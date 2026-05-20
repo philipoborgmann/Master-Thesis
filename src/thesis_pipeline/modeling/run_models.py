@@ -112,14 +112,24 @@ def load_feature_sets(path: str) -> pd.DataFrame:
                   .str.replace(r"[^a-z0-9]+", "_", regex=True)
                   .str.strip("_"))
 
-    # Rename known variants to expected names
-    for old, new in [
-        ("feature_columns_comma_separated", "features"),
-        ("feature_columns", "features"),
-        ("n_features", "n_features"),
-    ]:
-        if old in df.columns and new not in df.columns:
-            df = df.rename(columns={old: new})
+    # Rename known variants to expected names.
+    #
+    # Explicit priority for the column that holds the comma-separated feature
+    # list:
+    #     feature_columns_comma_separated  >  feature_columns  >  features
+    #
+    # The previous behaviour skipped the rename when ``features`` already
+    # existed in the frame — e.g. because the XLSX still contains a
+    # ``# Features`` column that normalises to ``features`` after the regex
+    # above. In that situation the wrong column silently won. Fix: when a
+    # more specific header is present, drop any pre-existing ``features``
+    # column first so the rename actually takes effect.
+    for preferred in ("feature_columns_comma_separated", "feature_columns"):
+        if preferred in df.columns:
+            if "features" in df.columns and preferred != "features":
+                df = df.drop(columns=["features"])
+            df = df.rename(columns={preferred: "features"})
+            break
 
     # Fallback: if 'features' still missing, use the longest column
     if "features" not in df.columns:
