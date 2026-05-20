@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+
+Data/
+Outputs/
+
+*.parquet
+*.csv
+*.xlsx
+*.zip
+*.pkl
+*.pt
+*.pth
+
+.idea/
