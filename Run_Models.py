@@ -377,7 +377,7 @@ def main():
             category   = cfg_row["category"]
             sent_model = cfg_row.get("sentiment_model", "-")
             label      = cfg_row.get("label", "")
-            feat_str   = cfg_row["features"]
+            feat_str   = cfg_row["feature_columns_comma_separated"]
 
             # File naming
             if sent_model and str(sent_model) != "-" and str(sent_model) != "nan":
@@ -414,14 +414,23 @@ def main():
 
             print(f"\n  ── {out_name} ({label}) ", end="", flush=True)
 
-            # ── Benchmark: rolling probability ────────────────
-            if feat_str.strip() in ("__rolling_probability__", "__majority_class__"):
+            feat_str = "" if pd.isna(feat_str) else str(feat_str).strip()
+
+            if feat_str in ("", "0"):
+                feat_str = "__majority_class__"
+
+            # ── Benchmark: rolling probability / majority class ────────────────
+            if feat_str in ("__rolling_probability__", "__majority_class__"):
                 all_signals = []
+
                 for tk in tickers:
                     df_t = df_all[df_all["ticker"] == tk]
                     sig = run_rolling_probability(df_t)
+
                     if not sig.empty:
                         all_signals.append(sig)
+
+                # danach deine bestehende Logik für concat/output/metrics
 
                 if all_signals:
                     signals = pd.concat(all_signals, ignore_index=True)
