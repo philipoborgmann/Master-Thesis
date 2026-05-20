@@ -87,10 +87,31 @@ def cmd_merge_features(args: argparse.Namespace) -> int:
 
 
 def cmd_run_models(args: argparse.Namespace) -> int:
-    from .modeling.run_models import run
-    return run(horizon=args.horizon, set_id=args.set_id,
-               coins=args.coins, sentiment_model=args.sentiment_model,
-               smoke=args.smoke, dry_run=args.dry_run)
+    """Call ``thesis_pipeline.modeling.run_models.main`` directly.
+
+    Translates the CLI's ``--coins BTC ETH`` to the modeling module's
+    ``--coins BTC ETH`` — never to the buggy ``--coin BTC --coin ETH``
+    that previous versions emitted.
+    """
+    from .modeling import run_models as _rm
+    argv: list[str] = []
+    if args.horizon:
+        argv += ["--horizon", args.horizon]
+    if args.set_id:
+        argv += ["--set-id", args.set_id]
+    if args.coins:
+        argv += ["--coins", *list(args.coins)]
+    if args.sentiment_model:
+        argv += ["--sentiment-model", args.sentiment_model]
+    if args.smoke:
+        argv.append("--smoke")
+    if args.dry_run:
+        argv.append("--dry-run")
+    if getattr(args, "force", False):
+        argv.append("--force")
+    if getattr(args, "restart", False):
+        argv.append("--restart")
+    return _rm.main(argv)
 
 
 def cmd_diagnostics(args: argparse.Namespace) -> int:
@@ -220,6 +241,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--coins", nargs="*")
     sp.add_argument("--sentiment-model", dest="sentiment_model", default=None,
                     choices=[None, "vader", "finbert", "cryptobert"])
+    sp.add_argument("--restart", action="store_true",
+                    help="Ignore cached signal parquets and rerun every set.")
     _add_common(sp)
     sp.set_defaults(func=cmd_run_models)
 
