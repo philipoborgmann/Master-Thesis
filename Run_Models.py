@@ -2,20 +2,30 @@
 """
 Run_Models.py
 ==============
-Runs Ridge (L2) logistic regression across all feature sets and horizons
-defined in feature_sets.xlsx. Uses expanding-window forward validation.
+Ridge (L2) logistic regression with expanding-window walk-forward validation
+across all feature sets and horizons defined in feature_sets.xlsx.
 
-For each (horizon × feature_set × ticker), the script:
-  1. Loads the merged feature parquet from Data/Final/
-  2. Splits into expanding train / single-step test windows
-  3. Fits LogisticRegressionCV with L2 penalty (Ridge) on the training set
-  4. Generates out-of-sample predictions and predicted probabilities
-  5. Saves signals (predictions) to Outputs/Signals/
-  6. Computes first-pass accuracy metrics
+Validation design:
+  - Initial time-series split: first 50% of chronologically sorted
+    observations per ticker form the initial training window.
+  - Expanding walk-forward with step size 1:
+    For each step t, train on observations [0, t-1], predict at t.
+  - No random splits, no k-fold CV — temporal order is never violated.
+  - StandardScaler re-fitted on each training window (no leakage).
 
-The expanding window starts at 50% of the available data and grows by
-one observation per step. StandardScaler is re-fitted on each training
-fold to prevent information leakage.
+Model:
+  - LogisticRegression(penalty="l2", C=1.0, solver="lbfgs")
+  - No hyperparameter search inside the walk-forward loop.
+  - C is configurable via --C but defaults to 1.0.
+
+Benchmark:
+  - Rolling probability: p_hat = mean(y_train), predict 1 if p_hat >= 0.5.
+  - Produces calibrated probabilities for log loss / Brier score comparison.
+
+Metrics (per ticker + pooled):
+  - Accuracy, Balanced Accuracy, F1, Precision, Recall
+  - Log Loss, Brier Score
+  - n_obs, first/last test timestamp
 
 Input:
     Data/Final/features_{horizon}.parquet
@@ -29,6 +39,7 @@ Usage:
     python Run_Models.py
     python Run_Models.py --horizon 1d
     python Run_Models.py --set_id S1 --horizon 1d
+    python Run_Models.py --C 0.1 --restart
 """
 
 import argparse
@@ -39,9 +50,12 @@ import warnings
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegressionCV
+from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from sklearn.metrics import (
+    accuracy_score, balanced_accuracy_score, f1_score,
+    precision_score, recall_score, log_loss, brier_score_loss,
+)
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -60,14 +74,12 @@ HORIZONS       = ["1h", "6h", "1d"]
 # Expanding window: initial training fraction
 INIT_TRAIN_FRAC = 0.50
 
-# Ridge logistic regression: cross-validation folds for C selection
-CV_FOLDS = 5
-# Regularisation strength search grid (inverse of lambda)
-CS = np.logspace(-4, 4, 20)
+# Default Ridge regularisation strength
+DEFAULT_C = 1.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LOAD DATA
+# DATA LOADING
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_features(horizon: str) -> pd.DataFrame:
@@ -83,186 +95,230 @@ def load_features(horizon: str) -> pd.DataFrame:
 
 
 def load_feature_sets(path: str) -> pd.DataFrame:
-    """Loads the feature set configuration XLSX."""
-    df = pd.read_excel(path, sheet_name="feature_sets")
-    # Normalize display headers to snake_case keys
+    """
+    Loads the feature set configuration XLSX. Robust to sheet names
+    'feature_sets' or 'model_specs'. Normalises column headers to
+    snake_case.
+    """
+    xls = pd.ExcelFile(path)
+    sheet = None
+    for candidate in ["feature_sets", "model_specs"]:
+        if candidate in xls.sheet_names:
+            sheet = candidate
+            break
+    if sheet is None:
+        sheet = xls.sheet_names[0]
+
+    df = pd.read_excel(xls, sheet_name=sheet)
+
+    # Normalise display headers to snake_case
     df.columns = (df.columns
                   .str.strip()
                   .str.lower()
-                  .str.replace(" ", "_")
-                  .str.replace("#", "n")
-                  .str.replace("(comma-separated)", "", regex=False)
-                  .str.replace("__", "_")
+                  .str.replace(r"[^a-z0-9]+", "_", regex=True)
                   .str.strip("_"))
-    # Ensure expected columns exist
-    rename_map = {
-        "feature_columns": "features",
-    }
-    for old, new in rename_map.items():
+
+    # Rename known variants to expected names
+    for old, new in [
+        ("feature_columns_comma_separated", "features"),
+        ("feature_columns", "features"),
+        ("n_features", "n_features"),
+    ]:
         if old in df.columns and new not in df.columns:
             df = df.rename(columns={old: new})
 
-    # Fallback: if 'features' still not found, use the longest column name
+    # Fallback: if 'features' still missing, use the longest column
     if "features" not in df.columns:
-        longest = max(df.columns, key=len)
-        print(f"  [INFO] Renaming '{longest}' → 'features'")
+        longest = max(df.columns, key=lambda c: df[c].astype(str).str.len().mean())
         df = df.rename(columns={longest: "features"})
 
+    # Unify benchmark sentinel
+    df["features"] = df["features"].replace("__majority_class__", "__rolling_probability__")
+
     print(f"  [INFO] Config columns: {list(df.columns)}")
+    print(f"  [INFO] {len(df)} feature set configurations loaded from sheet '{sheet}'")
     return df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# EXPANDING WINDOW FORWARD VALIDATION
+# WALK-FORWARD VALIDATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_expanding_window(df_ticker: pd.DataFrame,
-                         feature_cols: list[str],
-                         set_id: str) -> pd.DataFrame:
+def run_walk_forward(df_ticker: pd.DataFrame,
+                     feature_cols: list[str],
+                     C: float = DEFAULT_C) -> pd.DataFrame:
     """
-    Expanding-window forward validation for a single ticker.
+    Expanding-window walk-forward validation for a single ticker.
 
-    Starting from INIT_TRAIN_FRAC of the data, the model is trained on
-    all observations up to time t and predicts the direction at t+1.
-    StandardScaler is re-fitted on each expanding window.
+    For each step t (starting at 50% of the data):
+      1. Train on observations [0, t-1]
+      2. Fit StandardScaler on training window only
+      3. Fit LogisticRegression(L2, C) on scaled training data
+      4. Predict observation t
+      5. Advance t by 1
 
-    Returns a DataFrame with columns:
-        timestamp, ticker, target, prediction, probability, set_id
+    Returns DataFrame with: timestamp, ticker, target, prediction, probability
     """
     df = df_ticker.sort_values("timestamp").reset_index(drop=True)
     n = len(df)
     init_train = max(int(n * INIT_TRAIN_FRAC), 30)
 
-    # Validate features exist and have no NaN in the required columns
-    available = [c for c in feature_cols if c in df.columns]
-    if len(available) < len(feature_cols):
-        missing = set(feature_cols) - set(available)
-        return pd.DataFrame()
-
-    X = df[feature_cols].values
-    y = df["target"].values
+    X_all = df[feature_cols].values.astype(float)
+    y_all = df["target"].values.astype(float)
     timestamps = df["timestamp"].values
     ticker = df["ticker"].iloc[0]
 
-    predictions = []
-    probabilities = []
-    targets = []
-    ts_out = []
+    results = []
 
     for t in range(init_train, n):
-        X_train = X[:t]
-        y_train = y[:t]
-        X_test  = X[t:t+1]
-        y_test  = y[t]
-
-        # Skip if only one class in training data
-        if len(np.unique(y_train)) < 2:
+        # ── Skip if test point has NaN ────────────────────────
+        if np.any(np.isnan(X_all[t])) or np.isnan(y_all[t]):
             continue
 
-        # Skip if test has NaN
-        if np.any(np.isnan(X_test)) or np.isnan(y_test):
-            continue
+        # ── Training window: [0, t-1], drop NaN rows ─────────
+        X_train = X_all[:t]
+        y_train = y_all[:t]
 
-        # Handle NaN in training: drop those rows
-        train_mask = ~(np.isnan(X_train).any(axis=1) | np.isnan(y_train))
-        X_tr = X_train[train_mask]
-        y_tr = y_train[train_mask]
+        valid_mask = ~(np.isnan(X_train).any(axis=1) | np.isnan(y_train))
+        X_tr = X_train[valid_mask]
+        y_tr = y_train[valid_mask]
 
+        # Need at least 20 observations and both classes
         if len(y_tr) < 20 or len(np.unique(y_tr)) < 2:
             continue
 
-        # Scale features (fitted on training only)
+        # ── Scale: fit on training only, transform test ───────
         scaler = StandardScaler()
-        X_tr_scaled = scaler.fit_transform(X_tr)
-        X_te_scaled = scaler.transform(X_test)
+        X_tr_s = scaler.fit_transform(X_tr)
+        X_te_s = scaler.transform(X_all[t:t+1])
 
-        # Fit Ridge logistic regression with CV for C selection
-        model = LogisticRegressionCV(
+        # ── Fit Ridge logistic regression ─────────────────────
+        model = LogisticRegression(
             penalty="l2",
-            Cs=CS,
-            cv=min(CV_FOLDS, len(y_tr) // 5),  # safety for small samples
-            scoring="accuracy",
+            C=C,
             solver="lbfgs",
             max_iter=1000,
             random_state=42,
         )
-        model.fit(X_tr_scaled, y_tr)
+        model.fit(X_tr_s, y_tr)
 
-        pred = model.predict(X_te_scaled)[0]
-        prob = model.predict_proba(X_te_scaled)[0, 1]  # P(class=1)
+        pred = int(model.predict(X_te_s)[0])
+        prob = float(model.predict_proba(X_te_s)[0, 1])
 
-        predictions.append(int(pred))
-        probabilities.append(float(prob))
-        targets.append(int(y_test))
-        ts_out.append(timestamps[t])
+        results.append({
+            "timestamp":   timestamps[t],
+            "ticker":      ticker,
+            "target":      int(y_all[t]),
+            "prediction":  pred,
+            "probability": prob,
+        })
 
-    if not predictions:
+    if not results:
         return pd.DataFrame()
 
-    return pd.DataFrame({
-        "timestamp":   ts_out,
-        "ticker":      ticker,
-        "target":      targets,
-        "prediction":  predictions,
-        "probability": probabilities,
-        "set_id":      set_id,
-    })
+    return pd.DataFrame(results)
 
 
-def run_majority_baseline(df_ticker: pd.DataFrame) -> pd.DataFrame:
+def run_rolling_probability(df_ticker: pd.DataFrame) -> pd.DataFrame:
     """
-    B1 benchmark: predicts the majority class from the expanding training
-    window. No features needed.
+    Benchmark: rolling probability from the expanding training window.
+
+    For each test point t:
+      p_hat = mean(y_train[0:t])
+      prediction = 1 if p_hat >= 0.5 else 0
+      probability = p_hat
+
+    Produces calibrated probabilities for log loss / Brier score comparison.
     """
     df = df_ticker.sort_values("timestamp").reset_index(drop=True)
     n = len(df)
     init_train = max(int(n * INIT_TRAIN_FRAC), 30)
 
-    y = df["target"].values
+    y = df["target"].values.astype(float)
     timestamps = df["timestamp"].values
     ticker = df["ticker"].iloc[0]
 
-    predictions = []
-    targets = []
-    ts_out = []
+    results = []
 
     for t in range(init_train, n):
-        y_train = y[:t]
-        majority = int(np.round(np.mean(y_train)))  # 1 if >50% positive
-        predictions.append(majority)
-        targets.append(int(y[t]))
-        ts_out.append(timestamps[t])
+        if np.isnan(y[t]):
+            continue
 
-    return pd.DataFrame({
-        "timestamp":   ts_out,
-        "ticker":      ticker,
-        "target":      targets,
-        "prediction":  predictions,
-        "probability": [np.nan] * len(predictions),
-        "set_id":      "B1",
-    })
+        y_train = y[:t]
+        valid = y_train[~np.isnan(y_train)]
+        if len(valid) == 0:
+            continue
+
+        p_hat = float(np.mean(valid))
+        pred = 1 if p_hat >= 0.5 else 0
+
+        results.append({
+            "timestamp":   timestamps[t],
+            "ticker":      ticker,
+            "target":      int(y[t]),
+            "prediction":  pred,
+            "probability": p_hat,
+        })
+
+    if not results:
+        return pd.DataFrame()
+
+    return pd.DataFrame(results)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # METRICS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_metrics(signals: pd.DataFrame) -> dict:
-    """Computes first-pass classification metrics from signal DataFrame."""
+def compute_metrics(signals: pd.DataFrame, ticker_label: str = "pooled") -> dict:
+    """
+    Computes classification and probabilistic metrics from signal DataFrame.
+    Robust to single-class samples.
+    """
     y_true = signals["target"].values
     y_pred = signals["prediction"].values
+    y_prob = signals["probability"].values
 
-    if len(y_true) == 0 or len(np.unique(y_true)) < 2:
-        return {"accuracy": np.nan, "f1": np.nan,
-                "precision": np.nan, "recall": np.nan, "n_obs": len(y_true)}
+    n = len(y_true)
+    n_classes = len(np.unique(y_true))
 
-    return {
-        "accuracy":  round(accuracy_score(y_true, y_pred), 4),
-        "f1":        round(f1_score(y_true, y_pred, zero_division=0), 4),
-        "precision": round(precision_score(y_true, y_pred, zero_division=0), 4),
-        "recall":    round(recall_score(y_true, y_pred, zero_division=0), 4),
-        "n_obs":     len(y_true),
+    out = {
+        "ticker":       ticker_label,
+        "n_obs":        n,
+        "first_test_timestamp": str(signals["timestamp"].min()),
+        "last_test_timestamp":  str(signals["timestamp"].max()),
     }
+
+    if n == 0:
+        for m in ["accuracy", "balanced_accuracy", "f1", "precision",
+                   "recall", "log_loss", "brier_score"]:
+            out[m] = np.nan
+        return out
+
+    # Classification metrics
+    out["accuracy"]          = round(accuracy_score(y_true, y_pred), 6)
+    out["balanced_accuracy"] = round(balanced_accuracy_score(y_true, y_pred), 6)
+
+    if n_classes >= 2:
+        out["f1"]        = round(f1_score(y_true, y_pred, zero_division=0), 6)
+        out["precision"] = round(precision_score(y_true, y_pred, zero_division=0), 6)
+        out["recall"]    = round(recall_score(y_true, y_pred, zero_division=0), 6)
+    else:
+        out["f1"]        = np.nan
+        out["precision"] = np.nan
+        out["recall"]    = np.nan
+
+    # Probabilistic metrics
+    if n_classes >= 2 and not np.any(np.isnan(y_prob)):
+        # Clip probabilities to avoid log(0)
+        y_prob_safe = np.clip(y_prob, 1e-15, 1 - 1e-15)
+        out["log_loss"]    = round(log_loss(y_true, y_prob_safe), 6)
+        out["brier_score"] = round(brier_score_loss(y_true, y_prob_safe), 6)
+    else:
+        out["log_loss"]    = np.nan
+        out["brier_score"] = np.nan
+
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -271,22 +327,22 @@ def compute_metrics(signals: pd.DataFrame) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run Ridge logistic regression across all feature sets"
+        description="Ridge logistic regression — walk-forward validation"
     )
     parser.add_argument("--feature_config", type=str, default=FEATURE_CONFIG)
-    parser.add_argument("--horizon", type=str, default=None,
-                        choices=HORIZONS, help="Run only this horizon")
-    parser.add_argument("--set_id", type=str, default=None,
-                        help="Run only this feature set ID")
-    parser.add_argument("--ticker", type=str, default=None,
-                        help="Run only this ticker")
+    parser.add_argument("--horizon", type=str, default=None, choices=HORIZONS)
+    parser.add_argument("--set_id", type=str, default=None)
+    parser.add_argument("--ticker", type=str, default=None)
+    parser.add_argument("--C", type=float, default=DEFAULT_C,
+                        help=f"Ridge regularisation strength (default: {DEFAULT_C})")
+    parser.add_argument("--restart", action="store_true",
+                        help="Ignore cached signals and rerun everything")
     args = parser.parse_args()
 
     os.makedirs(SIGNAL_DIR, exist_ok=True)
 
-    # Load feature set configuration
+    # ── Load feature set configuration ────────────────────────
     config = load_feature_sets(args.feature_config)
-    print(f"[INFO] Loaded {len(config)} feature set configurations")
 
     if args.set_id:
         config = config[config["set_id"] == args.set_id]
@@ -309,119 +365,175 @@ def main():
         if args.ticker:
             tickers = [t for t in tickers if t == args.ticker]
         print(f"  Tickers: {len(tickers)} — {', '.join(tickers)}")
+        print(f"  Model: LogisticRegression(L2, C={args.C})")
+        print(f"  Initial train split: {INIT_TRAIN_FRAC:.0%}")
 
         hz_dir = os.path.join(SIGNAL_DIR, hz)
         os.makedirs(hz_dir, exist_ok=True)
 
         for _, cfg_row in config.iterrows():
-            set_id = cfg_row["set_id"]
-            category = cfg_row["category"]
-            sent_model = cfg_row["sentiment_model"]
-            label = cfg_row["label"]
-            features_str = cfg_row["features"]
+            set_id     = cfg_row["set_id"]
+            category   = cfg_row["category"]
+            sent_model = cfg_row.get("sentiment_model", "-")
+            label      = cfg_row.get("label", "")
+            feat_str   = cfg_row["features"]
 
             # File naming
-            if sent_model and sent_model != "-":
+            if sent_model and str(sent_model) != "-" and str(sent_model) != "nan":
                 out_name = f"{set_id}_{sent_model}"
             else:
-                out_name = set_id
+                out_name = str(set_id)
+                sent_model = "-"
 
-            print(f"\n  ── {out_name} ({label}) ", end="")
+            out_path = os.path.join(hz_dir, f"{out_name}.parquet")
 
-            # Parse feature list
-            if features_str == "__majority_class__":
-                # B1 benchmark — no features
+            # ── Checkpoint: skip if already computed ──────────
+            if os.path.isfile(out_path) and not args.restart:
+                try:
+                    cached = pd.read_parquet(out_path)
+                    # Compute pooled metrics from cache
+                    m = compute_metrics(cached, "pooled")
+                    m.update({"horizon": hz, "set_id": set_id,
+                              "sentiment_model": sent_model, "label": label,
+                              "category": category,
+                              "n_tickers": cached["ticker"].nunique()})
+                    all_metrics.append(m)
+                    # Per-ticker metrics from cache
+                    for tk, grp in cached.groupby("ticker"):
+                        mt = compute_metrics(grp, tk)
+                        mt.update({"horizon": hz, "set_id": set_id,
+                                   "sentiment_model": sent_model, "label": label,
+                                   "category": category, "n_tickers": 1})
+                        all_metrics.append(mt)
+                    print(f"\n  ── {out_name} ({label}) "
+                          f"→ CACHED acc={m['accuracy']:.4f}, n={m['n_obs']}")
+                    continue
+                except Exception:
+                    pass  # corrupted — will re-run
+
+            print(f"\n  ── {out_name} ({label}) ", end="", flush=True)
+
+            # ── Benchmark: rolling probability ────────────────
+            if feat_str.strip() in ("__rolling_probability__", "__majority_class__"):
                 all_signals = []
-                for ticker in tickers:
-                    df_t = df_all[df_all["ticker"] == ticker]
-                    sig = run_majority_baseline(df_t)
+                for tk in tickers:
+                    df_t = df_all[df_all["ticker"] == tk]
+                    sig = run_rolling_probability(df_t)
                     if not sig.empty:
                         all_signals.append(sig)
 
                 if all_signals:
                     signals = pd.concat(all_signals, ignore_index=True)
-                    out_path = os.path.join(hz_dir, f"{out_name}.parquet")
+                    signals["set_id"] = set_id
+                    signals["sentiment_model"] = sent_model
+                    signals["horizon"] = hz
                     signals.to_parquet(out_path, index=False, engine="pyarrow")
 
-                    metrics = compute_metrics(signals)
-                    metrics.update({"horizon": hz, "set_id": set_id,
-                                    "sentiment_model": sent_model, "label": label,
-                                    "category": category, "n_tickers": len(all_signals)})
-                    all_metrics.append(metrics)
-                    print(f"→ acc={metrics['accuracy']:.3f}, n={metrics['n_obs']}")
+                    m = compute_metrics(signals, "pooled")
+                    m.update({"horizon": hz, "set_id": set_id,
+                              "sentiment_model": sent_model, "label": label,
+                              "category": category,
+                              "n_tickers": len(all_signals)})
+                    all_metrics.append(m)
+                    # Per-ticker
+                    for tk, grp in signals.groupby("ticker"):
+                        mt = compute_metrics(grp, tk)
+                        mt.update({"horizon": hz, "set_id": set_id,
+                                   "sentiment_model": sent_model, "label": label,
+                                   "category": category, "n_tickers": 1})
+                        all_metrics.append(mt)
+                    print(f"→ acc={m['accuracy']:.4f}, brier={m.get('brier_score', np.nan):.4f}, "
+                          f"n={m['n_obs']}")
                 else:
                     print("→ no signals")
                 continue
 
-            feature_cols = [f.strip() for f in features_str.split(",")]
+            # ── Parse feature list ────────────────────────────
+            feature_cols = [f.strip() for f in feat_str.split(",")]
 
-            # Check if features exist in the data
-            missing_feats = [f for f in feature_cols if f not in df_all.columns]
-            if missing_feats:
-                print(f"→ SKIP (missing: {missing_feats[:3]})")
+            missing = [f for f in feature_cols if f not in df_all.columns]
+            if missing:
+                print(f"→ SKIP (missing: {missing[:3]})")
                 all_metrics.append({
                     "horizon": hz, "set_id": set_id, "sentiment_model": sent_model,
-                    "label": label, "category": category,
+                    "label": label, "category": category, "ticker": "pooled",
                     "accuracy": np.nan, "n_obs": 0, "n_tickers": 0,
-                    "status": f"missing_features: {missing_feats[:3]}",
+                    "status": f"missing: {missing[:3]}",
                 })
                 continue
 
-            # Run per ticker
+            # ── Run per ticker ────────────────────────────────
             t0 = time.time()
             all_signals = []
-            for ticker in tickers:
-                df_t = df_all[df_all["ticker"] == ticker]
-                sig = run_expanding_window(df_t, feature_cols, set_id)
+
+            for tk in tickers:
+                df_t = df_all[df_all["ticker"] == tk]
+                sig = run_walk_forward(df_t, feature_cols, C=args.C)
                 if not sig.empty:
-                    sig["sentiment_model"] = sent_model
                     all_signals.append(sig)
 
             elapsed = time.time() - t0
 
             if all_signals:
                 signals = pd.concat(all_signals, ignore_index=True)
-                out_path = os.path.join(hz_dir, f"{out_name}.parquet")
+                signals["set_id"] = set_id
+                signals["sentiment_model"] = sent_model
+                signals["horizon"] = hz
                 signals.to_parquet(out_path, index=False, engine="pyarrow")
 
-                metrics = compute_metrics(signals)
-                metrics.update({"horizon": hz, "set_id": set_id,
-                                "sentiment_model": sent_model, "label": label,
-                                "category": category, "n_tickers": len(all_signals)})
-                all_metrics.append(metrics)
-                print(f"→ acc={metrics['accuracy']:.3f}, "
-                      f"f1={metrics['f1']:.3f}, "
-                      f"n={metrics['n_obs']}, "
-                      f"{elapsed:.1f}s")
+                # Pooled metrics
+                m = compute_metrics(signals, "pooled")
+                m.update({"horizon": hz, "set_id": set_id,
+                          "sentiment_model": sent_model, "label": label,
+                          "category": category,
+                          "n_tickers": len(all_signals)})
+                all_metrics.append(m)
+
+                # Per-ticker metrics
+                for tk, grp in signals.groupby("ticker"):
+                    mt = compute_metrics(grp, tk)
+                    mt.update({"horizon": hz, "set_id": set_id,
+                               "sentiment_model": sent_model, "label": label,
+                               "category": category, "n_tickers": 1})
+                    all_metrics.append(mt)
+
+                print(f"→ acc={m['accuracy']:.4f}, "
+                      f"f1={m['f1']:.4f}, "
+                      f"brier={m.get('brier_score', np.nan):.4f}, "
+                      f"n={m['n_obs']}, {elapsed:.1f}s")
             else:
                 print(f"→ no signals ({elapsed:.1f}s)")
                 all_metrics.append({
                     "horizon": hz, "set_id": set_id, "sentiment_model": sent_model,
-                    "label": label, "category": category,
+                    "label": label, "category": category, "ticker": "pooled",
                     "accuracy": np.nan, "n_obs": 0, "n_tickers": 0,
                 })
 
-    # ── Save metrics summary ──────────────────────────────────────
+    # ── Save metrics summary ──────────────────────────────────
     if all_metrics:
         metrics_df = pd.DataFrame(all_metrics)
         metrics_path = os.path.join(SIGNAL_DIR, "metrics_summary.csv")
         metrics_df.to_csv(metrics_path, index=False)
-        print(f"\n{'=' * 70}")
-        print("DONE — Metrics Summary")
-        print(f"{'=' * 70}")
-        print(f"  Total runs: {len(all_metrics)}")
-        print(f"  Metrics:    {metrics_path}")
-        print(f"  Signals:    {os.path.abspath(SIGNAL_DIR)}")
 
-        # Quick leaderboard
-        valid = metrics_df[metrics_df["accuracy"].notna()].copy()
+        print(f"\n{'=' * 70}")
+        print("DONE")
+        print(f"{'=' * 70}")
+        print(f"  Total metric rows: {len(metrics_df)}")
+        print(f"  Metrics: {metrics_path}")
+        print(f"  Signals: {os.path.abspath(SIGNAL_DIR)}")
+
+        # Quick pooled leaderboard
+        pooled = metrics_df[metrics_df["ticker"] == "pooled"].copy()
+        valid = pooled[pooled["accuracy"].notna()]
         if not valid.empty:
-            print(f"\n  Top 10 by accuracy:")
+            print(f"\n  Top 10 by accuracy (pooled):")
             top = valid.nlargest(10, "accuracy")
             for _, r in top.iterrows():
-                sm = f"/{r['sentiment_model']}" if r.get("sentiment_model", "-") != "-" else ""
-                print(f"    {r['set_id']}{sm:12s} {r['horizon']:3s}  "
-                      f"acc={r['accuracy']:.4f}  f1={r.get('f1', np.nan):.4f}  "
+                sm = f"/{r['sentiment_model']}" if str(r.get("sentiment_model", "-")) != "-" else ""
+                print(f"    {r['set_id']}{sm:15s} {r['horizon']:3s}  "
+                      f"acc={r['accuracy']:.4f}  "
+                      f"f1={r.get('f1', np.nan):.4f}  "
+                      f"brier={r.get('brier_score', np.nan):.4f}  "
                       f"n={int(r['n_obs'])}")
         print()
 
