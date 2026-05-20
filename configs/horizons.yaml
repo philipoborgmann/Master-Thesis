@@ -1,0 +1,50 @@
+# Horizon configuration.
+#
+# The repository distinguishes between:
+#   - raw_price_horizons:        what raw OHLCV parquet files exist on disk
+#   - price_feature_horizons:    horizons for which price features are produced
+#   - sentiment_feature_horizons: horizons for which sentiment features exist
+#   - final_model_horizons:      horizons that flow end-to-end to modelling
+#
+# Note: 4h raw price data exists, but no downstream feature/merge/model output
+# is currently produced for 4h. Do not add 4h to the final pipeline silently.
+
+raw_price_horizons:
+  15min:
+    folder: "15min"
+    filename_suffix: "15m"
+    pandas_freq: "15min"
+  1h:
+    folder: "1h"
+    filename_suffix: "1h"
+    pandas_freq: "1h"
+  4h:
+    folder: "4h"
+    filename_suffix: "4h"
+    pandas_freq: "4h"
+  6h:
+    folder: "6h"
+    filename_suffix: "6h"
+    pandas_freq: "6h"
+  1d:
+    folder: "1d"
+    filename_suffix: "1d"
+    pandas_freq: "1D"
+
+price_feature_horizons:
+  - 1h
+  - 6h
+  - 1d
+
+sentiment_feature_horizons:
+  - 15min
+  - 1h
+  - 6h
+  - 1d
+
+final_model_horizons:
+  - 1h
+  - 6h
+  - 1d
+
+default_horizon: "1d"

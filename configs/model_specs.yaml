@@ -1,0 +1,49 @@
+# Model specifications.
+# Values extracted from Run_Models.py.
+
+default_model:    "logistic_ridge"     # sklearn.linear_model.LogisticRegression(penalty='l2')
+benchmark_model:  "rolling_probability"
+
+# Walk-forward configuration (Run_Models.py: INIT_TRAIN_FRAC, expanding-window).
+walk_forward:
+  scheme: "expanding"
+  init_train_frac: 0.50          # first 50% of observations form the initial training window
+  min_init_train_obs: 30         # but never fewer than 30 observations
+  min_obs_per_window: 20         # skip step if training window has < 20 valid rows
+  min_classes: 2                 # skip step if both classes not present in training
+
+# Logistic-ridge hyperparameters.
+logistic_ridge:
+  penalty: "l2"
+  C: 1.0
+  solver: "lbfgs"
+  max_iter: 1000
+  random_state: 42
+
+# Standardisation: a fresh StandardScaler is fit on each expanding training
+# window only (no leakage). Applied to all numeric features.
+scaler:
+  type: "StandardScaler"
+  fit_scope: "train_window_only"
+
+# Classification threshold (applied to predicted probability).
+threshold: 0.5
+
+# Numerical guards from Run_Models.py.
+probability_clip:
+  low:  1.0e-15
+  high: 0.999999999999999      # 1 - 1e-15
+
+# Columns written to Outputs/Signals/<horizon>/<set_id>.parquet.
+output_columns:
+  - timestamp
+  - ticker
+  - target
+  - prediction
+  - probability
+  - set_id
+  - sentiment_model    # null/empty for benchmark and economic sets
+
+# Hyperparameter search: intentionally none. The thesis pins C=1.0 and
+# random_state=42 to keep the walk-forward identical across runs.
+hyperparameter_tuning: false

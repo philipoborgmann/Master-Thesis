@@ -1,0 +1,97 @@
+# Central path configuration.
+# Paths are repository-relative. The local data layout described here is the
+# compatibility contract — the refactor does NOT move data; it only documents
+# and references the existing structure.
+
+project_root: "."
+data_root: "Data"
+outputs_root: "Outputs"
+
+# ---------------------------------------------------------------------------
+# Raw price data (OHLCV parquet files per horizon)
+# ---------------------------------------------------------------------------
+raw_price_root: "Data/Raw/Price"
+raw_price_15min: "Data/Raw/Price/15min"
+raw_price_1h:    "Data/Raw/Price/1h"
+raw_price_4h:    "Data/Raw/Price/4h"
+raw_price_6h:    "Data/Raw/Price/6h"
+raw_price_1d:    "Data/Raw/Price/1d"
+
+# ---------------------------------------------------------------------------
+# CoinMarketCap reference data
+# ---------------------------------------------------------------------------
+cmc_root:          "Data/Raw/Price/CoinMarketCap"
+cmc_market_cap:    "Data/Raw/Price/CoinMarketCap/market_cap.parquet"
+cmc_price:         "Data/Raw/Price/CoinMarketCap/price.parquet"
+cmc_volume:        "Data/Raw/Price/CoinMarketCap/volume.parquet"
+cmc_metadata_csv:  "Data/Raw/Price/CoinMarketCap/MetaData.csv"
+cmc_metadata_xlsx: "Data/Raw/Price/CoinMarketCap/MetaData.xlsx"
+
+# ---------------------------------------------------------------------------
+# Price validation outputs
+# ---------------------------------------------------------------------------
+price_validation_root: "Data/Raw/Price/validation"
+
+# ---------------------------------------------------------------------------
+# Raw sentiment data
+# ---------------------------------------------------------------------------
+raw_sentiment_root:         "Data/Raw/Sentiment"
+raw_sentiment_full_parquet: "Data/Raw/Sentiment/st-data-full.parquet"
+raw_sentiment_full_xlsx:    "Data/Raw/Sentiment/st-data-full.xlsx"
+subreddit_ticker_mapping:   "subreddit_ticker_mapping.xlsx"
+
+# ---------------------------------------------------------------------------
+# Processed sentiment data
+# ---------------------------------------------------------------------------
+processed_sentiment_root: "Data/Processed/Sentiment"
+sentiment_combined:       "Data/Processed/Sentiment/sentiment_combined.csv"
+
+# ---------------------------------------------------------------------------
+# Transformed (scored) sentiment data
+# ---------------------------------------------------------------------------
+transformed_root:             "Data/Transformed"
+sentiment_scored_vader:       "Data/Transformed/Sentiment_Scored_Vader.csv"
+sentiment_scored_finbert:     "Data/Transformed/Sentiment_Scored_Finbert.csv"
+sentiment_scored_cryptobert:  "Data/Transformed/Sentiment_Scored_Cryptobert.csv"
+vader_checkpoints:            "Data/Transformed/.vader_checkpoints"
+finbert_checkpoints:          "Data/Transformed/.finbert_checkpoints"
+finbert_backup_checkpoints:   "Data/Transformed/.finbert_backup_checkpoints"
+cryptobert_checkpoints:       "Data/Transformed/.cryptobert_checkpoints"
+
+# ---------------------------------------------------------------------------
+# Feature outputs
+# ---------------------------------------------------------------------------
+features_root:               "Data/Features"
+price_features_pattern:      "Data/Features/price_features_{horizon}.parquet"
+sentiment_features_pattern:  "Data/Features/sentiment_features_{horizon}.parquet"
+feature_generation_report:   "Data/Features/feature_generation_report.csv"
+sentiment_coverage:          "Data/Features/sentiment_coverage.csv"
+winsorization_thresholds:    "Data/Features/winsorization_thresholds.csv"
+cmc_marketcap_column_matches: "Data/Features/cmc_marketcap_column_matches.csv"
+stationarity_records:        "Data/Features/stationarity_records_v2.parquet"
+stationarity_results:        "Data/Features/stationarity_results_v2.xlsx"
+stationarity_plots:          "Data/Features/plots_v2"
+
+# ---------------------------------------------------------------------------
+# Final merged features (price + sentiment, modelling-ready)
+# ---------------------------------------------------------------------------
+final_root:             "Data/Final"
+final_features_pattern: "Data/Final/features_{horizon}.parquet"
+merge_report:           "Data/Final/merge_report.csv"
+
+# ---------------------------------------------------------------------------
+# Outputs (model signals, descriptive stats, diagnostics)
+# ---------------------------------------------------------------------------
+signals_root:      "Outputs/Signals"
+signals_pattern:   "Outputs/Signals/{horizon}/{set_id}.parquet"
+signals_metrics:   "Outputs/Signals/metrics_summary.csv"
+descriptive_root:  "Outputs/deskriptiv"
+diagnostics_root:  "Outputs/diagnostics"
+diagnostics_logs:  "Outputs/diagnostics/logs"
+smoke_root:        "Outputs/diagnostics/smoke"
+
+# ---------------------------------------------------------------------------
+# Top-level metadata files
+# ---------------------------------------------------------------------------
+feature_sets_xlsx:        "feature_sets.xlsx"
+feature_sets_yaml:        "configs/feature_sets.yaml"

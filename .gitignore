@@ -1,15 +1,57 @@
-.venv/
-__pycache__/
+# ---------------------------------------------------------------------------
+# Local data (never committed). Everything under Data/ and the data-shaped
+# parts of Outputs/ is ignored.
+# ---------------------------------------------------------------------------
+Data/Raw/
+Data/Processed/
+Data/Transformed/
+Data/Features/
+Data/Final/
 
-Data/
-Outputs/
+Outputs/Signals/
+Outputs/deskriptiv/
+Outputs/diagnostics/
 
+# Transformer checkpoints (large, intermediate)
+Data/Transformed/.finbert_checkpoints/
+Data/Transformed/.finbert_backup_checkpoints/
+Data/Transformed/.cryptobert_checkpoints/
+Data/Transformed/.vader_checkpoints/
+
+# ---------------------------------------------------------------------------
+# Generic data-file extensions
+# (kept broad so accidental commits of raw data are blocked).
+# ---------------------------------------------------------------------------
 *.parquet
 *.csv
-*.xlsx
-*.zip
 *.pkl
 *.pt
 *.pth
+*.zip
+
+# *.xlsx — DO NOT add. feature_sets.xlsx and subreddit_ticker_mapping.xlsx
+# are intentionally tracked.
+
+# ---------------------------------------------------------------------------
+# Python / IDE
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 .idea/
+.vscode/
+.DS_Store
+
+# ---------------------------------------------------------------------------
+# Exceptions: tiny tracked fixtures and metadata
+# ---------------------------------------------------------------------------
+!feature_sets.xlsx
+!subreddit_ticker_mapping.xlsx
+!tests/fixtures/**
