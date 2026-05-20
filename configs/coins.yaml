@@ -1,0 +1,117 @@
+# Coin / ticker configuration.
+#
+# Tickers are the canonical symbols used downstream (in feature files and
+# signal outputs). For data acquisition or matching against CoinMarketCap, the
+# pipeline may need to fall back to alternate symbols (e.g. NANO ↔ XNO).
+#
+# Sources of these mappings:
+#   - Crypto _data.py (COIN_UNIVERSE, SYMBOL_ALIASES, EXCHANGE_PREFERENCES)
+#   - Price_Data_Validation.py (PREFERRED_CMC_IDS, alias mapping)
+#   - Create_Price_Features.py (PREFERRED_CMC_SYMBOLS, alias mapping)
+
+pair_quote: "USDT"
+raw_price_filename_template: "{ticker}USDT_{suffix}.parquet"
+
+tickers:
+  - ADA
+  - BAT
+  - BCH
+  - BNB
+  - BTC
+  - CRO
+  - DOGE
+  - DOT
+  - EOS
+  - ETH
+  - IOTA
+  - KCS
+  - LRC
+  - LTC
+  - MANA
+  - NANO
+  - NEO
+  - SOL
+  - TRX
+  - UNI
+  - VET
+  - XLM
+  - XMR
+  - XRP
+  - XTZ
+
+# Symbol aliases used when downloading raw OHLCV from exchanges
+# (extracted from Crypto _data.py SYMBOL_ALIASES).
+exchange_symbol_aliases:
+  NANO: [NANO, XNO]
+  IOTA: [IOTA, MIOTA]
+
+# Preferred CoinMarketCap numeric IDs per ticker
+# (extracted from Price_Data_Validation.py PREFERRED_CMC_IDS).
+cmc_ids:
+  BTC: 1
+  ETH: 1027
+  BNB: 1839
+  SOL: 5426
+  ADA: 2010
+  DOGE: 74
+  DOT: 6636
+  LTC: 2
+  TRX: 1958
+  UNI: 7083
+  XLM: 512
+  XMR: 328
+  VET: 3077
+  XTZ: 2011
+  EOS: 1765
+  NEO: 1376
+  MANA: 1966
+  LRC: 1934
+  BAT: 1697
+  BCH: 1831
+  CRO: 3635
+  KCS: 2087
+  XRP: 52
+  XNO: 1567        # NANO (post-rename ticker)
+  MIOTA: 1720      # IOTA (post-rename ticker)
+
+# CMC symbol fallbacks. Sentiment / price data uses these as the modern symbol
+# while older listings used the historical symbol.
+# (extracted from Create_Price_Features.py PREFERRED_CMC_SYMBOLS / aliases.)
+cmc_symbol_aliases:
+  NANO: [NANO, XNO]
+  IOTA: [IOTA, MIOTA]
+
+# Preferred CMC symbol per coin (which symbol provides better coverage during
+# the thesis sample, 2021-12 to 2023-02). Extracted from Create_Price_Features.py.
+preferred_cmc_symbol:
+  NANO: "XNO"     # XNO covers 2022 onwards better
+  IOTA: "MIOTA"   # MIOTA covers 2021-12 to 2023-01 better
+
+# Default exchange preferences (extracted from Crypto _data.py EXCHANGE_PREFERENCES).
+exchange_preferences:
+  KCS:  [kucoin]
+  XMR:  [kucoin, gate, kraken]
+  NANO: [binance, kucoin, kraken]
+  EOS:  [okx, kucoin, gate, kraken]
+
+# Fallback exchange order (extracted from Crypto _data.py FALLBACK_EXCHANGES).
+fallback_exchanges:
+  - bybit
+  - okx
+  - kucoin
+  - gate
+  - binance
+  - kraken
+
+# Quote-currency priority (extracted from Crypto _data.py QUOTE_PRIORITY).
+quote_priority:
+  - USDT
+  - USD
+  - USDC
+  - BUSD
+  - FDUSD
+
+# Smoke-mode coin subset (used by the CLI --smoke flag).
+smoke_coins:
+  - BTC
+  - ETH

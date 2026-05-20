@@ -1,0 +1,432 @@
+# Master Thesis — Social-Media Sentiment and Cryptocurrency Return Direction
+
+> **Thesis question:** *Does social-media sentiment improve the out-of-sample
+> forecast of the direction of future cryptocurrency returns?*
+
+This repository implements a staged pipeline for testing whether Reddit-based
+sentiment signals improve out-of-sample forecasts of cryptocurrency return
+direction. It downloads raw OHLCV price data and Reddit submissions, scores
+the posts with three sentiment models (VADER, FinBERT, CryptoBERT), engineers
+per-horizon price and sentiment features, merges them, and runs walk-forward
+logistic-ridge models against benchmark predictors.
+
+---
+
+## 1. Repository layout
+
+```
+Master_Thesis/
+├── README.md                         ← this file
+├── pyproject.toml                    ← package metadata + dependencies
+├── requirements.txt                  ← pip-installable runtime deps
+├── .gitignore                        ← data and caches are gitignored
+│
+├── configs/                          ← all paths / constants / settings (YAML)
+│   ├── paths.yaml
+│   ├── coins.yaml
+│   ├── horizons.yaml
+│   ├── feature_sets.yaml
+│   ├── model_specs.yaml
+│   └── pipeline.yaml
+│
+├── docs/                             ← detailed documentation
+│   ├── pipeline_overview.md
+│   ├── data_layout.md                ← ★ how to populate Data/ locally
+│   ├── data_dictionary.md
+│   ├── feature_definitions.md
+│   ├── model_design.md
+│   ├── reproducibility.md
+│   └── refactor_log.md
+│
+├── src/thesis_pipeline/              ← reusable package
+│   ├── cli.py                        ← `python -m thesis_pipeline.cli ...`
+│   ├── config.py                     ← config + path resolution
+│   ├── io.py, utils.py, logging_utils.py
+│   ├── price/                        ← validate, features, load
+│   ├── sentiment/                    ← load, score_*, aggregate, stationarity
+│   ├── features/                     ← merge, feature_registry, checks
+│   ├── modeling/                     ← walk_forward, benchmarks, metrics, run_models
+│   └── diagnostics/                  ← sample_report, missingness, leakage_checks
+│
+├── scripts/                          ← thin wrappers around the CLI
+│   ├── run_pipeline.py
+│   ├── validate_price.py
+│   └── ...
+│
+├── tests/                            ← pytest test-suite
+│
+└── (root scripts kept as backward-compat wrappers)
+    Create_Price_Features.py
+    Price_Data_Validation.py
+    Merge_Features.py
+    Run_Models.py
+    Sentiment_Data_Load.py
+    Sentiment_score_vader.py
+    Sentiment_score_finbert.py
+    Sentiment_score_cryptobert.py
+    Sentiment_feature_engineering.py
+    Sentiment_Stationarity_Test.py
+    Crypto _data.py                    ← raw OHLCV downloader (ccxt)
+```
+
+---
+
+## 2. Local data contract
+
+The pipeline assumes the **Data/** and **Outputs/** trees described below.
+None of these files are committed to git — recreate the layout locally and
+drop files into the documented locations.
+
+```
+Data/
+├── Raw/
+│   ├── Price/
+│   │   ├── 15min/
+│   │   │   ├── BTCUSDT_15m.parquet
+│   │   │   ├── ETHUSDT_15m.parquet
+│   │   │   └── price_sources.csv
+│   │   ├── 1h/
+│   │   │   ├── BTCUSDT_1h.parquet
+│   │   │   └── ...
+│   │   ├── 4h/
+│   │   │   ├── BTCUSDT_4h.parquet
+│   │   │   └── ...
+│   │   ├── 6h/
+│   │   │   ├── BTCUSDT_6h.parquet
+│   │   │   └── ...
+│   │   ├── 1d/
+│   │   │   ├── BTCUSDT_1d.parquet
+│   │   │   └── ...
+│   │   ├── CoinMarketCap/
+│   │   │   ├── market_cap.parquet
+│   │   │   ├── price.parquet
+│   │   │   ├── volume.parquet
+│   │   │   ├── MetaData.csv
+│   │   │   └── MetaData.xlsx
+│   │   └── validation/               ← produced by validate-price stage
+│   │
+│   └── Sentiment/
+│       ├── st-data-full.parquet
+│       ├── st-data-full.xlsx
+│       ├── README.md
+│       ├── bitcoin/submission.csv
+│       ├── ethereum/submission.csv
+│       ├── cryptocurrency/submission.csv
+│       └── ... (one folder per subreddit)
+│
+├── Processed/
+│   └── Sentiment/
+│       └── sentiment_combined.csv
+│
+├── Transformed/
+│   ├── Sentiment_Scored_Vader.csv
+│   ├── Sentiment_Scored_Finbert.csv
+│   ├── Sentiment_Scored_Cryptobert.csv
+│   ├── .vader_checkpoints/
+│   ├── .finbert_checkpoints/
+│   └── .cryptobert_checkpoints/
+│
+├── Features/
+│   ├── price_features_1d.parquet
+│   ├── price_features_1h.parquet
+│   ├── price_features_6h.parquet
+│   ├── sentiment_features_15min.parquet
+│   ├── sentiment_features_1h.parquet
+│   ├── sentiment_features_6h.parquet
+│   ├── sentiment_features_1d.parquet
+│   ├── feature_generation_report.csv
+│   ├── sentiment_coverage.csv
+│   ├── winsorization_thresholds.csv
+│   ├── stationarity_records_v2.parquet
+│   └── stationarity_results_v2.xlsx
+│
+└── Final/
+    ├── features_1h.parquet
+    ├── features_6h.parquet
+    ├── features_1d.parquet
+    └── merge_report.csv
+
+Outputs/
+├── Signals/
+│   ├── 1h/<set_id>.parquet
+│   ├── 6h/<set_id>.parquet
+│   └── 1d/<set_id>.parquet
+├── deskriptiv/
+│   ├── descriptive_statistics.xlsx
+│   └── plots/
+└── diagnostics/
+    ├── logs/
+    └── smoke/
+```
+
+### 2.1  Raw price files — naming convention
+
+```
+Data/Raw/Price/{horizon}/{TICKER}USDT_{suffix}.parquet
+```
+
+| horizon | folder    | filename suffix |
+|---------|-----------|-----------------|
+| 15 min  | `15min/`  | `_15m`          |
+| 1 hour  | `1h/`     | `_1h`           |
+| 4 hour  | `4h/`     | `_4h`           |
+| 6 hour  | `6h/`     | `_6h`           |
+| 1 day   | `1d/`     | `_1d`           |
+
+Examples:
+
+```
+Data/Raw/Price/1d/BTCUSDT_1d.parquet
+Data/Raw/Price/1h/ETHUSDT_1h.parquet
+Data/Raw/Price/15min/ADAUSDT_15m.parquet
+```
+
+OHLCV columns expected in each parquet: `timestamp, open, high, low, close,
+volume` (timestamps in UTC). Both integer-ms and pandas-datetime timestamps
+work — the loader normalises.
+
+The list of tickers used in the thesis is in `configs/coins.yaml`. The current
+universe is:
+
+```
+ADA, BAT, BCH, BNB, BTC, CRO, DOGE, DOT, EOS, ETH, IOTA, KCS, LRC, LTC,
+MANA, NANO, NEO, SOL, TRX, UNI, VET, XLM, XMR, XRP, XTZ
+```
+
+### 2.2  CoinMarketCap reference files
+
+The pipeline expects three CoinMarketCap parquet files plus the metadata
+sheet under `Data/Raw/Price/CoinMarketCap/`:
+
+```
+Data/Raw/Price/CoinMarketCap/market_cap.parquet
+Data/Raw/Price/CoinMarketCap/price.parquet
+Data/Raw/Price/CoinMarketCap/volume.parquet
+Data/Raw/Price/CoinMarketCap/MetaData.csv
+Data/Raw/Price/CoinMarketCap/MetaData.xlsx
+```
+
+Symbol matching handles renamed coins (NANO/XNO, IOTA/MIOTA) — see
+`configs/coins.yaml` for the alias and preferred-symbol mappings.
+
+### 2.3  Raw sentiment files
+
+Each subreddit lives in its own folder; the file is always named
+`submission.csv`:
+
+```
+Data/Raw/Sentiment/{subreddit}/submission.csv
+```
+
+Examples observed in the thesis dataset:
+
+```
+Data/Raw/Sentiment/bitcoin/submission.csv
+Data/Raw/Sentiment/ethereum/submission.csv
+Data/Raw/Sentiment/cryptocurrency/submission.csv
+Data/Raw/Sentiment/dogecoin/submission.csv
+Data/Raw/Sentiment/solana/submission.csv
+Data/Raw/Sentiment/cardano/submission.csv
+Data/Raw/Sentiment/ripple/submission.csv
+Data/Raw/Sentiment/xrp/submission.csv
+Data/Raw/Sentiment/litecoin/submission.csv
+Data/Raw/Sentiment/monero/submission.csv
+Data/Raw/Sentiment/nanocurrency/submission.csv
+Data/Raw/Sentiment/iota/submission.csv
+Data/Raw/Sentiment/polkadot/submission.csv
+Data/Raw/Sentiment/vechain/submission.csv
+Data/Raw/Sentiment/uniswap/submission.csv
+```
+
+Two whole-corpus dumps are also expected:
+
+```
+Data/Raw/Sentiment/st-data-full.parquet
+Data/Raw/Sentiment/st-data-full.xlsx
+```
+
+The mapping from subreddit → ticker(s) is in `subreddit_ticker_mapping.xlsx`
+at the repository root (sheet `Subreddit_Ticker_Mapping`). This file is
+small and tracked in git.
+
+---
+
+## 3. Intermediate files
+
+| File | Stage that writes it | Purpose |
+|------|----------------------|---------|
+| `Data/Processed/Sentiment/sentiment_combined.csv` | `load-sentiment` | Cleaned, deduplicated post-level table |
+| `Data/Transformed/Sentiment_Scored_Vader.csv` | `score-sentiment --model vader` | Post-level VADER scores |
+| `Data/Transformed/Sentiment_Scored_Finbert.csv` | `score-sentiment --model finbert` | Post-level FinBERT scores |
+| `Data/Transformed/Sentiment_Scored_Cryptobert.csv` | `score-sentiment --model cryptobert` | Post-level CryptoBERT scores |
+| `Data/Features/price_features_{horizon}.parquet` | `create-price-features` | Engineered price features per horizon |
+| `Data/Features/sentiment_features_{horizon}.parquet` | `create-sentiment-features` | Engineered sentiment features per horizon |
+| `Data/Final/features_{horizon}.parquet` | `merge-features` | Modelling-ready merged dataset |
+
+---
+
+## 4. Key schemas
+
+### 4.1  `price_features_{horizon}.parquet`
+
+| column | description |
+|--------|-------------|
+| `timestamp`         | Bar end timestamp |
+| `date`              | Calendar date (used for CMC matching) |
+| `ticker`            | Base ticker, e.g. `BTC` |
+| `horizon`           | `"1h"`, `"6h"`, or `"1d"` |
+| `target`            | Binary direction of the next return (0 = down, 1 = up) |
+| `log_return_t`      | Winsorized log return at t |
+| `cum_log_return_7`  | 7-period rolling sum of winsorized log returns |
+| `cum_log_return_14` | 14-period rolling sum of winsorized log returns |
+| `realized_vol_14`   | 14-period rolling std of winsorized log returns |
+| `volume_diff`       | Winsorized first difference of volume |
+| `market_cap_t`      | CoinMarketCap market cap on `date` |
+
+### 4.2  `Data/Final/features_{horizon}.parquet`
+
+Combines `price_features_{horizon}.parquet` with the matching
+`sentiment_features_{horizon}.parquet` via a left join on
+`(ticker, timestamp)`. See `docs/data_dictionary.md` for the full sentiment
+column list.
+
+### 4.3  `Outputs/Signals/{horizon}/{set_id}.parquet`
+
+| column | description |
+|--------|-------------|
+| `timestamp`       | Test-step timestamp |
+| `ticker`          | Base ticker |
+| `target`          | Realised direction |
+| `prediction`      | Predicted direction (0/1) |
+| `probability`     | Predicted probability of class 1 |
+| `set_id`          | Feature-set ID (B1, B2, E1-E4, S1-S7, C1-C5) |
+| `sentiment_model` | `vader` / `finbert` / `cryptobert` (or null for non-sentiment sets) |
+
+---
+
+## 5. Pipeline overview
+
+```
+raw OHLCV (Data/Raw/Price/{horizon}/)
+    → validate-price            → Data/Raw/Price/validation/
+    → create-price-features     → Data/Features/price_features_{horizon}.parquet
+
+raw Reddit (Data/Raw/Sentiment/<subreddit>/submission.csv)
+    → load-sentiment            → Data/Processed/Sentiment/sentiment_combined.csv
+    → score-sentiment {vader,finbert,cryptobert}
+                                → Data/Transformed/Sentiment_Scored_*.csv
+    → create-sentiment-features → Data/Features/sentiment_features_{horizon}.parquet
+    → stationarity              → Data/Features/stationarity_*.{parquet,xlsx}
+
+(price features) + (sentiment features)
+    → merge-features            → Data/Final/features_{horizon}.parquet
+    → run-models                → Outputs/Signals/{horizon}/{set_id}.parquet
+    → diagnostics               → Outputs/diagnostics/sample_report_{horizon}.md
+```
+
+See `docs/pipeline_overview.md` for the same diagram with annotations.
+
+---
+
+## 6. Running smoke tests
+
+Every heavy stage supports `--smoke` (small, deterministic inputs) and
+`--dry-run` (print the plan, do nothing).
+
+```bash
+# Plan a run without touching any files.
+python -m thesis_pipeline.cli create-price-features --horizon 1d --coins BTC ETH --smoke --dry-run
+
+# Smoke-test individual stages
+python -m thesis_pipeline.cli create-price-features --horizon 1d --coins BTC ETH --smoke
+python -m thesis_pipeline.cli score-sentiment --model vader --smoke --max-rows 5000
+python -m thesis_pipeline.cli score-sentiment --model finbert --smoke --max-rows 200
+python -m thesis_pipeline.cli score-sentiment --model cryptobert --smoke --max-rows 200
+python -m thesis_pipeline.cli create-sentiment-features --horizon 1d --smoke --no-plots
+python -m thesis_pipeline.cli merge-features --horizon 1d --smoke
+python -m thesis_pipeline.cli run-models --horizon 1d --set-id B1 --smoke
+
+# Smoke the whole default pipeline at horizon 1d
+python -m thesis_pipeline.cli run-pipeline --horizon 1d --smoke
+```
+
+Smoke outputs go to `Outputs/diagnostics/smoke/`; full production outputs are
+never overwritten unless `--force` is passed.
+
+---
+
+## 7. Running the full pipeline
+
+```bash
+python -m thesis_pipeline.cli run-pipeline --horizon 1d
+python -m thesis_pipeline.cli run-pipeline --horizon 1h
+python -m thesis_pipeline.cli run-pipeline --horizon 6h
+
+# Or stage-by-stage:
+python -m thesis_pipeline.cli validate-price
+python -m thesis_pipeline.cli create-price-features --horizon 1d
+python -m thesis_pipeline.cli create-price-features --horizon 1h
+python -m thesis_pipeline.cli create-price-features --horizon 6h
+python -m thesis_pipeline.cli load-sentiment
+python -m thesis_pipeline.cli score-sentiment --model vader
+python -m thesis_pipeline.cli score-sentiment --model finbert       # heavy (GPU recommended)
+python -m thesis_pipeline.cli score-sentiment --model cryptobert    # heavy (GPU recommended)
+python -m thesis_pipeline.cli create-sentiment-features
+python -m thesis_pipeline.cli merge-features --horizon 1d
+python -m thesis_pipeline.cli run-models --horizon 1d --set-id B1
+```
+
+> **Warning:** FinBERT and CryptoBERT scoring are GPU-heavy and can take many
+> hours on the full corpus. Use smoke mode first to validate paths and
+> outputs.
+
+---
+
+## 8. Reproducibility
+
+- **Paths**       → `configs/paths.yaml`
+- **Horizons**    → `configs/horizons.yaml`
+- **Tickers**     → `configs/coins.yaml`
+- **Feature sets**→ `configs/feature_sets.yaml` (mirror of `feature_sets.xlsx`)
+- **Model specs** → `configs/model_specs.yaml`
+- **Pipeline**    → `configs/pipeline.yaml`
+
+Every stage prints input/output paths, row counts, and mode (smoke/dry-run/full)
+at the top of its run, and optionally writes a per-run log under
+`Outputs/diagnostics/logs/`. See `docs/reproducibility.md` for the full
+recipe.
+
+---
+
+## 9. Large data — do not commit
+
+The following directories are gitignored and **must never be committed**:
+
+```
+Data/Raw/         Data/Processed/   Data/Transformed/
+Data/Features/    Data/Final/
+Outputs/Signals/  Outputs/deskriptiv/   Outputs/diagnostics/
+```
+
+Generic data extensions (`*.parquet`, `*.csv`, `*.pkl`, `*.zip`) are blocked
+globally. The two small Excel metadata files in the repo root —
+`feature_sets.xlsx` and `subreddit_ticker_mapping.xlsx` — are intentionally
+*tracked* because they are required at config-load time and tiny.
+
+---
+
+## 10. Backward compatibility
+
+The original root-level scripts (`Create_Price_Features.py`,
+`Sentiment_score_finbert.py`, `Run_Models.py`, …) still work exactly as
+before. The first comment line of each script points to the equivalent CLI
+command, e.g.:
+
+```python
+# This wrapper is kept for backward compatibility.
+# Preferred usage: python -m thesis_pipeline.cli create-price-features
+```
+
+The new package (`src/thesis_pipeline/`) imports and re-uses these scripts'
+`main()` functions internally, so behavior is preserved bit-for-bit until any
+logic is consciously migrated.

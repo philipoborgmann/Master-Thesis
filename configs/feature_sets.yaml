@@ -1,0 +1,130 @@
+# Feature-set definitions.
+#
+# This YAML mirrors feature_sets.xlsx (sheets: summary, feature_sets) and
+# becomes the canonical, version-controlled source. The code still loads
+# feature_sets.xlsx by default for backward compatibility; switch the
+# default in src/thesis_pipeline/features/feature_registry.py once
+# feature_sets.xlsx is verified to match this file exactly.
+#
+# Set IDs preserved from feature_sets.xlsx / Run_Models.py:
+#   - B1, B2                 (benchmarks)
+#   - E1, E2, E3, E4         (economic / price-only)
+#   - S1, S2, S3, S4, S5, S6, S7  (sentiment sets, applied per scorer)
+#   - C1, C2, C3, C4, C5     (combined price + sentiment sets, per scorer)
+#
+# Feature names below mirror the columns produced by
+#   Create_Price_Features.py and Sentiment_feature_engineering.py.
+# Sentiment features follow the pattern produced upstream:
+#   {model}_{title|selftext|combined}_{mean|median|std|weighted_mean}
+#   {model}_post_count, {model}_bullishness_ratio, etc.
+#
+# NOTE: This file is a structural mirror. Cross-check against
+# feature_sets.xlsx and confirm the exact feature lists before flipping
+# the loader default. Items marked TODO need verification.
+
+source_of_truth: "feature_sets.xlsx"   # change to "feature_sets.yaml" after verification
+
+# ---------------------------------------------------------------------------
+# Common price features (produced by Create_Price_Features.py)
+# ---------------------------------------------------------------------------
+price_features_core:
+  - log_return_t
+  - cum_log_return_7
+  - cum_log_return_14
+  - realized_vol_14
+  - volume_diff
+  - market_cap_t
+
+# ---------------------------------------------------------------------------
+# Feature sets
+# ---------------------------------------------------------------------------
+sets:
+
+  B1:
+    category: benchmark
+    label: "Naive benchmark — rolling probability"
+    features: []
+    sentiment_model: null
+    model_override: "rolling_probability"
+
+  B2:
+    category: benchmark
+    label: "Logistic benchmark — last log return only"
+    features:
+      - log_return_t
+    sentiment_model: null
+
+  E1:
+    category: economic
+    label: "Return + lagged returns"
+    features:
+      - log_return_t
+      - cum_log_return_7
+    sentiment_model: null
+
+  E2:
+    category: economic
+    label: "Return + volatility"
+    features:
+      - log_return_t
+      - realized_vol_14
+    sentiment_model: null
+
+  E3:
+    category: economic
+    label: "Return + volume"
+    features:
+      - log_return_t
+      - volume_diff
+    sentiment_model: null
+
+  E4:
+    category: economic
+    label: "Full economic set"
+    features:
+      - log_return_t
+      - cum_log_return_7
+      - cum_log_return_14
+      - realized_vol_14
+      - volume_diff
+      - market_cap_t
+    sentiment_model: null
+
+  # ---------------------------------------------------------------------------
+  # Sentiment-only sets (S*) — applied separately for VADER, FinBERT, CryptoBERT
+  # The {model} placeholder is substituted to vader / finbert / cryptobert.
+  # TODO: confirm exact column list against feature_sets.xlsx.
+  # ---------------------------------------------------------------------------
+  S1:
+    category: sentiment
+    label: "Sentiment combined mean"
+    features:
+      - "{model}_combined_mean"
+    per_sentiment_model: true
+
+  S2:
+    category: sentiment
+    label: "Sentiment combined weighted mean (engagement)"
+    features:
+      - "{model}_combined_weighted_mean"
+    per_sentiment_model: true
+
+  # ---------------------------------------------------------------------------
+  # Combined economic + sentiment sets (C*)
+  # ---------------------------------------------------------------------------
+  C1:
+    category: combined
+    label: "Full economic + sentiment combined mean"
+    features:
+      - log_return_t
+      - cum_log_return_7
+      - cum_log_return_14
+      - realized_vol_14
+      - volume_diff
+      - market_cap_t
+      - "{model}_combined_mean"
+    per_sentiment_model: true
+
+# TODO(refactor_log): cross-check additional sets S3-S7 / C2-C5 against
+# feature_sets.xlsx — leave them resolved via the Excel loader until the
+# mapping is verified by hand.

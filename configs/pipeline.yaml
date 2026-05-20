@@ -1,0 +1,186 @@
+# Pipeline stage configuration.
+# Each stage references inputs/outputs by path-key (see configs/paths.yaml).
+
+stages:
+
+  validate_price:
+    script: "Price_Data_Validation.py"
+    module: "thesis_pipeline.price.validate"
+    inputs:
+      - raw_price_root
+      - cmc_root
+    outputs:
+      - price_validation_root
+    heavy: false
+    supports_smoke: true
+    smoke:
+      horizon: "1d"
+      coins: [BTC, ETH]
+
+  create_price_features:
+    script: "Create_Price_Features.py"
+    module: "thesis_pipeline.price.features"
+    inputs:
+      - raw_price_root
+      - cmc_market_cap
+    outputs:
+      - price_features_pattern
+      - feature_generation_report
+      - winsorization_thresholds
+      - cmc_marketcap_column_matches
+    heavy: false
+    supports_smoke: true
+    smoke:
+      horizon: "1d"
+      coins: [BTC, ETH]
+
+  load_sentiment:
+    script: "Sentiment_Data_Load.py"
+    module: "thesis_pipeline.sentiment.load"
+    inputs:
+      - raw_sentiment_root
+      - subreddit_ticker_mapping
+    outputs:
+      - sentiment_combined
+      - descriptive_root
+    heavy: true
+    supports_smoke: true
+    smoke:
+      max_rows: 10000
+
+  score_vader:
+    script: "Sentiment_score_vader.py"
+    module: "thesis_pipeline.sentiment.score_vader"
+    inputs:
+      - sentiment_combined
+    outputs:
+      - sentiment_scored_vader
+    heavy: false
+    supports_smoke: true
+    smoke:
+      max_rows: 5000
+
+  score_finbert:
+    script: "Sentiment_score_finbert.py"
+    module: "thesis_pipeline.sentiment.score_finbert"
+    inputs:
+      - sentiment_combined
+    outputs:
+      - sentiment_scored_finbert
+      - finbert_checkpoints
+    heavy: true
+    supports_smoke: true
+    smoke:
+      max_rows: 200
+
+  score_cryptobert:
+    script: "Sentiment_score_cryptobert.py"
+    module: "thesis_pipeline.sentiment.score_cryptobert"
+    inputs:
+      - sentiment_combined
+    outputs:
+      - sentiment_scored_cryptobert
+      - cryptobert_checkpoints
+    heavy: true
+    supports_smoke: true
+    smoke:
+      max_rows: 200
+
+  create_sentiment_features:
+    script: "Sentiment_feature_engineering.py"
+    module: "thesis_pipeline.sentiment.aggregate"
+    inputs:
+      - sentiment_scored_vader
+      - sentiment_scored_finbert
+      - sentiment_scored_cryptobert
+    outputs:
+      - sentiment_features_pattern
+      - sentiment_coverage
+    heavy: false
+    supports_smoke: true
+    smoke:
+      horizon: "1d"
+      max_rows: 10000
+      no_plots: true
+
+  stationarity:
+    script: "Sentiment_Stationarity_Test.py"
+    module: "thesis_pipeline.sentiment.stationarity"
+    inputs:
+      - sentiment_features_pattern
+    outputs:
+      - stationarity_records
+      - stationarity_results
+      - stationarity_plots
+    heavy: true
+    supports_smoke: true
+    smoke:
+      horizon: "1d"
+      coins: [BTC, ETH]
+
+  merge_features:
+    script: "Merge_Features.py"
+    module: "thesis_pipeline.features.merge"
+    inputs:
+      - price_features_pattern
+      - sentiment_features_pattern
+      - sentiment_coverage
+    outputs:
+      - final_features_pattern
+      - merge_report
+    heavy: false
+    supports_smoke: true
+    smoke:
+      horizon: "1d"
+
+  run_models:
+    script: "Run_Models.py"
+    module: "thesis_pipeline.modeling.run_models"
+    inputs:
+      - final_features_pattern
+      - feature_sets_xlsx
+    outputs:
+      - signals_pattern
+      - signals_metrics
+    heavy: true
+    supports_smoke: true
+    smoke:
+      horizon: "1d"
+      set_id: "B1"
+      coins: [BTC, ETH]
+
+  diagnostics:
+    module: "thesis_pipeline.diagnostics.sample_report"
+    inputs:
+      - final_features_pattern
+      - signals_pattern
+    outputs:
+      - diagnostics_root
+    heavy: false
+    supports_smoke: true
+    smoke:
+      horizon: "1d"
+
+  reports:
+    module: "thesis_pipeline.diagnostics.sample_report"
+    inputs:
+      - signals_pattern
+    outputs:
+      - descriptive_root
+    heavy: false
+    supports_smoke: true
+
+# Order in which stages run for `run-pipeline` when no --stages list is given.
+default_order:
+  - validate_price
+  - create_price_features
+  - load_sentiment
+  - score_vader
+  - score_finbert
+  - score_cryptobert
+  - create_sentiment_features
+  - stationarity
+  - merge_features
+  - run_models
+  - diagnostics
+  - reports

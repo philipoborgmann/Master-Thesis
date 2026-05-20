@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# This wrapper is kept for backward compatibility. Preferred usage: python -m thesis_pipeline.cli load-sentiment
 """
 Sentiment_Data_Load.py
 ======================
