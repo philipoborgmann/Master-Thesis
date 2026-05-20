@@ -1,50 +1,16 @@
 #!/usr/bin/env python3
-# This wrapper is kept for backward compatibility. Preferred usage: python -m thesis_pipeline.cli run-models
-"""
-Run_Models.py
-==============
-Ridge (L2) logistic regression with expanding-window walk-forward validation
-across all feature sets and horizons defined in feature_sets.xlsx.
+# This wrapper is kept for backward compatibility.
+# Preferred usage: python -m thesis_pipeline.cli run-models
+"""Legacy redirect.
 
-Validation design:
-  - Initial time-series split: first 50% of chronologically sorted
-    observations per ticker form the initial training window.
-  - Expanding walk-forward with step size 1:
-    For each step t, train on observations [0, t-1], predict at t.
-  - No random splits, no k-fold CV — temporal order is never violated.
-  - StandardScaler re-fitted on each training window (no leakage).
+All modeling logic now lives in ``thesis_pipeline.modeling.run_models``.
+This file exists only so that existing invocations like
 
-Model:
-  - LogisticRegression(penalty="l2", C=1.0, solver="lbfgs")
-  - No hyperparameter search inside the walk-forward loop.
-  - C is configurable via --C but defaults to 1.0.
+    python Run_Models.py --horizon 1d --set_id B1 --ticker BTC
 
-Benchmark:
-  - Rolling probability: p_hat = mean(y_train), predict 1 if p_hat >= 0.5.
-  - Produces calibrated probabilities for log loss / Brier score comparison.
-
-Metrics (per ticker + pooled):
-  - Accuracy, Balanced Accuracy, F1, Precision, Recall
-  - Log Loss, Brier Score
-  - n_obs, first/last test timestamp
-
-Input:
-    Data/Final/features_{horizon}.parquet
-    feature_sets.xlsx
-
-Output:
-    Outputs/Signals/{horizon}/{set_id}_{sentiment_model}.parquet
-    Outputs/Signals/metrics_summary.csv
-
-Usage:
-    python Run_Models.py
-    python Run_Models.py --horizon 1d
-    python Run_Models.py --set_id S1 --horizon 1d
-    python Run_Models.py --C 0.1 --restart
+continue to work. It contains no logic of its own.
 """
 
-import argparse
-import os
 import sys
 import time
 import warnings
@@ -532,21 +498,13 @@ def main():
         print(f"  Metrics: {metrics_path}")
         print(f"  Signals: {os.path.abspath(SIGNAL_DIR)}")
 
-        # Quick pooled leaderboard
-        pooled = metrics_df[metrics_df["ticker"] == "pooled"].copy()
-        valid = pooled[pooled["accuracy"].notna()]
-        if not valid.empty:
-            print(f"\n  Top 10 by accuracy (pooled):")
-            top = valid.nlargest(10, "accuracy")
-            for _, r in top.iterrows():
-                sm = f"/{r['sentiment_model']}" if str(r.get("sentiment_model", "-")) != "-" else ""
-                print(f"    {r['set_id']}{sm:15s} {r['horizon']:3s}  "
-                      f"acc={r['accuracy']:.4f}  "
-                      f"f1={r.get('f1', np.nan):.4f}  "
-                      f"brier={r.get('brier_score', np.nan):.4f}  "
-                      f"n={int(r['n_obs'])}")
-        print()
+# Make the in-repo ``src/`` layout importable when this file is executed
+# directly from the repository root.
+_SRC = Path(__file__).resolve().parent / "src"
+if _SRC.exists() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
+from thesis_pipeline.modeling.run_models import main  # noqa: E402
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
