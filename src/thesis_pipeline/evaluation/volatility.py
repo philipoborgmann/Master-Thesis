@@ -29,10 +29,27 @@ from ..logging_utils import get_logger
 from .metrics import GROUP_KEYS, _group_meta
 
 REGIME_LABELS = ("low", "mid", "high")
-_OHLCV_KEYS = {"open": ["open", "Open", "OPEN"],
-               "high": ["high", "High", "HIGH"],
-               "low":  ["low",  "Low",  "LOW"],
-               "close":["close","Close","CLOSE"]}
+
+# Column-name candidates that map onto the canonical OHLC fields. Pandas
+# parquet writers do not normalise these so we have to handle the common
+# variants explicitly (lowercase, Title, UPPER, plus a few Binance-style
+# aliases such as "Open Price").
+_OHLCV_KEYS = {
+    "open":  ["open",  "Open",  "OPEN",  "open_price",  "Open Price"],
+    "high":  ["high",  "High",  "HIGH",  "high_price",  "High Price"],
+    "low":   ["low",   "Low",   "LOW",   "low_price",   "Low Price"],
+    "close": ["close", "Close", "CLOSE", "close_price", "Close Price"],
+}
+
+# Timestamp-column candidates, in priority order. The first column found wins.
+_TS_CANDIDATES = (
+    "timestamp", "Timestamp", "TIMESTAMP",
+    "open_time", "Open time", "Open Time", "OpenTime",
+    "close_time", "Close time", "Close Time", "CloseTime",
+    "date", "Date", "DATE",
+    "datetime", "Datetime", "DATETIME", "DateTime",
+    "time", "Time",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -58,28 +75,84 @@ def _resolve_ohlcv_path(ticker: str) -> Path | None:
     return None
 
 
+def _coerce_to_utc_datetime(series: pd.Series) -> pd.Series:
+    """Best-effort coercion of any timestamp-like series to tz-aware UTC."""
+    if pd.api.types.is_integer_dtype(series) or pd.api.types.is_float_dtype(series):
+        # Detect epoch unit by magnitude.
+        try:
+            mx = float(series.dropna().abs().max())
+        except (TypeError, ValueError):
+            mx = 0.0
+        if mx > 1e17:
+            unit = "ns"
+        elif mx > 1e14:
+            unit = "us"
+        elif mx > 1e11:
+            unit = "ms"
+        else:
+            unit = "s"
+        return pd.to_datetime(series, unit=unit, utc=True, errors="coerce")
+    return pd.to_datetime(series, utc=True, errors="coerce")
+
+
+def _pick_timestamp_column(df: pd.DataFrame) -> pd.Series | None:
+    """Return a UTC-aware timestamp series sourced from the first matching column."""
+    for candidate in _TS_CANDIDATES:
+        if candidate in df.columns:
+            return _coerce_to_utc_datetime(df[candidate])
+    # Case-insensitive fallback for any column whose lowered name matches.
+    lowered = {str(c).lower(): c for c in df.columns}
+    for candidate in _TS_CANDIDATES:
+        key = candidate.lower()
+        if key in lowered:
+            return _coerce_to_utc_datetime(df[lowered[key]])
+    return None
+
+
 def _normalise_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a frame with ``date, open, high, low, close`` columns."""
-    if df.index.name in ("timestamp", "date", "Date", "Timestamp"):
+    """Return a frame with ``date, open, high, low, close`` columns.
+
+    ``date`` is a ``pd.Timestamp`` normalised to UTC midnight so that it has
+    a single ``datetime64[ns, UTC]`` dtype and can be merged against signal
+    timestamps without dtype mismatches.
+    """
+    df = df.copy()
+    if df.index.name and str(df.index.name).lower() in {
+        c.lower() for c in _TS_CANDIDATES
+    }:
         df = df.reset_index()
-    cols = {c.lower(): c for c in df.columns}
-    out = pd.DataFrame()
-    if "timestamp" in cols:
-        out["timestamp"] = pd.to_datetime(df[cols["timestamp"]], utc=True, errors="coerce")
-    elif "date" in cols:
-        out["timestamp"] = pd.to_datetime(df[cols["date"]], utc=True, errors="coerce")
-    else:
-        # Fall back to the index when no time column is present.
-        out["timestamp"] = pd.to_datetime(df.index, utc=True, errors="coerce")
+
+    ts = _pick_timestamp_column(df)
+    if ts is None:
+        # Last-ditch: use the index, regardless of name.
+        try:
+            ts = _coerce_to_utc_datetime(pd.Series(df.index))
+        except Exception:  # noqa: BLE001
+            return pd.DataFrame()
+
+    out = pd.DataFrame({"timestamp": ts.values})
     for name, candidates in _OHLCV_KEYS.items():
+        chosen = None
         for c in candidates:
             if c in df.columns:
-                out[name] = pd.to_numeric(df[c], errors="coerce")
+                chosen = df[c]
                 break
-        if name not in out.columns:
+        if chosen is None:
+            # Case-insensitive secondary pass.
+            lowered = {str(c).lower(): c for c in df.columns}
+            for c in candidates:
+                if c.lower() in lowered:
+                    chosen = df[lowered[c.lower()]]
+                    break
+        if chosen is None:
             return pd.DataFrame()
+        out[name] = pd.to_numeric(chosen, errors="coerce").values
+
     out = out.dropna(subset=["timestamp", "open", "high", "low", "close"])
-    out["date"] = out["timestamp"].dt.tz_convert("UTC").dt.date
+    if out.empty:
+        return out
+    # Normalise to UTC midnight so the merge key dtype is stable.
+    out["date"] = pd.to_datetime(out["timestamp"], utc=True).dt.normalize()
     out = out.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
     return out[["date", "open", "high", "low", "close"]]
 
@@ -182,15 +255,20 @@ def build_regime_lookup(tickers: Iterable[str]) -> pd.DataFrame:
 
 def _attach_date(signals: pd.DataFrame) -> pd.DataFrame:
     out = signals.copy()
-    out["date"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce") \
-                    .dt.tz_convert("UTC").dt.date
+    out["date"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce").dt.normalize()
     out["ticker"] = out["ticker"].astype(str).str.upper()
     return out
 
 
 def attach_regimes(signals: pd.DataFrame,
                    regime_lookup: pd.DataFrame) -> pd.DataFrame:
-    """Left-merge ``regime`` onto signals via ``(ticker, date)``."""
+    """Left-merge ``regime`` onto signals via ``(ticker, date)``.
+
+    Both sides are normalised to UTC midnight (``datetime64[ns, UTC]``) so the
+    join is dtype-stable. Logs a warning when the join produces zero matches
+    despite the lookup being non-empty — that is the symptom the user hit on
+    real data.
+    """
     if signals.empty:
         return signals
     if regime_lookup is None or regime_lookup.empty:
@@ -198,8 +276,22 @@ def attach_regimes(signals: pd.DataFrame,
         out["regime"] = np.nan
         return out
     sig = _attach_date(signals)
-    return sig.merge(regime_lookup[["ticker", "date", "regime"]],
-                     on=["ticker", "date"], how="left")
+
+    rl = regime_lookup[["ticker", "date", "regime"]].copy()
+    rl["ticker"] = rl["ticker"].astype(str).str.upper()
+    # Force both sides to the same datetime64[ns, UTC] dtype.
+    rl["date"] = pd.to_datetime(rl["date"], utc=True, errors="coerce").dt.normalize()
+
+    out = sig.merge(rl, on=["ticker", "date"], how="left")
+    matched = int(out["regime"].notna().sum())
+    if matched == 0:
+        get_logger().warning(
+            "evaluate-signals: regime join produced 0 matches "
+            "(signals=%d rows, lookup=%d rows). Common causes: "
+            "ticker/date dtype mismatch or empty regime values.",
+            len(sig), len(rl),
+        )
+    return out
 
 
 def _daily_aggregate(group: pd.DataFrame) -> pd.DataFrame:

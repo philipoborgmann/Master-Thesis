@@ -342,16 +342,41 @@ def test_mcnemar_b_plus_c_zero_is_p_one():
     assert pval == 1.0
 
 
-def test_mcnemar_table_excludes_b1_and_non_eligible(signals_env):
+def test_mcnemar_table_excludes_benchmarks_and_non_eligible(signals_env):
     df = loading.load_all_signals("1d")
     fs = pd.read_excel(signals_env["feature_sets"], sheet_name="feature_sets")
     fs.columns = [c.strip().lower().replace(" ", "_") for c in fs.columns]
     df = loading.attach_feature_set_metadata(df, fs)
-    out = significance.mcnemar_table(df)
-    # B1 itself is excluded; only sentiment+combined rows remain
-    assert "B1" not in out["set_id"].unique()
-    # Only categories sentiment+combined → 2 rows for the 1d horizon
-    assert len(out) == 2
+    out = significance.mcnemar_table(df, benchmarks=("B1", "B2"))
+    # Benchmark sets never appear as the *tested* set_id.
+    assert {"B1", "B2"}.isdisjoint(out["set_id"].unique())
+    # Only sentiment+combined are eligible → S1 and C1 = 2 sets,
+    # tested against both benchmarks where present → expect rows per (set × benchmark)
+    # Note: B2 is not part of this synthetic env, so only B1 contributes.
+    assert set(out["set_id"]) == {"S1", "C1"}
+    assert set(out["benchmark"]) == {"B1"}
+
+
+def test_mcnemar_wide_disambiguates_benchmarks():
+    long = pd.DataFrame({
+        "horizon": ["1d", "1d"],
+        "set_id":  ["S1", "S1"],
+        "sentiment_model": ["vader", "vader"],
+        "benchmark": ["B1", "B2"],
+        "mcnemar_stat": [3.5, 1.2],
+        "mcnemar_pval": [0.02, 0.27],
+        "significant_vs_benchmark": [True, False],
+        "b": [10, 12],
+        "c": [20, 14],
+        "n_matched": [100, 100],
+    })
+    wide = significance.mcnemar_wide(long, benchmarks=("B1", "B2"))
+    assert len(wide) == 1
+    row = wide.iloc[0]
+    assert row["mcnemar_pval_vs_b1"] == pytest.approx(0.02)
+    assert row["mcnemar_pval_vs_b2"] == pytest.approx(0.27)
+    assert bool(row["significant_vs_b1"]) is True
+    assert bool(row["significant_vs_b2"]) is False
 
 
 # ---------------------------------------------------------------------------
@@ -378,17 +403,35 @@ def test_full_evaluation_writes_excel_and_csvs(signals_env):
     assert rc == 0
     assert (out_dir / "signal_evaluation.xlsx").exists()
     for name in ("pooled_metrics.csv", "per_ticker_metrics.csv",
-                 "threshold_analysis.csv", "volatility_stratification.csv"):
+                 "threshold_analysis.csv", "volatility_stratification.csv",
+                 "threshold_lift.csv", "mcnemar_tests.csv"):
         assert (out_dir / name).exists()
-    # Smoke-check the pooled CSV
+    # Pooled CSV must carry both the disambiguated McNemar columns AND the
+    # legacy back-compat aliases.
     pooled = pd.read_csv(out_dir / "pooled_metrics.csv")
     assert set(pooled["set_id"]) == {"B1", "E4", "S1", "C1"}
-    assert "mcnemar_pval" in pooled.columns
+    for col in ("mcnemar_pval_vs_b1", "significant_vs_b1",
+                "mcnemar_pval", "significant_vs_benchmark"):
+        assert col in pooled.columns
     # B1's McNemar columns are NaN; sentiment/combined have a real test
     bench = pooled[pooled["set_id"] == "B1"].iloc[0]
-    assert pd.isna(bench["mcnemar_pval"])
+    assert pd.isna(bench["mcnemar_pval_vs_b1"])
     sent = pooled[pooled["set_id"] == "S1"].iloc[0]
+    assert pd.notna(sent["mcnemar_pval_vs_b1"])
+    # Backward-compat alias mirrors the B1 value.
+    assert pd.isna(bench["mcnemar_pval"])
     assert pd.notna(sent["mcnemar_pval"])
+
+    # threshold_lift.csv must be populated for sentiment/combined sets and
+    # carry lift_accuracy = accuracy_model − accuracy_benchmark.
+    lift = pd.read_csv(out_dir / "threshold_lift.csv")
+    assert not lift.empty
+    assert set(lift["set_id"]) == {"S1", "C1"}
+    assert set(lift["threshold"]) == {0.50, 0.55, 0.60, 0.65}
+    # Algebraic invariant: lift_accuracy == accuracy_model − accuracy_benchmark.
+    valid = lift.dropna(subset=["accuracy_model", "accuracy_benchmark", "lift_accuracy"])
+    diff = valid["accuracy_model"] - valid["accuracy_benchmark"]
+    assert np.allclose(diff.values, valid["lift_accuracy"].values, atol=1e-6)
 
 
 def test_no_volatility_flag_skips_regime_step(signals_env):
@@ -414,3 +457,91 @@ def test_cli_evaluate_signals_help_runs():
     parser = cli.build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["evaluate-signals", "--help"])
+
+
+def test_threshold_lift_algebra_synthetic():
+    """The matched-observation lift must equal acc_model − acc_benchmark."""
+    rng = np.random.default_rng(42)
+    n = 200
+    base_ts = pd.date_range("2024-01-01", periods=n, freq="D", tz="UTC")
+    target = rng.integers(0, 2, n)
+
+    # Model: 60% accuracy, probability skewed away from 0.5
+    flip_m = rng.random(n) > 0.6
+    pred_m = np.where(flip_m, 1 - target, target).astype(int)
+    prob_m = np.where(pred_m == 1,
+                      rng.uniform(0.55, 0.95, n),
+                      rng.uniform(0.05, 0.45, n))
+
+    # Benchmark: always 1, prob 0.5
+    pred_b = np.ones(n, dtype=int)
+    prob_b = np.full(n, 0.5)
+
+    sig = pd.concat([
+        pd.DataFrame({"timestamp": base_ts, "ticker": "BTC",
+                       "target": target, "prediction": pred_m,
+                       "probability": prob_m, "set_id": "S1",
+                       "sentiment_model": "vader", "horizon": "1d",
+                       "category": "sentiment"}),
+        pd.DataFrame({"timestamp": base_ts, "ticker": "BTC",
+                       "target": target, "prediction": pred_b,
+                       "probability": prob_b, "set_id": "B1",
+                       "sentiment_model": "-", "horizon": "1d",
+                       "category": "benchmark"}),
+    ], ignore_index=True)
+
+    out = thresholds.threshold_lift_table(sig, benchmarks=("B1",),
+                                          thresholds=(0.50, 0.65))
+    assert not out.empty
+    # All sentiment rows present, both thresholds
+    assert set(out["threshold"]) == {0.50, 0.65}
+    # Coverage at 0.5 == 1.0 (model trades on every observation)
+    cov50 = out[out["threshold"] == 0.50]["coverage_model"].iloc[0]
+    assert cov50 == pytest.approx(1.0)
+    # n_matched must shrink (or equal) when threshold rises
+    n_m50 = out[out["threshold"] == 0.50]["n_matched"].iloc[0]
+    n_m65 = out[out["threshold"] == 0.65]["n_matched"].iloc[0]
+    assert n_m65 <= n_m50
+
+
+def test_volatility_regime_join_dtype_stable(tmp_path):
+    """Regression: signal date + OHLCV date must use the same dtype.
+
+    Both sides go through ``pd.to_datetime(..., utc=True).dt.normalize()`` so
+    the merge key is ``datetime64[ns, UTC]`` on both sides.
+    """
+    # Build a synthetic OHLCV with int-ms timestamps (the trickiest case)
+    rng = np.random.default_rng(13)
+    n_days = 60
+    start = pd.Timestamp("2024-01-01", tz="UTC")
+    ts_ms = [(start + pd.Timedelta(days=i)).value // 1_000_000 for i in range(n_days)]
+    ohlcv = pd.DataFrame({
+        "open_time": ts_ms,
+        "Open": 100 + rng.normal(0, 1, n_days),
+        "High": 102 + rng.normal(0, 1, n_days),
+        "Low":  98  + rng.normal(0, 1, n_days),
+        "Close": 100 + rng.normal(0, 1, n_days),
+    })
+    out = volatility._normalise_ohlcv(ohlcv)
+    assert not out.empty
+    # date column must be tz-aware datetime64
+    assert pd.api.types.is_datetime64_any_dtype(out["date"])
+
+    # Build a fake regime lookup
+    lookup = pd.DataFrame({
+        "ticker": "BTC", "date": out["date"],
+        "regime": (["low"] * 20) + (["mid"] * 20) + (["high"] * 20),
+    })
+
+    # Signals with naive timestamps — attach_regimes must still join.
+    sig = pd.DataFrame({
+        "timestamp": [start + pd.Timedelta(days=i) for i in range(n_days)],
+        "ticker":    "BTC",
+        "target":    rng.integers(0, 2, n_days),
+        "prediction": rng.integers(0, 2, n_days),
+        "probability": rng.random(n_days),
+        "set_id": "S1", "sentiment_model": "vader", "horizon": "1d",
+    })
+    merged = volatility.attach_regimes(sig, lookup)
+    # Every observation must have found a regime.
+    assert merged["regime"].notna().all()

@@ -115,3 +115,135 @@ def threshold_analysis_table(signals: pd.DataFrame,
     front = ["horizon", "set_id", "category", "sentiment_model", "label", "threshold"]
     rest = [c for c in out.columns if c not in front]
     return out[front + rest].reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Threshold lift vs benchmark (conditional outperformance)
+# ---------------------------------------------------------------------------
+#
+# At high thresholds the model trades only on its most confident calls. The
+# thesis-relevant question is: *on the observations where the model trades,
+# how do we compare to the benchmark?*  We measure this with a matched-
+# observation lift:
+#
+#   1. For each (model_set × threshold), pick the rows the MODEL would trade.
+#   2. Join those rows against the benchmark on (timestamp, ticker).
+#   3. Compute model accuracy and benchmark accuracy on the matched subset.
+#   4. lift_accuracy = accuracy_model − accuracy_benchmark.
+#   5. Compute a continuity-corrected McNemar on the matched subset to test
+#      whether the lift is statistically significant.
+#
+# This gives a much richer thesis story than the unconditional pooled
+# accuracy — sentiment can perfectly well be useless on average yet useful
+# at high model confidence (or vice versa).
+
+def _matched_lift(model_grp: pd.DataFrame,
+                  bench_grp: pd.DataFrame,
+                  threshold: float) -> dict:
+    """Lift of model accuracy vs benchmark on the model's traded subset."""
+    if model_grp.empty:
+        return {"n_traded": 0, "n_matched": 0,
+                "accuracy_model": np.nan,
+                "accuracy_benchmark": np.nan,
+                "lift_accuracy": np.nan,
+                "mcnemar_stat": np.nan,
+                "mcnemar_pval": np.nan,
+                "significant_vs_benchmark": False}
+
+    prob = np.clip(model_grp["probability"].astype(float).values, 1e-15, 1 - 1e-15)
+    mask = _trade_mask(prob, threshold)
+    traded = model_grp.loc[mask].copy()
+    n_traded = int(len(traded))
+    if n_traded == 0 or bench_grp.empty:
+        return {"n_traded": n_traded, "n_matched": 0,
+                "accuracy_model": np.nan,
+                "accuracy_benchmark": np.nan,
+                "lift_accuracy": np.nan,
+                "mcnemar_stat": np.nan,
+                "mcnemar_pval": np.nan,
+                "significant_vs_benchmark": False}
+
+    traded["__pred_model__"] = _predictions_at_threshold(prob, threshold)[mask]
+    matched = traded.merge(
+        bench_grp[["timestamp", "ticker", "target", "prediction"]]
+            .rename(columns={"target": "target_bench",
+                             "prediction": "__pred_bench__"}),
+        on=["timestamp", "ticker"], how="inner",
+    )
+    if matched.empty:
+        return {"n_traded": n_traded, "n_matched": 0,
+                "accuracy_model": np.nan,
+                "accuracy_benchmark": np.nan,
+                "lift_accuracy": np.nan,
+                "mcnemar_stat": np.nan,
+                "mcnemar_pval": np.nan,
+                "significant_vs_benchmark": False}
+
+    y = matched["target"].astype(int).values
+    correct_m = (matched["__pred_model__"].astype(int).values == y).astype(int)
+    correct_b = (matched["__pred_bench__"].astype(int).values == y).astype(int)
+    acc_m = float(correct_m.mean())
+    acc_b = float(correct_b.mean())
+
+    # Continuity-corrected McNemar on the matched subset.
+    from .significance import mcnemar_continuity_corrected, SIGNIFICANCE_ALPHA
+    b = int(((correct_b == 1) & (correct_m == 0)).sum())
+    c = int(((correct_b == 0) & (correct_m == 1)).sum())
+    stat, pval = mcnemar_continuity_corrected(b, c)
+    return {
+        "n_traded": n_traded, "n_matched": int(len(matched)),
+        "accuracy_model": round(acc_m, 6),
+        "accuracy_benchmark": round(acc_b, 6),
+        "lift_accuracy": round(acc_m - acc_b, 6),
+        "mcnemar_stat": stat,
+        "mcnemar_pval": pval,
+        "significant_vs_benchmark": bool(pval < SIGNIFICANCE_ALPHA),
+    }
+
+
+def threshold_lift_table(signals: pd.DataFrame,
+                         benchmarks: tuple[str, ...] = ("B1", "B2"),
+                         thresholds: tuple[float, ...] = DEFAULT_THRESHOLDS,
+                         ) -> pd.DataFrame:
+    """Per (horizon × set × threshold × benchmark): matched-observation lift.
+
+    Rows for the benchmark set itself are omitted (you don't lift a benchmark
+    against itself). Eligibility follows the McNemar contract — sentiment and
+    combined sets only.
+    """
+    if signals.empty or "category" not in signals.columns:
+        return pd.DataFrame()
+    rows: list[dict] = []
+    for horizon, hz_grp in signals.groupby("horizon", dropna=False):
+        bench_frames = {bid: hz_grp[hz_grp["set_id"] == bid] for bid in benchmarks}
+        for keys, grp in hz_grp.groupby(list(GROUP_KEYS), dropna=False):
+            set_id = keys[1]
+            if set_id in benchmarks:
+                continue
+            cats = grp["category"].dropna().astype(str)
+            category = cats.iloc[0] if not cats.empty else ""
+            if category.lower() not in ("sentiment", "combined"):
+                continue
+            n_obs = int(len(grp))
+            for t in thresholds:
+                for bid in benchmarks:
+                    bench = bench_frames.get(bid, pd.DataFrame())
+                    if bench.empty:
+                        continue
+                    res = _matched_lift(grp, bench, t)
+                    res.update(dict(zip(GROUP_KEYS, keys)))
+                    res["benchmark"] = bid
+                    res["category"]  = category
+                    res["threshold"] = t
+                    res["coverage_model"] = round(res["n_traded"] / n_obs, 6) \
+                        if n_obs else 0.0
+                    rows.append(res)
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    front = ["horizon", "set_id", "category", "sentiment_model", "benchmark",
+             "threshold", "n_traded", "coverage_model", "n_matched",
+             "accuracy_model", "accuracy_benchmark", "lift_accuracy",
+             "mcnemar_stat", "mcnemar_pval", "significant_vs_benchmark"]
+    rest = [col for col in out.columns if col not in front]
+    return out[front + rest].reset_index(drop=True)
