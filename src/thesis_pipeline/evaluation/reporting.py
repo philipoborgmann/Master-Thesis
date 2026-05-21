@@ -32,6 +32,8 @@ def build_leaderboard(pooled: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
     cols = [c for c in ("horizon", "set_id", "category", "sentiment_model", "label",
                         "accuracy", "balanced_accuracy", "f1", "brier_score",
                         "log_loss", "n_obs", "n_tickers",
+                        "mcnemar_pval_vs_b1", "significant_vs_b1",
+                        "mcnemar_pval_vs_b2", "significant_vs_b2",
                         "mcnemar_pval", "significant_vs_benchmark") if c in pooled.columns]
     out = (pooled[cols]
            .sort_values(["horizon", "accuracy"], ascending=[True, False])
@@ -43,7 +45,9 @@ def build_leaderboard(pooled: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
 
 def build_summary(pooled: pd.DataFrame,
                   threshold_df: pd.DataFrame,
-                  volatility_df: pd.DataFrame) -> pd.DataFrame:
+                  volatility_df: pd.DataFrame,
+                  *,
+                  threshold_lift: pd.DataFrame | None = None) -> pd.DataFrame:
     """Thesis-ready aggregate overview as a long-form table."""
     rows: list[dict] = []
     if not pooled.empty:
@@ -105,6 +109,23 @@ def build_summary(pooled: pd.DataFrame,
                 "horizon": r["horizon"], "threshold": r["threshold"],
                 "metric": "accuracy", "value": r["accuracy"],
                 "coverage": r["coverage"],
+            })
+    if threshold_lift is not None and not threshold_lift.empty:
+        # Best matched-observation lift per (horizon, threshold, benchmark).
+        lift = (threshold_lift.dropna(subset=["lift_accuracy"])
+                              .sort_values("lift_accuracy", ascending=False)
+                              .groupby(["horizon", "threshold", "benchmark"])
+                              .head(1))
+        for _, r in lift.iterrows():
+            rows.append({
+                "section": "best_threshold_lift",
+                "horizon": r["horizon"], "threshold": r["threshold"],
+                "benchmark": r["benchmark"],
+                "set_id":    r["set_id"],
+                "sentiment_model": r.get("sentiment_model", "-"),
+                "metric": "lift_accuracy", "value": r["lift_accuracy"],
+                "n_matched": int(r.get("n_matched", 0)),
+                "significant": bool(r.get("significant_vs_benchmark", False)),
             })
     return pd.DataFrame(rows)
 
@@ -178,7 +199,9 @@ def write_csv_outputs(out_dir: Path, *,
                       pooled: pd.DataFrame,
                       per_ticker: pd.DataFrame,
                       threshold: pd.DataFrame,
-                      volatility: pd.DataFrame) -> dict[str, Path]:
+                      volatility: pd.DataFrame,
+                      threshold_lift: pd.DataFrame | None = None,
+                      mcnemar: pd.DataFrame | None = None) -> dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = {
         "pooled":    out_dir / "pooled_metrics.csv",
@@ -190,6 +213,12 @@ def write_csv_outputs(out_dir: Path, *,
     per_ticker.to_csv(paths["per_ticker"], index=False)
     threshold.to_csv(paths["threshold"], index=False)
     volatility.to_csv(paths["volatility"], index=False)
+    if threshold_lift is not None:
+        paths["threshold_lift"] = out_dir / "threshold_lift.csv"
+        threshold_lift.to_csv(paths["threshold_lift"], index=False)
+    if mcnemar is not None:
+        paths["mcnemar"] = out_dir / "mcnemar_tests.csv"
+        mcnemar.to_csv(paths["mcnemar"], index=False)
     return paths
 
 
@@ -199,15 +228,21 @@ def write_excel_report(out_path: Path, *,
                        threshold: pd.DataFrame,
                        volatility: pd.DataFrame,
                        leaderboard: pd.DataFrame,
-                       summary: pd.DataFrame) -> Path:
+                       summary: pd.DataFrame,
+                       threshold_lift: pd.DataFrame | None = None,
+                       mcnemar: pd.DataFrame | None = None) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        _write_sheet(writer, "pooled_metrics",        pooled)
-        _write_sheet(writer, "per_ticker_metrics",    per_ticker)
-        _write_sheet(writer, "threshold_analysis",    threshold)
+        _write_sheet(writer, "pooled_metrics",            pooled)
+        _write_sheet(writer, "per_ticker_metrics",        per_ticker)
+        _write_sheet(writer, "threshold_analysis",        threshold)
+        if threshold_lift is not None:
+            _write_sheet(writer, "threshold_lift",        threshold_lift)
         _write_sheet(writer, "volatility_stratification", volatility)
-        _write_sheet(writer, "leaderboard",           leaderboard)
-        _write_sheet(writer, "summary",               summary)
+        if mcnemar is not None:
+            _write_sheet(writer, "mcnemar_tests",         mcnemar)
+        _write_sheet(writer, "leaderboard",               leaderboard)
+        _write_sheet(writer, "summary",                   summary)
     return out_path
 
 
@@ -218,7 +253,8 @@ def write_excel_report(out_path: Path, *,
 def print_console_summary(*,
                           pooled: pd.DataFrame,
                           threshold: pd.DataFrame,
-                          mcnemar: pd.DataFrame) -> None:
+                          mcnemar: pd.DataFrame,
+                          threshold_lift: pd.DataFrame | None = None) -> None:
     print("\n" + "=" * 72)
     print(" SIGNAL EVALUATION SUMMARY")
     print("=" * 72)
@@ -248,16 +284,17 @@ def print_console_summary(*,
                   f"brier={r.get('brier_score', float('nan')):.4f}  "
                   f"n={int(r.get('n_obs', 0))}")
 
-    # Significant outperformers
+    # Significant outperformers — broken out per benchmark.
     if not mcnemar.empty and "significant_vs_benchmark" in mcnemar.columns:
-        n_sig = int(mcnemar["significant_vs_benchmark"].fillna(False).sum())
-        print(f"\n  Significant (α=0.05) outperformers vs B1: {n_sig}")
-        sig = mcnemar[mcnemar["significant_vs_benchmark"]].sort_values("mcnemar_pval")
-        for _, r in sig.head(10).iterrows():
-            sm = r.get("sentiment_model", "-")
-            tag = f"/{sm}" if sm and sm != "-" else ""
-            print(f"    {r['horizon']:>3s}  {r['set_id']}{tag:14s} "
-                  f"stat={r['mcnemar_stat']:.3f}  p={r['mcnemar_pval']:.4f}")
+        for bid, grp in mcnemar.groupby("benchmark"):
+            n_sig = int(grp["significant_vs_benchmark"].fillna(False).sum())
+            print(f"\n  Significant (α=0.05) outperformers vs {bid}: {n_sig}")
+            sig = grp[grp["significant_vs_benchmark"]].sort_values("mcnemar_pval")
+            for _, r in sig.head(10).iterrows():
+                sm = r.get("sentiment_model", "-")
+                tag = f"/{sm}" if sm and sm != "-" else ""
+                print(f"    {r['horizon']:>3s}  {r['set_id']}{tag:14s} "
+                      f"stat={r['mcnemar_stat']:.3f}  p={r['mcnemar_pval']:.4f}")
 
     # Best sentiment model per horizon
     sent = pooled[pooled["category"].str.lower().isin(["sentiment", "combined"])]
@@ -283,4 +320,23 @@ def print_console_summary(*,
             for _, r in grp.iterrows():
                 print(f"     t={r['threshold']:.2f}  acc={r['accuracy']:.4f}  "
                       f"coverage={r['coverage']:.3f}")
+
+    # Threshold lift — does sentiment beat the benchmark on the model's
+    # high-conviction observations?
+    if threshold_lift is not None and not threshold_lift.empty:
+        print("\n  Top sentiment lifts on matched obs (model traded → vs benchmark):")
+        for hz, hz_grp in threshold_lift.dropna(subset=["lift_accuracy"]) \
+                                        .groupby("horizon"):
+            print(f"   [{hz}]")
+            top = (hz_grp.sort_values("lift_accuracy", ascending=False)
+                          .head(5))
+            for _, r in top.iterrows():
+                sm = r.get("sentiment_model", "-")
+                tag = f"/{sm}" if sm and sm != "-" else ""
+                star = "*" if bool(r.get("significant_vs_benchmark", False)) else " "
+                print(f"     {star} {r['set_id']}{tag:14s} t={r['threshold']:.2f} "
+                      f"vs {r['benchmark']}  lift={r['lift_accuracy']:+.4f} "
+                      f"(model={r['accuracy_model']:.4f}, "
+                      f"bench={r['accuracy_benchmark']:.4f}, "
+                      f"n={int(r['n_matched'])})")
     print()

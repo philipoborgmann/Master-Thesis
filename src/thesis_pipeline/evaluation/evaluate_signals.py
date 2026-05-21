@@ -35,8 +35,8 @@ from .reporting import (
     build_leaderboard, build_summary,
     print_console_summary, write_csv_outputs, write_excel_report,
 )
-from .significance import mcnemar_table
-from .thresholds import threshold_analysis_table
+from .significance import DEFAULT_BENCHMARKS, mcnemar_table, mcnemar_wide
+from .thresholds import threshold_analysis_table, threshold_lift_table
 from .volatility import build_regime_lookup, volatility_stratification_table
 
 
@@ -179,15 +179,22 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # ── 4. Threshold / conviction analysis ──────────────────────
     threshold_df = threshold_analysis_table(signals)
+    threshold_lift_df = threshold_lift_table(signals, benchmarks=DEFAULT_BENCHMARKS)
 
-    # ── 5. McNemar significance vs B1 ───────────────────────────
-    mcnemar_df = mcnemar_table(signals)
-    if not pooled.empty and not mcnemar_df.empty:
+    # ── 5. McNemar significance vs B1 and B2 ────────────────────
+    mcnemar_df_long = mcnemar_table(signals, benchmarks=DEFAULT_BENCHMARKS)
+    mcnemar_wide_df = mcnemar_wide(mcnemar_df_long, benchmarks=DEFAULT_BENCHMARKS)
+    if not pooled.empty and not mcnemar_wide_df.empty:
         pooled = pooled.merge(
-            mcnemar_df[["horizon", "set_id", "sentiment_model",
-                        "mcnemar_stat", "mcnemar_pval", "significant_vs_benchmark"]],
-            on=["horizon", "set_id", "sentiment_model"], how="left",
+            mcnemar_wide_df, on=["horizon", "set_id", "sentiment_model"],
+            how="left",
         )
+    # Back-compat aliases so external code that still reads `mcnemar_pval`
+    # keeps working. They mirror the vs-B1 columns.
+    if "mcnemar_pval_vs_b1" in pooled.columns and "mcnemar_pval" not in pooled.columns:
+        pooled["mcnemar_stat"]              = pooled["mcnemar_stat_vs_b1"]
+        pooled["mcnemar_pval"]              = pooled["mcnemar_pval_vs_b1"]
+        pooled["significant_vs_benchmark"]  = pooled.get("significant_vs_b1", False)
 
     # ── 6. Volatility-regime stratification ─────────────────────
     if args.no_volatility:
@@ -205,7 +212,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # ── 7. Leaderboard + summary ────────────────────────────────
     leaderboard = build_leaderboard(pooled)
-    summary     = build_summary(pooled, threshold_df, volatility_df)
+    summary     = build_summary(pooled, threshold_df, volatility_df,
+                                threshold_lift=threshold_lift_df)
 
     # ── 8. Sorting (deterministic output) ───────────────────────
     if not pooled.empty:
@@ -217,28 +225,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not threshold_df.empty:
         threshold_df = threshold_df.sort_values(
             ["horizon", "set_id", "sentiment_model", "threshold"]).reset_index(drop=True)
+    if not threshold_lift_df.empty:
+        threshold_lift_df = threshold_lift_df.sort_values(
+            ["horizon", "set_id", "sentiment_model", "benchmark", "threshold"]
+        ).reset_index(drop=True)
     if not volatility_df.empty:
         volatility_df = volatility_df.sort_values(
             ["horizon", "set_id", "sentiment_model", "vol_regime"]).reset_index(drop=True)
+    if not mcnemar_df_long.empty:
+        mcnemar_df_long = mcnemar_df_long.sort_values(
+            ["horizon", "set_id", "sentiment_model", "benchmark"]
+        ).reset_index(drop=True)
 
     # ── 9. Write outputs ────────────────────────────────────────
     csv_paths = write_csv_outputs(
         out_root,
         pooled=pooled, per_ticker=per_ticker,
         threshold=threshold_df, volatility=volatility_df,
+        threshold_lift=threshold_lift_df,
+        mcnemar=mcnemar_df_long,
     )
     xlsx = write_excel_report(
         xlsx_path,
         pooled=pooled, per_ticker=per_ticker,
         threshold=threshold_df, volatility=volatility_df,
         leaderboard=leaderboard, summary=summary,
+        threshold_lift=threshold_lift_df,
+        mcnemar=mcnemar_df_long,
     )
     logger.info("evaluate-signals: wrote Excel report %s", xlsx)
     for label, path in csv_paths.items():
         logger.info("evaluate-signals: wrote %s → %s", label, path)
 
     # ── 10. Console summary ─────────────────────────────────────
-    print_console_summary(pooled=pooled, threshold=threshold_df, mcnemar=mcnemar_df)
+    print_console_summary(
+        pooled=pooled, threshold=threshold_df,
+        mcnemar=mcnemar_df_long, threshold_lift=threshold_lift_df,
+    )
     return 0
 
 
