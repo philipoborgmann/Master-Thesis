@@ -2,17 +2,17 @@
 
 These tests pin the invariants documented in ``docs/refactor_log.md``:
 
-1. Root-level scripts contain no real logic — they are thin redirects to
-   ``thesis_pipeline.*`` modules.
-2. ``scripts/`` entries are thin entry points.
+1. The repository root is **clean** — none of the historical pipeline-stage
+   scripts (``Run_Models.py``, ``Create_Price_Features.py``, …) live there
+   any more. Their archive copies live outside the repository.
+2. ``scripts/`` entries are thin entry points re-exporting a single
+   package ``main``.
 3. The CLI dispatches every documented stage.
 4. ``--dry-run`` works on every CLI sub-command.
 5. ``Crypto _data.py`` is no longer in the root (it now lives in ``legacy/``).
 """
 from __future__ import annotations
 
-import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -22,21 +22,22 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT  = REPO_ROOT / "src"
 
 
-# Map every root-script redirect to the package module it must import.
-ROOT_REDIRECTS = {
-    "Run_Models.py":                    "thesis_pipeline.modeling.run_models",
-    "Merge_Features.py":                "thesis_pipeline.features.merge",
-    "Create_Price_Features.py":         "thesis_pipeline.price.features",
-    "Price_Data_Validation.py":         "thesis_pipeline.price.validate",
-    "Sentiment_Data_Load.py":           "thesis_pipeline.sentiment.load",
-    "Sentiment_score_vader.py":         "thesis_pipeline.sentiment.score_vader",
-    "Sentiment_score_finbert.py":       "thesis_pipeline.sentiment.score_finbert",
-    "Sentiment_score_cryptobert.py":    "thesis_pipeline.sentiment.score_cryptobert",
-    "Sentiment_feature_engineering.py": "thesis_pipeline.sentiment.aggregate",
-    "Sentiment_Stationarity_Test.py":   "thesis_pipeline.sentiment.stationarity",
-}
+# Historical root-level pipeline scripts. These files MUST NOT exist any
+# more — all logic lives in the corresponding package module.
+RETIRED_ROOT_SCRIPTS = (
+    "Run_Models.py",
+    "Merge_Features.py",
+    "Create_Price_Features.py",
+    "Price_Data_Validation.py",
+    "Sentiment_Data_Load.py",
+    "Sentiment_score_vader.py",
+    "Sentiment_score_finbert.py",
+    "Sentiment_score_cryptobert.py",
+    "Sentiment_feature_engineering.py",
+    "Sentiment_Stationarity_Test.py",
+)
 
-# Map every per-stage scripts/ entry to the same package module.
+# Map every per-stage scripts/ entry to the package module it re-exports.
 SCRIPT_DIRECT_TARGETS = {
     "scripts/run_models.py":                  "thesis_pipeline.modeling.run_models",
     "scripts/merge_features.py":              "thesis_pipeline.features.merge",
@@ -49,41 +50,18 @@ SCRIPT_DIRECT_TARGETS = {
 
 
 # ---------------------------------------------------------------------------
-# Section 1: root-level redirects are thin
+# Section 1: the repo root is clean of historical pipeline scripts
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("root_name,target_module",
-                         sorted(ROOT_REDIRECTS.items()))
-def test_root_redirect_is_thin_and_imports_package(root_name, target_module):
-    path = REPO_ROOT / root_name
-    assert path.exists(), f"{root_name} should exist as a legacy redirect"
-    text = path.read_text(encoding="utf-8")
-
-    # A redirect should be < ~40 lines: nothing else fits in that budget.
-    n_lines = len(text.splitlines())
-    assert n_lines < 40, (
-        f"{root_name} has {n_lines} lines — it must be a thin redirect, "
-        f"not a re-implementation. Move the logic into {target_module}."
+@pytest.mark.parametrize("name", RETIRED_ROOT_SCRIPTS)
+def test_retired_root_script_no_longer_exists(name):
+    path = REPO_ROOT / name
+    assert not path.exists(), (
+        f"{name} should no longer live at the repo root — "
+        f"its logic now lives in src/thesis_pipeline/. "
+        f"If you re-created it for compatibility, archive it under legacy/ "
+        f"instead."
     )
-
-    # It must import the documented package module.
-    assert f"from {target_module} import main" in text, (
-        f"{root_name} should re-import main() from {target_module}"
-    )
-
-    # It must NOT redeclare heavy modelling-library imports — those belong to
-    # the package module now.
-    forbidden = (
-        "from sklearn.linear_model import",
-        "from sklearn.preprocessing import StandardScaler",
-        "from transformers import",
-        "import statsmodels",
-    )
-    for needle in forbidden:
-        assert needle not in text, (
-            f"{root_name} still contains heavy import {needle!r} — "
-            "the redirect must own no real logic."
-        )
 
 
 def test_crypto_data_moved_to_legacy():
@@ -129,49 +107,7 @@ def test_run_pipeline_script_routes_through_cli():
 
 
 # ---------------------------------------------------------------------------
-# Section 3: every entry-point ultimately calls the same package main()
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("root_name,target_module",
-                         sorted(ROOT_REDIRECTS.items()))
-def test_root_and_package_share_same_main(root_name, target_module):
-    """Importing the redirect and importing the package directly must yield
-    the *same* ``main`` function object — no copies, no shims.
-
-    Skipped when the package module has heavy optional dependencies
-    (matplotlib, statsmodels, arch, torch, transformers, vaderSentiment)
-    that are unavailable in the current environment — the redirect contract
-    is then still pinned via static text inspection in
-    :func:`test_root_redirect_is_thin_and_imports_package`.
-    """
-    if str(SRC_ROOT) not in sys.path:
-        sys.path.insert(0, str(SRC_ROOT))
-
-    import importlib
-    try:
-        pkg = importlib.import_module(target_module)
-    except ModuleNotFoundError as exc:
-        pytest.skip(f"{target_module} requires {exc.name}; not installed here")
-
-    # Load the redirect as a module under a unique throwaway name
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        f"__redirect_test__{root_name.replace('.', '_')}",
-        REPO_ROOT / root_name,
-    )
-    mod = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(mod)
-    except ModuleNotFoundError as exc:
-        pytest.skip(f"{root_name} could not import {exc.name}")
-
-    assert mod.main is pkg.main, (
-        f"{root_name} must re-export the same main() as {target_module}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Section 4: every CLI sub-command supports --dry-run
+# Section 3: every CLI sub-command supports --dry-run
 # ---------------------------------------------------------------------------
 
 CLI_DRY_RUN_CASES = [
@@ -199,11 +135,22 @@ def test_cli_dry_run_returns_zero(argv):
 
 
 # ---------------------------------------------------------------------------
-# Section 5: package modules expose main() with optional argv
+# Section 4: package modules expose main() with optional argv
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("modname", sorted(set(ROOT_REDIRECTS.values()) |
-                                           set(SCRIPT_DIRECT_TARGETS.values())))
+@pytest.mark.parametrize("modname", sorted(set(SCRIPT_DIRECT_TARGETS.values()) | {
+    "thesis_pipeline.modeling.run_models",
+    "thesis_pipeline.features.merge",
+    "thesis_pipeline.price.features",
+    "thesis_pipeline.price.validate",
+    "thesis_pipeline.sentiment.load",
+    "thesis_pipeline.sentiment.score_vader",
+    "thesis_pipeline.sentiment.score_finbert",
+    "thesis_pipeline.sentiment.score_cryptobert",
+    "thesis_pipeline.sentiment.aggregate",
+    "thesis_pipeline.sentiment.stationarity",
+    "thesis_pipeline.evaluation.evaluate_signals",
+}))
 def test_package_module_main_accepts_argv(modname):
     if str(SRC_ROOT) not in sys.path:
         sys.path.insert(0, str(SRC_ROOT))
@@ -224,7 +171,7 @@ def test_package_module_main_accepts_argv(modname):
 
 
 # ---------------------------------------------------------------------------
-# Section 6: CLI exposes every documented sub-command
+# Section 5: CLI exposes every documented sub-command
 # ---------------------------------------------------------------------------
 
 REQUIRED_CLI_COMMANDS = (

@@ -58,26 +58,15 @@ Master_Thesis/
 ├── legacy/                            ← off-pipeline tooling
 │   ├── README.md
 │   └── crypto_data.py                 ← raw OHLCV downloader (ccxt)
-│
-└── (root-level legacy redirects — thin)
-    Create_Price_Features.py           ← redirect to thesis_pipeline.price.features
-    Price_Data_Validation.py           ← redirect to thesis_pipeline.price.validate
-    Merge_Features.py                  ← redirect to thesis_pipeline.features.merge
-    Run_Models.py                      ← redirect to thesis_pipeline.modeling.run_models
-    Sentiment_Data_Load.py             ← redirect to thesis_pipeline.sentiment.load
-    Sentiment_score_vader.py           ← redirect to thesis_pipeline.sentiment.score_vader
-    Sentiment_score_finbert.py         ← redirect to thesis_pipeline.sentiment.score_finbert
-    Sentiment_score_cryptobert.py      ← redirect to thesis_pipeline.sentiment.score_cryptobert
-    Sentiment_feature_engineering.py   ← redirect to thesis_pipeline.sentiment.aggregate
-    Sentiment_Stationarity_Test.py     ← redirect to thesis_pipeline.sentiment.stationarity
 ```
 
-> **Package-first.** All real pipeline logic lives under `src/thesis_pipeline/`.
-> Files in `scripts/` are thin entry points that import the matching package
-> module's `main()` directly. Root-level files are backward-compatibility
-> redirects only — they contain no logic and exist solely so older
-> invocations like `python Run_Models.py …` keep working. The preferred entry
-> point is always `python -m thesis_pipeline.cli <command>`.
+> **Package-first.** All real pipeline logic lives under
+> `src/thesis_pipeline/`. Files in `scripts/` are thin entry points that
+> import the matching package module's `main()` directly. The historical
+> root-level scripts (`Run_Models.py`, `Create_Price_Features.py`, …) have
+> been retired — their logic was moved into the package and the redirects
+> were removed. The preferred entry point is always
+> `python -m thesis_pipeline.cli <command>`.
 
 ---
 
@@ -425,29 +414,28 @@ globally. The two small Excel metadata files in the repo root —
 
 ---
 
-## 10. Backward compatibility
+## 10. Migration notes
 
 The original root-level scripts (`Create_Price_Features.py`,
-`Sentiment_score_finbert.py`, `Run_Models.py`, …) still work exactly as
-before, but the direction of delegation is reversed: the **canonical
-implementations now live in `src/thesis_pipeline/*`**, and the root scripts
-are 20-line redirects that simply re-export the package module's `main()`.
-A typical redirect looks like this:
+`Sentiment_score_finbert.py`, `Run_Models.py`, …) have been **retired**.
+Their full logic now lives in the corresponding `src/thesis_pipeline/*`
+module, and the previous backward-compatibility redirects at the repo root
+were deleted in the cleanup commit. To replace an old invocation:
 
-```python
-#!/usr/bin/env python3
-"""Legacy redirect for ``python Run_Models.py``.
+| Old command                                  | New command                                                                |
+|----------------------------------------------|----------------------------------------------------------------------------|
+| `python Run_Models.py …`                     | `python -m thesis_pipeline.cli run-models …` or `python scripts/run_models.py …` |
+| `python Create_Price_Features.py …`          | `python -m thesis_pipeline.cli create-price-features …`                    |
+| `python Price_Data_Validation.py …`          | `python -m thesis_pipeline.cli validate-price …`                           |
+| `python Merge_Features.py …`                 | `python -m thesis_pipeline.cli merge-features …`                           |
+| `python Sentiment_Data_Load.py …`            | `python -m thesis_pipeline.cli load-sentiment …`                           |
+| `python Sentiment_score_{vader,finbert,cryptobert}.py …` | `python -m thesis_pipeline.cli score-sentiment --model {vader,finbert,cryptobert} …` |
+| `python Sentiment_feature_engineering.py …`  | `python -m thesis_pipeline.cli create-sentiment-features …`                |
+| `python Sentiment_Stationarity_Test.py …`    | `python -m thesis_pipeline.cli stationarity …`                             |
 
-All modeling logic now lives in :mod:`thesis_pipeline.modeling.run_models`.
-Preferred usage: ``python -m thesis_pipeline.cli run-models``.
-"""
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
-from thesis_pipeline.modeling.run_models import main  # noqa: E402
-if __name__ == "__main__":
-    raise SystemExit(main())
-```
+Backed-up copies of the historical scripts live outside this repository
+(or under the user's local archive). The CLI surface is stable and is the
+single supported entry point.
 
 The off-pipeline raw OHLCV downloader (`Crypto _data.py`) moved to
 `legacy/crypto_data.py`. It is intentionally **not** wired through the CLI

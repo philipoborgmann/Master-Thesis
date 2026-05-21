@@ -21,30 +21,33 @@ branch.)
 
 | Original location                  | Canonical package module                                    | scripts/ entry                              | Root file              |
 |-----------------------------------|-------------------------------------------------------------|---------------------------------------------|------------------------|
-| `Create_Price_Features.py`        | `src/thesis_pipeline/price/features.py`                     | `scripts/create_price_features.py`          | thin redirect          |
-| `Price_Data_Validation.py`        | `src/thesis_pipeline/price/validate.py`                     | `scripts/validate_price.py`                 | thin redirect          |
-| `Merge_Features.py`               | `src/thesis_pipeline/features/merge.py`                     | `scripts/merge_features.py`                 | thin redirect          |
-| `Run_Models.py`                   | `src/thesis_pipeline/modeling/run_models.py`                | `scripts/run_models.py`                     | thin redirect          |
-| `Sentiment_Data_Load.py`          | `src/thesis_pipeline/sentiment/load.py`                     | `scripts/load_sentiment.py`                 | thin redirect          |
-| `Sentiment_score_vader.py`        | `src/thesis_pipeline/sentiment/score_vader.py`              | `scripts/score_sentiment.py` (multi-model)  | thin redirect          |
-| `Sentiment_score_finbert.py`      | `src/thesis_pipeline/sentiment/score_finbert.py`            | `scripts/score_sentiment.py` (multi-model)  | thin redirect          |
-| `Sentiment_score_cryptobert.py`   | `src/thesis_pipeline/sentiment/score_cryptobert.py`         | `scripts/score_sentiment.py` (multi-model)  | thin redirect          |
-| `Sentiment_feature_engineering.py`| `src/thesis_pipeline/sentiment/aggregate.py`                | `scripts/create_sentiment_features.py`      | thin redirect          |
-| `Sentiment_Stationarity_Test.py`  | `src/thesis_pipeline/sentiment/stationarity.py`             | — (only via CLI `stationarity`)             | thin redirect          |
+| `Create_Price_Features.py`        | `src/thesis_pipeline/price/features.py`                     | `scripts/create_price_features.py`          | **retired**            |
+| `Price_Data_Validation.py`        | `src/thesis_pipeline/price/validate.py`                     | `scripts/validate_price.py`                 | **retired**            |
+| `Merge_Features.py`               | `src/thesis_pipeline/features/merge.py`                     | `scripts/merge_features.py`                 | **retired**            |
+| `Run_Models.py`                   | `src/thesis_pipeline/modeling/run_models.py`                | `scripts/run_models.py`                     | **retired**            |
+| `Sentiment_Data_Load.py`          | `src/thesis_pipeline/sentiment/load.py`                     | `scripts/load_sentiment.py`                 | **retired**            |
+| `Sentiment_score_vader.py`        | `src/thesis_pipeline/sentiment/score_vader.py`              | `scripts/score_sentiment.py` (multi-model)  | **retired**            |
+| `Sentiment_score_finbert.py`      | `src/thesis_pipeline/sentiment/score_finbert.py`            | `scripts/score_sentiment.py` (multi-model)  | **retired**            |
+| `Sentiment_score_cryptobert.py`   | `src/thesis_pipeline/sentiment/score_cryptobert.py`         | `scripts/score_sentiment.py` (multi-model)  | **retired**            |
+| `Sentiment_feature_engineering.py`| `src/thesis_pipeline/sentiment/aggregate.py`                | `scripts/create_sentiment_features.py`      | **retired**            |
+| `Sentiment_Stationarity_Test.py`  | `src/thesis_pipeline/sentiment/stationarity.py`             | — (only via CLI `stationarity`)             | **retired**            |
 | —                                  | `src/thesis_pipeline/evaluation/evaluate_signals.py`        | `scripts/evaluate_signals.py`               | — (no historical root) |
 | `Crypto _data.py`                 | — (off-pipeline data acquisition)                            | —                                           | moved to `legacy/crypto_data.py` |
 
 The direction of delegation is now consistent across the repository:
 
 ```
-python Run_Models.py …         →  thesis_pipeline.modeling.run_models.main()
-python scripts/run_models.py … →  thesis_pipeline.modeling.run_models.main()
+python scripts/run_models.py …               →  thesis_pipeline.modeling.run_models.main()
 python -m thesis_pipeline.cli run-models … → cli → thesis_pipeline.modeling.run_models.main()
 ```
 
-There is exactly one place each piece of logic lives. The thin redirects
-exist only so historical invocations keep working without surprising the
-caller.
+There is exactly one place each piece of logic lives. The previous
+backward-compatibility redirects at the repo root were removed once the
+canonical implementations had been verified — archived copies of the
+historical scripts live outside the repository. The
+``run_script_main`` / ``SCRIPT_MAP`` delegation layer in
+``src/thesis_pipeline/utils.py`` was removed at the same time, since no
+caller still routes through a root file.
 
 ## Banner comments inserted
 
