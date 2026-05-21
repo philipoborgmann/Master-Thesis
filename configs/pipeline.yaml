@@ -149,6 +149,23 @@ stages:
       set_id: "B1"
       coins: [BTC, ETH]
 
+  evaluate_signals:
+    module: "thesis_pipeline.evaluation.evaluate_signals"
+    inputs:
+      - signals_root
+      - feature_sets_xlsx
+      - raw_price_1d
+    outputs:
+      - evaluation_xlsx
+      - evaluation_pooled_csv
+      - evaluation_per_ticker_csv
+      - evaluation_thresholds_csv
+      - evaluation_volatility_csv
+    heavy: false
+    supports_smoke: true
+    smoke:
+      horizon: "1d"
+
   diagnostics:
     module: "thesis_pipeline.diagnostics.sample_report"
     inputs:
@@ -182,5 +199,6 @@ default_order:
   - stationarity
   - merge_features
   - run_models
+  - evaluate_signals
   - diagnostics
   - reports

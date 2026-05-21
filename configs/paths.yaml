@@ -91,6 +91,16 @@ diagnostics_logs:  "Outputs/diagnostics/logs"
 smoke_root:        "Outputs/diagnostics/smoke"
 
 # ---------------------------------------------------------------------------
+# Evaluation outputs (signal_evaluation stage)
+# ---------------------------------------------------------------------------
+evaluation_root:               "Outputs/Evaluation"
+evaluation_xlsx:               "Outputs/Evaluation/signal_evaluation.xlsx"
+evaluation_pooled_csv:         "Outputs/Evaluation/pooled_metrics.csv"
+evaluation_per_ticker_csv:     "Outputs/Evaluation/per_ticker_metrics.csv"
+evaluation_thresholds_csv:     "Outputs/Evaluation/threshold_analysis.csv"
+evaluation_volatility_csv:     "Outputs/Evaluation/volatility_stratification.csv"
+
+# ---------------------------------------------------------------------------
 # Top-level metadata files
 # ---------------------------------------------------------------------------
 feature_sets_xlsx:        "feature_sets.xlsx"

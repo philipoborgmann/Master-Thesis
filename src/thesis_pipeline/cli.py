@@ -119,6 +119,30 @@ def cmd_diagnostics(args: argparse.Namespace) -> int:
     return run(horizon=args.horizon, smoke=args.smoke, dry_run=args.dry_run)
 
 
+def cmd_evaluate_signals(args: argparse.Namespace) -> int:
+    """Forward CLI flags directly to the evaluation module's argparse-based main()."""
+    from .evaluation import evaluate_signals as _es
+    argv: list[str] = []
+    horizon = getattr(args, "horizon", None)
+    if horizon:
+        argv += ["--horizon", horizon]
+    output_dir = getattr(args, "output_dir", None)
+    if output_dir:
+        argv += ["--output-dir", str(output_dir)]
+    feature_config = getattr(args, "feature_config", None)
+    if feature_config:
+        argv += ["--feature-config", feature_config]
+    if getattr(args, "smoke", False):
+        argv.append("--smoke")
+    if getattr(args, "dry_run", False):
+        argv.append("--dry-run")
+    if getattr(args, "force", False):
+        argv.append("--force")
+    if getattr(args, "no_volatility", False):
+        argv.append("--no-volatility")
+    return _es.main(argv)
+
+
 def cmd_run_stage(args: argparse.Namespace) -> int:
     return _dispatch_stage(args.stage, args)
 
@@ -149,6 +173,7 @@ def _dispatch_stage(stage: str, args: argparse.Namespace) -> int:
         "stationarity":              cmd_stationarity,
         "merge_features":            cmd_merge_features,
         "run_models":                cmd_run_models,
+        "evaluate_signals":          cmd_evaluate_signals,
         "diagnostics":               cmd_diagnostics,
         "reports":                   cmd_diagnostics,
     }
@@ -252,6 +277,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(sp)
     sp.set_defaults(func=cmd_diagnostics)
 
+    # evaluate-signals
+    sp = sub.add_parser("evaluate-signals",
+                        help="Evaluate walk-forward signals (metrics, McNemar, regimes).")
+    sp.add_argument("--horizon", default=None, choices=["1h", "6h", "1d"])
+    sp.add_argument("--output-dir", dest="output_dir", default=None)
+    sp.add_argument("--feature-config", dest="feature_config", default=None,
+                    help="Override path to feature_sets.xlsx.")
+    sp.add_argument("--no-volatility", dest="no_volatility", action="store_true",
+                    help="Skip the volatility-stratification step.")
+    _add_common(sp)
+    sp.set_defaults(func=cmd_evaluate_signals)
+
     # run-stage
     sp = sub.add_parser("run-stage", help="Run a single named stage.")
     sp.add_argument("--stage", required=True)
@@ -265,6 +302,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--batch-size", dest="batch_size", type=int, default=None)
     sp.add_argument("--restart", action="store_true")
     sp.add_argument("--sentiment-model", dest="sentiment_model", default=None)
+    sp.add_argument("--output-dir", dest="output_dir", default=None)
+    sp.add_argument("--feature-config", dest="feature_config", default=None)
+    sp.add_argument("--no-volatility", dest="no_volatility", action="store_true")
     _add_common(sp)
     sp.set_defaults(func=cmd_run_stage)
 
@@ -283,6 +323,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--batch-size", dest="batch_size", type=int, default=None)
     sp.add_argument("--restart", action="store_true")
     sp.add_argument("--sentiment-model", dest="sentiment_model", default=None)
+    sp.add_argument("--output-dir", dest="output_dir", default=None)
+    sp.add_argument("--feature-config", dest="feature_config", default=None)
+    sp.add_argument("--no-volatility", dest="no_volatility", action="store_true")
     _add_common(sp)
     sp.set_defaults(func=cmd_run_pipeline)
 
