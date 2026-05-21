@@ -2,10 +2,10 @@
 
 Public entry point: ``python -m thesis_pipeline.cli --help``.
 
-This package is an *organizational* refactor of the original root-level
-scripts (Create_Price_Features.py, Run_Models.py, …). The original scripts
-remain functional as backward-compatible wrappers; the new modules expose
-the same behavior behind a cleaner package layout.
+The full pipeline logic lives in this package; ``scripts/`` holds thin
+entry points that re-export the matching module's ``main``. The historical
+root-level scripts (Create_Price_Features.py, Run_Models.py, …) have been
+retired — archived copies live outside the repository.
 """
 
 __version__ = "0.1.0"
