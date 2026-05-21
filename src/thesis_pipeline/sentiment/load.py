@@ -513,6 +513,15 @@ def main(argv=None):
         default=os.path.join("Outputs", "deskriptiv"))
     args = parser.parse_args(argv)
 
+    # ── Path-shape tolerance ────────────────────────────────────────────
+    # The script treats ``--output_stats`` as a *directory* (it appends the
+    # XLSX file name internally at line ~564). Older CLI wrappers passed a
+    # file path (``…/descriptive_statistics.xlsx``); in that case
+    # ``os.makedirs(args.output_stats)`` would crash with FileExistsError
+    # when the file already existed. Normalise here so both forms work.
+    if args.output_stats.lower().endswith((".xlsx", ".xls", ".csv")):
+        args.output_stats = os.path.dirname(args.output_stats) or "."
+
     if not os.path.isdir(args.raw_dir):
         print(f"[ERROR] Raw data directory not found: {args.raw_dir}")
         sys.exit(1)
