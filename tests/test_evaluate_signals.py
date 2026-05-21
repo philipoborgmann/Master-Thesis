@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+import shutil
 
 from thesis_pipeline import cli
 from thesis_pipeline.evaluation import (
@@ -125,7 +126,10 @@ def signals_env(tmp_path, monkeypatch):
     cfg.load_config.cache_clear()
     # Also clear configs dir cache by writing a marker — load_config reads from
     # ``configs/`` under the patched project_root.
-    (tmp_path / "configs").symlink_to(Path(__file__).resolve().parents[1] / "configs")
+    shutil.copytree(
+        Path(__file__).resolve().parents[1] / "configs",
+        tmp_path / "configs",
+        )
     return {
         "root": tmp_path,
         "signals_root": signals_root,
