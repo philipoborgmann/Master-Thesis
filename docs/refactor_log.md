@@ -17,21 +17,34 @@ branch.)
 
 ---
 
-## File map
+## File map (current state)
 
-| Original location                  | New module / wrapper                                  | Notes |
-|-----------------------------------|-------------------------------------------------------|-------|
-| `Create_Price_Features.py`        | `src/thesis_pipeline/price/features.py` + `scripts/create_price_features.py` | Wrapper invokes script `main()` with CLI args derived from configs. Banner comment added to root file. |
-| `Price_Data_Validation.py`        | `src/thesis_pipeline/price/validate.py` + `scripts/validate_price.py` | same pattern |
-| `Sentiment_Data_Load.py`          | `src/thesis_pipeline/sentiment/load.py` + `scripts/load_sentiment.py` | TODO: native `--max_rows` not in the underlying script; smoke cap currently routed via downstream `--validate_n`. |
-| `Sentiment_score_vader.py`        | `src/thesis_pipeline/sentiment/score_vader.py` + `scripts/score_sentiment.py` | smoke cap via `--validate --validate_n` |
-| `Sentiment_score_finbert.py`      | `src/thesis_pipeline/sentiment/score_finbert.py` + `scripts/score_sentiment.py` | smoke cap via `--validate --validate_n` |
-| `Sentiment_score_cryptobert.py`   | `src/thesis_pipeline/sentiment/score_cryptobert.py` + `scripts/score_sentiment.py` | smoke cap via `--validate --validate_n` |
-| `Sentiment_feature_engineering.py`| `src/thesis_pipeline/sentiment/aggregate.py` + `scripts/create_sentiment_features.py` | TODO: native `--max_rows` not in the script; `--no_plots` passes through. |
-| `Sentiment_Stationarity_Test.py`  | `src/thesis_pipeline/sentiment/stationarity.py` | wired through `run-stage stationarity` and `run-pipeline`. |
-| `Merge_Features.py`               | `src/thesis_pipeline/features/merge.py` + `scripts/merge_features.py` | Underlying script reads from hardcoded paths; new module does not yet override them. TODO: add `--horizon` / `--feature_dir` / `--output_dir` flags to the underlying script. |
-| `Run_Models.py`                   | `src/thesis_pipeline/modeling/run_models.py` + `scripts/run_models.py` | All walk-forward / logistic-ridge logic preserved; new module is a thin argv builder. |
-| `Crypto _data.py`                 | (not refactored; data acquisition only) | The filename contains a space; loader uses `importlib.util.spec_from_file_location`. |
+| Original location                  | Canonical package module                                    | scripts/ entry                              | Root file              |
+|-----------------------------------|-------------------------------------------------------------|---------------------------------------------|------------------------|
+| `Create_Price_Features.py`        | `src/thesis_pipeline/price/features.py`                     | `scripts/create_price_features.py`          | thin redirect          |
+| `Price_Data_Validation.py`        | `src/thesis_pipeline/price/validate.py`                     | `scripts/validate_price.py`                 | thin redirect          |
+| `Merge_Features.py`               | `src/thesis_pipeline/features/merge.py`                     | `scripts/merge_features.py`                 | thin redirect          |
+| `Run_Models.py`                   | `src/thesis_pipeline/modeling/run_models.py`                | `scripts/run_models.py`                     | thin redirect          |
+| `Sentiment_Data_Load.py`          | `src/thesis_pipeline/sentiment/load.py`                     | `scripts/load_sentiment.py`                 | thin redirect          |
+| `Sentiment_score_vader.py`        | `src/thesis_pipeline/sentiment/score_vader.py`              | `scripts/score_sentiment.py` (multi-model)  | thin redirect          |
+| `Sentiment_score_finbert.py`      | `src/thesis_pipeline/sentiment/score_finbert.py`            | `scripts/score_sentiment.py` (multi-model)  | thin redirect          |
+| `Sentiment_score_cryptobert.py`   | `src/thesis_pipeline/sentiment/score_cryptobert.py`         | `scripts/score_sentiment.py` (multi-model)  | thin redirect          |
+| `Sentiment_feature_engineering.py`| `src/thesis_pipeline/sentiment/aggregate.py`                | `scripts/create_sentiment_features.py`      | thin redirect          |
+| `Sentiment_Stationarity_Test.py`  | `src/thesis_pipeline/sentiment/stationarity.py`             | — (only via CLI `stationarity`)             | thin redirect          |
+| —                                  | `src/thesis_pipeline/evaluation/evaluate_signals.py`        | `scripts/evaluate_signals.py`               | — (no historical root) |
+| `Crypto _data.py`                 | — (off-pipeline data acquisition)                            | —                                           | moved to `legacy/crypto_data.py` |
+
+The direction of delegation is now consistent across the repository:
+
+```
+python Run_Models.py …         →  thesis_pipeline.modeling.run_models.main()
+python scripts/run_models.py … →  thesis_pipeline.modeling.run_models.main()
+python -m thesis_pipeline.cli run-models … → cli → thesis_pipeline.modeling.run_models.main()
+```
+
+There is exactly one place each piece of logic lives. The thin redirects
+exist only so historical invocations keep working without surprising the
+caller.
 
 ## Banner comments inserted
 

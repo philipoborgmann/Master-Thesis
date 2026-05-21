@@ -32,58 +32,132 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
                         help="Allow overwriting full production outputs in non-smoke runs.")
 
 
+# ---------------------------------------------------------------------------
+# Helper: log a stage plan and short-circuit on --dry-run.
+#
+# The migrated modules retain their original argparse parsers which do not
+# universally understand ``--dry-run`` / ``--smoke``. To keep the CLI's
+# uniform UX (every stage supports ``--dry-run``) we filter these flags here:
+# on ``--dry-run`` we emit the stage header and return 0 *before* invoking
+# the module. The modules that have native dry-run handling
+# (``modeling.run_models``, ``evaluation.evaluate_signals``,
+# ``features.merge``) still benefit from this short-circuit since both paths
+# agree on a noop return value.
+# ---------------------------------------------------------------------------
+
+def _stage_dry_run(stage: str, args: argparse.Namespace) -> int | None:
+    """Return 0 (handled) when ``--dry-run`` is set, else None (continue)."""
+    if not getattr(args, "dry_run", False):
+        return None
+    from .logging_utils import log_stage_header
+    extras = {
+        "horizon": getattr(args, "horizon", None) or "(all)",
+        "coins":   list(args.coins) if getattr(args, "coins", None) else "(all)",
+    }
+    for opt in ("set_id", "sentiment_model", "max_rows", "batch_size",
+                "winsor_p", "no_plots", "restart", "force",
+                "feature_config", "output_dir", "no_volatility"):
+        if hasattr(args, opt) and getattr(args, opt) not in (None, False):
+            extras[opt] = getattr(args, opt)
+    log_stage_header(stage, mode="dry-run", inputs=[], outputs=[], extra=extras)
+    return 0
+
+
 def cmd_validate_price(args: argparse.Namespace) -> int:
-    from .price.validate import run
-    return run(horizon=args.horizon, coins=args.coins,
-               smoke=args.smoke, dry_run=args.dry_run, debug=args.debug)
+    rc = _stage_dry_run("validate_price", args)
+    if rc is not None:
+        return rc
+    from .price import validate as _m
+    argv: list[str] = []
+    if args.coins:
+        for c in args.coins:
+            argv += ["--coin", c]
+    if getattr(args, "debug", False):
+        argv.append("--debug")
+    return _m.main(argv)
 
 
 def cmd_create_price_features(args: argparse.Namespace) -> int:
-    from .price.features import run
-    return run(horizon=args.horizon, coins=args.coins,
-               winsor_p=args.winsor_p,
-               smoke=args.smoke, dry_run=args.dry_run)
+    rc = _stage_dry_run("create_price_features", args)
+    if rc is not None:
+        return rc
+    from .price import features as _m
+    argv: list[str] = []
+    if args.horizon:
+        argv += ["--horizons", args.horizon]
+    if args.coins:
+        for c in args.coins:
+            argv += ["--coin", c]
+    if getattr(args, "winsor_p", None) is not None:
+        argv += ["--winsor_p", str(args.winsor_p)]
+    return _m.main(argv)
 
 
 def cmd_load_sentiment(args: argparse.Namespace) -> int:
-    from .sentiment.load import run
-    return run(smoke=args.smoke, max_rows=args.max_rows, dry_run=args.dry_run)
+    rc = _stage_dry_run("load_sentiment", args)
+    if rc is not None:
+        return rc
+    from .sentiment import load as _m
+    return _m.main([])
 
 
 def cmd_score_sentiment(args: argparse.Namespace) -> int:
+    rc = _stage_dry_run(f"score_{args.model}", args)
+    if rc is not None:
+        return rc
     if args.model == "vader":
-        from .sentiment.score_vader import run
-        return run(smoke=args.smoke, max_rows=args.max_rows,
-                   dry_run=args.dry_run, restart=args.restart)
-    if args.model == "finbert":
-        from .sentiment.score_finbert import run
-        return run(smoke=args.smoke, max_rows=args.max_rows,
-                   batch_size=args.batch_size,
-                   dry_run=args.dry_run, restart=args.restart)
-    if args.model == "cryptobert":
-        from .sentiment.score_cryptobert import run
-        return run(smoke=args.smoke, max_rows=args.max_rows,
-                   batch_size=args.batch_size,
-                   dry_run=args.dry_run, restart=args.restart)
-    raise SystemExit(f"Unknown sentiment model: {args.model}")
+        from .sentiment import score_vader as _m
+    elif args.model == "finbert":
+        from .sentiment import score_finbert as _m
+    elif args.model == "cryptobert":
+        from .sentiment import score_cryptobert as _m
+    else:
+        raise SystemExit(f"Unknown sentiment model: {args.model}")
+    argv: list[str] = []
+    if getattr(args, "batch_size", None) is not None:
+        argv += ["--batch_size", str(args.batch_size)]
+    if getattr(args, "restart", False):
+        argv.append("--restart")
+    return _m.main(argv)
 
 
 def cmd_create_sentiment_features(args: argparse.Namespace) -> int:
-    from .sentiment.aggregate import run
-    return run(horizon=args.horizon, smoke=args.smoke,
-               max_rows=args.max_rows, no_plots=args.no_plots,
-               dry_run=args.dry_run)
+    rc = _stage_dry_run("create_sentiment_features", args)
+    if rc is not None:
+        return rc
+    from .sentiment import aggregate as _m
+    argv: list[str] = []
+    if getattr(args, "no_plots", False):
+        argv.append("--no_plots")
+    return _m.main(argv)
 
 
 def cmd_stationarity(args: argparse.Namespace) -> int:
-    from .sentiment.stationarity import run
-    return run(horizon=args.horizon, coins=args.coins,
-               smoke=args.smoke, no_plots=args.no_plots, dry_run=args.dry_run)
+    rc = _stage_dry_run("stationarity", args)
+    if rc is not None:
+        return rc
+    from .sentiment import stationarity as _m
+    argv: list[str] = []
+    if args.horizon:
+        argv += ["--horizon", args.horizon]
+    if args.coins:
+        for c in args.coins:
+            argv += ["--ticker", c]
+    if getattr(args, "no_plots", False):
+        argv.append("--no_plots")
+    return _m.main(argv)
 
 
 def cmd_merge_features(args: argparse.Namespace) -> int:
-    from .features.merge import run
-    return run(horizon=args.horizon, smoke=args.smoke, dry_run=args.dry_run)
+    from .features import merge as _m
+    argv: list[str] = []
+    if args.horizon:
+        argv += ["--horizon", args.horizon]
+    if args.smoke:
+        argv.append("--smoke")
+    if args.dry_run:
+        argv.append("--dry-run")
+    return _m.main(argv)
 
 
 def cmd_run_models(args: argparse.Namespace) -> int:
