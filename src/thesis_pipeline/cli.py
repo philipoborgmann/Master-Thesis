@@ -56,7 +56,9 @@ def _stage_dry_run(stage: str, args: argparse.Namespace) -> int | None:
     }
     for opt in ("set_id", "sentiment_model", "max_rows", "batch_size",
                 "winsor_p", "no_plots", "restart", "force",
-                "feature_config", "output_dir", "no_volatility"):
+                "feature_config", "output_dir", "no_volatility",
+                "no_market_cap", "no_economic",
+                "backtest_config", "transaction_cost_bps"):
         if hasattr(args, opt) and getattr(args, opt) not in (None, False):
             extras[opt] = getattr(args, opt)
     log_stage_header(stage, mode="dry-run", inputs=[], outputs=[], extra=extras)
@@ -206,6 +208,12 @@ def cmd_evaluate_signals(args: argparse.Namespace) -> int:
     feature_config = getattr(args, "feature_config", None)
     if feature_config:
         argv += ["--feature-config", feature_config]
+    backtest_config = getattr(args, "backtest_config", None)
+    if backtest_config:
+        argv += ["--backtest-config", str(backtest_config)]
+    tcb = getattr(args, "transaction_cost_bps", None)
+    if tcb:
+        argv += ["--transaction-cost-bps", *(str(c) for c in tcb)]
     if getattr(args, "smoke", False):
         argv.append("--smoke")
     if getattr(args, "dry_run", False):
@@ -214,6 +222,10 @@ def cmd_evaluate_signals(args: argparse.Namespace) -> int:
         argv.append("--force")
     if getattr(args, "no_volatility", False):
         argv.append("--no-volatility")
+    if getattr(args, "no_market_cap", False):
+        argv.append("--no-market-cap")
+    if getattr(args, "no_economic", False):
+        argv.append("--no-economic")
     return _es.main(argv)
 
 
@@ -353,13 +365,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     # evaluate-signals
     sp = sub.add_parser("evaluate-signals",
-                        help="Evaluate walk-forward signals (metrics, McNemar, regimes).")
+                        help="Evaluate walk-forward signals (metrics, McNemar, "
+                             "regimes, market-cap interaction, backtest).")
     sp.add_argument("--horizon", default=None, choices=["1h", "6h", "1d"])
     sp.add_argument("--output-dir", dest="output_dir", default=None)
     sp.add_argument("--feature-config", dest="feature_config", default=None,
                     help="Override path to feature_sets.xlsx.")
+    sp.add_argument("--backtest-config", dest="backtest_config", default=None,
+                    help="Override path to configs/backtest.yaml.")
+    sp.add_argument("--transaction-cost-bps", dest="transaction_cost_bps",
+                    type=float, nargs="*", default=None,
+                    help="Override the transaction-cost grid (bps).")
     sp.add_argument("--no-volatility", dest="no_volatility", action="store_true",
                     help="Skip the volatility-stratification step.")
+    sp.add_argument("--no-market-cap", dest="no_market_cap", action="store_true",
+                    help="Skip the market-cap stratification + interaction step.")
+    sp.add_argument("--no-economic", dest="no_economic", action="store_true",
+                    help="Skip the turnover/cost-aware backtest step.")
     _add_common(sp)
     sp.set_defaults(func=cmd_evaluate_signals)
 
@@ -378,7 +400,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--sentiment-model", dest="sentiment_model", default=None)
     sp.add_argument("--output-dir", dest="output_dir", default=None)
     sp.add_argument("--feature-config", dest="feature_config", default=None)
-    sp.add_argument("--no-volatility", dest="no_volatility", action="store_true")
+    sp.add_argument("--no-volatility",  dest="no_volatility",  action="store_true")
+    sp.add_argument("--no-market-cap",  dest="no_market_cap",  action="store_true")
+    sp.add_argument("--no-economic",    dest="no_economic",    action="store_true")
+    sp.add_argument("--backtest-config", dest="backtest_config", default=None)
+    sp.add_argument("--transaction-cost-bps", dest="transaction_cost_bps",
+                    type=float, nargs="*", default=None)
     _add_common(sp)
     sp.set_defaults(func=cmd_run_stage)
 
@@ -399,7 +426,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--sentiment-model", dest="sentiment_model", default=None)
     sp.add_argument("--output-dir", dest="output_dir", default=None)
     sp.add_argument("--feature-config", dest="feature_config", default=None)
-    sp.add_argument("--no-volatility", dest="no_volatility", action="store_true")
+    sp.add_argument("--no-volatility",  dest="no_volatility",  action="store_true")
+    sp.add_argument("--no-market-cap",  dest="no_market_cap",  action="store_true")
+    sp.add_argument("--no-economic",    dest="no_economic",    action="store_true")
+    sp.add_argument("--backtest-config", dest="backtest_config", default=None)
+    sp.add_argument("--transaction-cost-bps", dest="transaction_cost_bps",
+                    type=float, nargs="*", default=None)
     _add_common(sp)
     sp.set_defaults(func=cmd_run_pipeline)
 

@@ -5,9 +5,11 @@ modules so that each piece is independently testable:
 
 * :mod:`.loading`        — robust signal parquet loading
 * :mod:`.metrics`        — pooled + per-ticker metrics + confusion diagnostics
-* :mod:`.thresholds`     — high-conviction threshold analysis
+* :mod:`.thresholds`     — high-conviction threshold analysis + lift vs benchmark
 * :mod:`.volatility`     — Garman-Klass + tertile regime stratification
-* :mod:`.significance`   — continuity-corrected McNemar vs B1
+* :mod:`.significance`   — continuity-corrected McNemar vs B1 / B2
+* :mod:`.market_cap`     — daily cross-sectional cap tertiles + interaction
+* :mod:`.economic`       — turnover/cost-aware backtest with risk metrics
 * :mod:`.reporting`      — Excel + CSV + console summary
 
 CLI:
@@ -30,7 +32,16 @@ from ..modeling.run_models import load_feature_sets
 from .loading import (
     attach_feature_set_metadata, discover_signal_files, load_all_signals,
 )
+from .market_cap import (
+    build_market_cap_lookup, build_market_cap_summary,
+    market_cap_stratification_table, regime_interaction_table,
+)
 from .metrics import pooled_metrics_table, per_ticker_metrics_table
+from .economic import (
+    buy_and_hold_benchmark, load_backtest_config, load_forward_returns,
+    summarize_backtest, summarize_backtest_by_ticker,
+    summarize_threshold_backtest,
+)
 from .reporting import (
     build_leaderboard, build_summary,
     print_console_summary, write_csv_outputs, write_excel_report,
@@ -46,8 +57,9 @@ from .volatility import build_regime_lookup, volatility_stratification_table
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Signal evaluation — pooled/per-ticker metrics, McNemar, "
-                    "volatility-regime and threshold analysis."
+        description="Signal evaluation — pooled / per-ticker metrics, McNemar, "
+                    "volatility + market-cap regimes, threshold lift, "
+                    "and turnover/cost-aware backtests."
     )
     parser.add_argument("--horizon", default=None, choices=["1h", "6h", "1d"],
                         help="Restrict to a single horizon. Default: all available.")
@@ -57,6 +69,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feature_config", "--feature-config",
                         dest="feature_config", default=None,
                         help="Path to feature_sets.xlsx; defaults to configs/paths.yaml.")
+    parser.add_argument("--backtest-config", "--backtest_config",
+                        dest="backtest_config", default=None,
+                        help="Override configs/backtest.yaml.")
+    parser.add_argument("--transaction-cost-bps", "--transaction_cost_bps",
+                        dest="transaction_cost_bps", type=float, nargs="*",
+                        default=None,
+                        help="Override the cost grid from configs/backtest.yaml "
+                             "(one or more values in basis points).")
     parser.add_argument("--smoke", action="store_true",
                         help="Smoke mode: horizon=1d if not given; writes under smoke_root.")
     parser.add_argument("--dry-run", "--dry_run", dest="dry_run",
@@ -66,8 +86,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Allow overwriting full production outputs.")
     parser.add_argument("--no-volatility", dest="no_volatility",
                         action="store_true",
-                        help="Skip the volatility-stratification step "
-                             "(useful if Data/Raw/Price/1d/ is unavailable).")
+                        help="Skip the volatility-stratification step.")
+    parser.add_argument("--no-market-cap", "--no_market_cap",
+                        dest="no_market_cap", action="store_true",
+                        help="Skip the market-cap stratification + interaction step.")
+    parser.add_argument("--no-economic", "--no_economic",
+                        dest="no_economic", action="store_true",
+                        help="Skip the turnover/cost-aware backtest step.")
     return parser
 
 
@@ -91,7 +116,10 @@ def run(*, horizon: str | None = None,
         output_dir: str | Path | None = None,
         smoke: bool = False, dry_run: bool = False,
         force: bool = False, no_volatility: bool = False,
-        feature_config: str | None = None) -> int:
+        no_market_cap: bool = False, no_economic: bool = False,
+        feature_config: str | None = None,
+        backtest_config: str | None = None,
+        transaction_cost_bps: list[float] | None = None) -> int:
     """Programmatic entry point. Mirrors :func:`main` but takes kwargs."""
     argv: list[str] = []
     if horizon:
@@ -100,6 +128,10 @@ def run(*, horizon: str | None = None,
         argv += ["--output-dir", str(output_dir)]
     if feature_config:
         argv += ["--feature-config", feature_config]
+    if backtest_config:
+        argv += ["--backtest-config", backtest_config]
+    if transaction_cost_bps:
+        argv += ["--transaction-cost-bps", *(str(c) for c in transaction_cost_bps)]
     if smoke:
         argv.append("--smoke")
     if dry_run:
@@ -108,6 +140,10 @@ def run(*, horizon: str | None = None,
         argv.append("--force")
     if no_volatility:
         argv.append("--no-volatility")
+    if no_market_cap:
+        argv.append("--no-market-cap")
+    if no_economic:
+        argv.append("--no-economic")
     return main(argv)
 
 
@@ -125,11 +161,23 @@ def main(argv: Sequence[str] | None = None) -> int:
               Path(args.feature_config) if args.feature_config
               else resolve_path("feature_sets_xlsx"),
               resolve_path("raw_price_1d")]
+    if not args.no_market_cap:
+        try:
+            inputs.append(resolve_path("cmc_market_cap"))
+        except KeyError:
+            pass
     outputs = [xlsx_path,
                out_root / "pooled_metrics.csv",
                out_root / "per_ticker_metrics.csv",
                out_root / "threshold_analysis.csv",
                out_root / "volatility_stratification.csv"]
+    if not args.no_market_cap:
+        outputs += [out_root / "market_cap_stratification.csv",
+                    out_root / "regime_interaction.csv"]
+    if not args.no_economic:
+        outputs += [out_root / "economic_performance.csv",
+                    out_root / "economic_performance_by_threshold.csv",
+                    out_root / "economic_performance_by_ticker.csv"]
 
     log_stage_header(
         "evaluate_signals",
@@ -137,10 +185,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         inputs=inputs,
         outputs=outputs,
         extra={
-            "horizon":       args.horizon or "(all)",
-            "output_dir":    str(out_root),
-            "no_volatility": args.no_volatility,
-            "force":         args.force,
+            "horizon":              args.horizon or "(all)",
+            "output_dir":           str(out_root),
+            "no_volatility":        args.no_volatility,
+            "no_market_cap":        args.no_market_cap,
+            "no_economic":          args.no_economic,
+            "transaction_cost_bps": args.transaction_cost_bps or "(from config)",
+            "backtest_config":      args.backtest_config or "(default)",
+            "force":                args.force,
         },
     )
 
@@ -178,7 +230,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     per_ticker = per_ticker_metrics_table(signals)
 
     # ── 4. Threshold / conviction analysis ──────────────────────
-    threshold_df = threshold_analysis_table(signals)
+    threshold_df      = threshold_analysis_table(signals)
     threshold_lift_df = threshold_lift_table(signals, benchmarks=DEFAULT_BENCHMARKS)
 
     # ── 5. McNemar significance vs B1 and B2 ────────────────────
@@ -189,33 +241,105 @@ def main(argv: Sequence[str] | None = None) -> int:
             mcnemar_wide_df, on=["horizon", "set_id", "sentiment_model"],
             how="left",
         )
-    # Back-compat aliases so external code that still reads `mcnemar_pval`
-    # keeps working. They mirror the vs-B1 columns.
     if "mcnemar_pval_vs_b1" in pooled.columns and "mcnemar_pval" not in pooled.columns:
         pooled["mcnemar_stat"]              = pooled["mcnemar_stat_vs_b1"]
         pooled["mcnemar_pval"]              = pooled["mcnemar_pval_vs_b1"]
         pooled["significant_vs_benchmark"]  = pooled.get("significant_vs_b1", False)
 
-    # ── 6. Volatility-regime stratification ─────────────────────
+    tickers = sorted(signals["ticker"].dropna().astype(str).str.upper().unique())
+
+    # ── 6. Volatility regime stratification ─────────────────────
+    vol_lookup = pd.DataFrame()
     if args.no_volatility:
         volatility_df = pd.DataFrame()
         logger.info("evaluate-signals: --no-volatility set, skipping stratification")
     else:
-        tickers = sorted(signals["ticker"].dropna().astype(str).str.upper().unique())
-        lookup = build_regime_lookup(tickers)
-        if lookup.empty:
+        vol_lookup = build_regime_lookup(tickers)
+        if vol_lookup.empty:
             logger.warning("evaluate-signals: no daily price data found — "
                            "volatility stratification will be empty")
             volatility_df = pd.DataFrame()
         else:
-            volatility_df = volatility_stratification_table(signals, lookup)
+            volatility_df = volatility_stratification_table(signals, vol_lookup)
 
-    # ── 7. Leaderboard + summary ────────────────────────────────
+    # ── 7. Market-cap regime stratification + interaction ───────
+    mcap_df         = pd.DataFrame()
+    interaction_df  = pd.DataFrame()
+    extra_summary: list[dict] = []
+    if args.no_market_cap:
+        logger.info("evaluate-signals: --no-market-cap set, skipping mcap stratification")
+    else:
+        mcap_lookup = build_market_cap_lookup()
+        if mcap_lookup.empty:
+            logger.warning("evaluate-signals: market-cap lookup is empty — "
+                           "mcap_stratification + regime_interaction tables "
+                           "will be empty")
+        else:
+            mcap_df = market_cap_stratification_table(signals, mcap_lookup)
+            if not vol_lookup.empty:
+                interaction_df = regime_interaction_table(
+                    signals, mcap_lookup, vol_lookup,
+                )
+            else:
+                logger.info("evaluate-signals: skipping regime_interaction — "
+                            "volatility lookup is empty")
+        extra_summary = build_market_cap_summary(mcap_df, interaction_df)
+
+    # ── 8. Economic / backtest layer ────────────────────────────
+    economic_df      = pd.DataFrame()
+    economic_thr_df  = pd.DataFrame()
+    economic_tk_df   = pd.DataFrame()
+    if args.no_economic:
+        logger.info("evaluate-signals: --no-economic set, skipping backtest")
+    else:
+        bcfg = load_backtest_config(args.backtest_config)
+        if args.transaction_cost_bps:
+            bcfg["transaction_cost_bps"] = list(args.transaction_cost_bps)
+        # Forward returns are loaded per-horizon to respect bar granularity.
+        for hz in sorted(signals["horizon"].dropna().astype(str).unique()):
+            hz_signals = signals[signals["horizon"] == hz]
+            if hz_signals.empty:
+                continue
+            hz_tickers = sorted(hz_signals["ticker"].astype(str).str.upper().unique())
+            fr = load_forward_returns(hz_tickers, horizon=hz)
+            if fr.empty:
+                logger.warning("evaluate-signals: no close-price data for %s — "
+                               "backtest will skip this horizon", hz)
+                continue
+            economic_df     = pd.concat(
+                [economic_df, summarize_backtest(hz_signals, fr, bcfg)],
+                ignore_index=True,
+            )
+            economic_thr_df = pd.concat(
+                [economic_thr_df, summarize_threshold_backtest(hz_signals, fr, bcfg)],
+                ignore_index=True,
+            )
+            economic_tk_df  = pd.concat(
+                [economic_tk_df, summarize_backtest_by_ticker(hz_signals, fr, bcfg)],
+                ignore_index=True,
+            )
+            # Buy-and-hold reference row (optional)
+            if bcfg.get("include_buy_and_hold"):
+                bh = buy_and_hold_benchmark(hz_tickers, fr, bcfg, hz)
+                if bh is not None:
+                    economic_df = pd.concat(
+                        [economic_df, pd.DataFrame([bh])],
+                        ignore_index=True,
+                    )
+
+    # ── 9. Leaderboard + thesis-style summary ───────────────────
     leaderboard = build_leaderboard(pooled)
-    summary     = build_summary(pooled, threshold_df, volatility_df,
-                                threshold_lift=threshold_lift_df)
+    summary     = build_summary(
+        pooled, threshold_df, volatility_df,
+        threshold_lift=threshold_lift_df,
+        market_cap_df=mcap_df,
+        interaction_df=interaction_df,
+        economic_df=economic_df,
+        economic_threshold_df=economic_thr_df,
+        extra_rows=extra_summary,
+    )
 
-    # ── 8. Sorting (deterministic output) ───────────────────────
+    # ── 10. Sorting (deterministic output) ──────────────────────
     if not pooled.empty:
         pooled = pooled.sort_values(["horizon", "accuracy"],
                                     ascending=[True, False]).reset_index(drop=True)
@@ -232,18 +356,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not volatility_df.empty:
         volatility_df = volatility_df.sort_values(
             ["horizon", "set_id", "sentiment_model", "vol_regime"]).reset_index(drop=True)
+    if not mcap_df.empty:
+        mcap_df = mcap_df.sort_values(
+            ["horizon", "set_id", "sentiment_model", "mcap_regime"]).reset_index(drop=True)
+    if not interaction_df.empty:
+        interaction_df = interaction_df.sort_values(
+            ["horizon", "set_id", "sentiment_model", "mcap_regime", "vol_regime"]
+        ).reset_index(drop=True)
     if not mcnemar_df_long.empty:
         mcnemar_df_long = mcnemar_df_long.sort_values(
             ["horizon", "set_id", "sentiment_model", "benchmark"]
         ).reset_index(drop=True)
+    if not economic_df.empty:
+        economic_df = economic_df.sort_values(
+            ["horizon", "cost_bps", "sharpe"],
+            ascending=[True, True, False]).reset_index(drop=True)
+    if not economic_thr_df.empty:
+        economic_thr_df = economic_thr_df.sort_values(
+            ["horizon", "threshold", "cost_bps", "sharpe"],
+            ascending=[True, True, True, False]).reset_index(drop=True)
+    if not economic_tk_df.empty:
+        economic_tk_df = economic_tk_df.sort_values(
+            ["horizon", "set_id", "sentiment_model", "ticker", "cost_bps"]
+        ).reset_index(drop=True)
 
-    # ── 9. Write outputs ────────────────────────────────────────
+    # ── 11. Write outputs ───────────────────────────────────────
     csv_paths = write_csv_outputs(
         out_root,
         pooled=pooled, per_ticker=per_ticker,
         threshold=threshold_df, volatility=volatility_df,
         threshold_lift=threshold_lift_df,
         mcnemar=mcnemar_df_long,
+        market_cap=(mcap_df         if not args.no_market_cap else None),
+        regime_interaction=(interaction_df if not args.no_market_cap else None),
+        economic=(economic_df       if not args.no_economic   else None),
+        economic_threshold=(economic_thr_df if not args.no_economic else None),
+        economic_by_ticker=(economic_tk_df  if not args.no_economic else None),
     )
     xlsx = write_excel_report(
         xlsx_path,
@@ -252,15 +400,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         leaderboard=leaderboard, summary=summary,
         threshold_lift=threshold_lift_df,
         mcnemar=mcnemar_df_long,
+        market_cap=(mcap_df         if not args.no_market_cap else None),
+        regime_interaction=(interaction_df if not args.no_market_cap else None),
+        economic=(economic_df       if not args.no_economic   else None),
+        economic_threshold=(economic_thr_df if not args.no_economic else None),
+        economic_by_ticker=(economic_tk_df  if not args.no_economic else None),
     )
     logger.info("evaluate-signals: wrote Excel report %s", xlsx)
     for label, path in csv_paths.items():
         logger.info("evaluate-signals: wrote %s → %s", label, path)
 
-    # ── 10. Console summary ─────────────────────────────────────
+    # ── 12. Console summary ─────────────────────────────────────
     print_console_summary(
         pooled=pooled, threshold=threshold_df,
         mcnemar=mcnemar_df_long, threshold_lift=threshold_lift_df,
+        market_cap=mcap_df, regime_interaction=interaction_df,
+        economic=economic_df, economic_threshold=economic_thr_df,
     )
     return 0
 
