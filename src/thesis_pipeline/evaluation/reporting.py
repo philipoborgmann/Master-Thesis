@@ -144,7 +144,7 @@ def build_summary(pooled: pd.DataFrame,
 
     if economic_df is not None and not economic_df.empty:
         for metric, label in (("sharpe", "best_sharpe"),
-                              ("cumulative_return", "best_cumulative_return")):
+                              ("net_cumulative_simple_return", "best_cumulative_return")):
             valid = economic_df.dropna(subset=[metric])
             if valid.empty:
                 continue
@@ -507,7 +507,7 @@ def print_console_summary(*,
                 print(f"     {r['horizon']:>3s}  cost={int(r['cost_bps'])}bps  "
                       f"{r['set_id']}{tag:14s} "
                       f"sharpe={r['sharpe']:+.3f}  "
-                      f"cum_ret={r.get('cumulative_return', float('nan')):+.3f}  "
+                      f"cum_ret={r.get('net_cumulative_simple_return', float('nan')):+.3f}  "
                       f"max_dd={r.get('max_drawdown', float('nan')):.3f}  "
                       f"turnover={r.get('turnover', float('nan')):.3f}")
 
@@ -526,5 +526,5 @@ def print_console_summary(*,
                       f"{r['set_id']}{tag:14s} "
                       f"sharpe={r['sharpe']:+.3f}  "
                       f"cov={r.get('coverage', float('nan')):.3f}  "
-                      f"n_trades={int(r.get('n_trades', 0))}")
+                      f"n_periods={int(r.get('n_periods', 0))}")
     print()
