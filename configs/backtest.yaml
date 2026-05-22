@@ -1,0 +1,56 @@
+# Backtest / economic-evaluation configuration.
+#
+# Consumed by :mod:`thesis_pipeline.evaluation.economic` via
+# :func:`thesis_pipeline.config.load_config("backtest")`. The CLI flag
+# ``evaluate-signals --backtest-config path/to/file.yaml`` overrides this
+# default at the call site.
+
+# Annualisation regime. ``crypto`` uses ``crypto_calendar_days`` (365);
+# ``traditional`` would use 252. Crypto trades 24/7 so 365 is the right
+# default for the thesis.
+annualization_mode: crypto
+crypto_calendar_days: 365
+
+# Transaction-cost grid in basis points (one bps = 1 / 10000).
+# Net returns are computed for every entry in this list; ``0`` keeps the
+# gross series in the output for comparison.
+transaction_cost_bps:
+  - 0
+  - 5
+  - 10
+
+# High-conviction trade thresholds. ``0.5`` is implicit (long ↔ short with
+# no neutral band) and is always included by the economic module; the
+# extra entries here add the asymmetric "no-trade" middle band.
+thresholds:
+  - 0.55
+  - 0.60
+  - 0.65
+
+# Turnover convention: half of the absolute position change per step
+# (``abs(pos_t - pos_{t-1}) / 2``). Switching from -1 to +1 → turnover 1,
+# matches a round-trip.
+turnover_method: half_abs_diff
+
+# Long-short toggle. ``true`` mirrors the existing prediction convention
+# (1 → long, 0 → short). ``false`` collapses shorts to flat (0).
+long_short_enabled: true
+
+# When ``true``, threshold backtests apply ``flat`` to observations inside
+# the neutral band; when ``false`` every observation is traded according
+# to the default sign rule.
+flat_middle_zone: true
+
+# Sets to use as economic benchmarks. Must exist as ``set_id`` values in
+# the signal universe; missing sets are skipped with a warning.
+benchmark_ids:
+  - B1
+  - B2
+
+# Risk-free rate (annual, decimal). Crypto thesis convention: 0.0.
+risk_free_rate: 0.0
+
+# Optional buy-and-hold benchmark, computed from raw close prices when
+# OHLCV data is locally available. Per-ticker series are averaged
+# equal-weight to give one number per horizon.
+include_buy_and_hold: true

@@ -47,7 +47,12 @@ def build_summary(pooled: pd.DataFrame,
                   threshold_df: pd.DataFrame,
                   volatility_df: pd.DataFrame,
                   *,
-                  threshold_lift: pd.DataFrame | None = None) -> pd.DataFrame:
+                  threshold_lift: pd.DataFrame | None = None,
+                  market_cap_df: pd.DataFrame | None = None,
+                  interaction_df: pd.DataFrame | None = None,
+                  economic_df: pd.DataFrame | None = None,
+                  economic_threshold_df: pd.DataFrame | None = None,
+                  extra_rows: list[dict] | None = None) -> pd.DataFrame:
     """Thesis-ready aggregate overview as a long-form table."""
     rows: list[dict] = []
     if not pooled.empty:
@@ -110,6 +115,81 @@ def build_summary(pooled: pd.DataFrame,
                 "metric": "accuracy", "value": r["accuracy"],
                 "coverage": r["coverage"],
             })
+    if market_cap_df is not None and not market_cap_df.empty:
+        small = (market_cap_df[market_cap_df["mcap_regime"] == "small"]
+                 .dropna(subset=["accuracy"])
+                 .sort_values("accuracy", ascending=False)
+                 .groupby("horizon", group_keys=False).head(1))
+        for _, r in small.iterrows():
+            rows.append({
+                "section": "best_small_cap_model",
+                "horizon": r["horizon"], "set_id": r["set_id"],
+                "sentiment_model": r.get("sentiment_model", "-"),
+                "metric": "accuracy", "value": float(r["accuracy"]),
+            })
+
+    if interaction_df is not None and not interaction_df.empty:
+        sub = (interaction_df[(interaction_df["mcap_regime"] == "small") &
+                              (interaction_df["vol_regime"]  == "high")]
+               .dropna(subset=["accuracy"])
+               .sort_values("accuracy", ascending=False)
+               .groupby("horizon", group_keys=False).head(1))
+        for _, r in sub.iterrows():
+            rows.append({
+                "section": "best_small_high_vol_model",
+                "horizon": r["horizon"], "set_id": r["set_id"],
+                "sentiment_model": r.get("sentiment_model", "-"),
+                "metric": "accuracy", "value": float(r["accuracy"]),
+            })
+
+    if economic_df is not None and not economic_df.empty:
+        for metric, label in (("sharpe", "best_sharpe"),
+                              ("cumulative_return", "best_cumulative_return")):
+            valid = economic_df.dropna(subset=[metric])
+            if valid.empty:
+                continue
+            gross = (valid[valid["cost_bps"] == 0]
+                     .sort_values(metric, ascending=False)
+                     .groupby("horizon", group_keys=False).head(1))
+            for _, r in gross.iterrows():
+                rows.append({
+                    "section": label,
+                    "horizon": r["horizon"], "set_id": r["set_id"],
+                    "sentiment_model": r.get("sentiment_model", "-"),
+                    "cost_bps": int(r["cost_bps"]),
+                    "metric": metric, "value": float(r[metric]),
+                })
+            if metric == "sharpe":
+                net = (valid[valid["cost_bps"] > 0]
+                       .sort_values(metric, ascending=False)
+                       .groupby("horizon", group_keys=False).head(1))
+                for _, r in net.iterrows():
+                    rows.append({
+                        "section": "best_net_sharpe",
+                        "horizon": r["horizon"], "set_id": r["set_id"],
+                        "sentiment_model": r.get("sentiment_model", "-"),
+                        "cost_bps": int(r["cost_bps"]),
+                        "metric": metric, "value": float(r[metric]),
+                    })
+
+    if economic_threshold_df is not None and not economic_threshold_df.empty:
+        valid = economic_threshold_df.dropna(subset=["sharpe"])
+        if not valid.empty:
+            best = (valid.sort_values("sharpe", ascending=False)
+                         .groupby(["horizon", "cost_bps"], group_keys=False).head(1))
+            for _, r in best.iterrows():
+                rows.append({
+                    "section":  "best_threshold_sharpe",
+                    "horizon":  r["horizon"], "set_id": r["set_id"],
+                    "sentiment_model": r.get("sentiment_model", "-"),
+                    "threshold": float(r["threshold"]),
+                    "cost_bps":  int(r["cost_bps"]),
+                    "metric":   "sharpe", "value": float(r["sharpe"]),
+                })
+
+    if extra_rows:
+        rows.extend(extra_rows)
+
     if threshold_lift is not None and not threshold_lift.empty:
         # Best matched-observation lift per (horizon, threshold, benchmark).
         lift = (threshold_lift.dropna(subset=["lift_accuracy"])
@@ -201,7 +281,13 @@ def write_csv_outputs(out_dir: Path, *,
                       threshold: pd.DataFrame,
                       volatility: pd.DataFrame,
                       threshold_lift: pd.DataFrame | None = None,
-                      mcnemar: pd.DataFrame | None = None) -> dict[str, Path]:
+                      mcnemar: pd.DataFrame | None = None,
+                      market_cap: pd.DataFrame | None = None,
+                      regime_interaction: pd.DataFrame | None = None,
+                      economic: pd.DataFrame | None = None,
+                      economic_threshold: pd.DataFrame | None = None,
+                      economic_by_ticker: pd.DataFrame | None = None
+                      ) -> dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = {
         "pooled":    out_dir / "pooled_metrics.csv",
@@ -219,6 +305,21 @@ def write_csv_outputs(out_dir: Path, *,
     if mcnemar is not None:
         paths["mcnemar"] = out_dir / "mcnemar_tests.csv"
         mcnemar.to_csv(paths["mcnemar"], index=False)
+    if market_cap is not None:
+        paths["market_cap"] = out_dir / "market_cap_stratification.csv"
+        market_cap.to_csv(paths["market_cap"], index=False)
+    if regime_interaction is not None:
+        paths["regime_interaction"] = out_dir / "regime_interaction.csv"
+        regime_interaction.to_csv(paths["regime_interaction"], index=False)
+    if economic is not None:
+        paths["economic"] = out_dir / "economic_performance.csv"
+        economic.to_csv(paths["economic"], index=False)
+    if economic_threshold is not None:
+        paths["economic_threshold"] = out_dir / "economic_performance_by_threshold.csv"
+        economic_threshold.to_csv(paths["economic_threshold"], index=False)
+    if economic_by_ticker is not None:
+        paths["economic_by_ticker"] = out_dir / "economic_performance_by_ticker.csv"
+        economic_by_ticker.to_csv(paths["economic_by_ticker"], index=False)
     return paths
 
 
@@ -230,19 +331,34 @@ def write_excel_report(out_path: Path, *,
                        leaderboard: pd.DataFrame,
                        summary: pd.DataFrame,
                        threshold_lift: pd.DataFrame | None = None,
-                       mcnemar: pd.DataFrame | None = None) -> Path:
+                       mcnemar: pd.DataFrame | None = None,
+                       market_cap: pd.DataFrame | None = None,
+                       regime_interaction: pd.DataFrame | None = None,
+                       economic: pd.DataFrame | None = None,
+                       economic_threshold: pd.DataFrame | None = None,
+                       economic_by_ticker: pd.DataFrame | None = None) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        _write_sheet(writer, "pooled_metrics",            pooled)
-        _write_sheet(writer, "per_ticker_metrics",        per_ticker)
-        _write_sheet(writer, "threshold_analysis",        threshold)
+        _write_sheet(writer, "pooled_metrics",                pooled)
+        _write_sheet(writer, "per_ticker_metrics",            per_ticker)
+        _write_sheet(writer, "threshold_analysis",            threshold)
         if threshold_lift is not None:
-            _write_sheet(writer, "threshold_lift",        threshold_lift)
-        _write_sheet(writer, "volatility_stratification", volatility)
+            _write_sheet(writer, "threshold_lift",            threshold_lift)
+        _write_sheet(writer, "volatility_stratification",     volatility)
+        if market_cap is not None:
+            _write_sheet(writer, "market_cap_stratification", market_cap)
+        if regime_interaction is not None:
+            _write_sheet(writer, "regime_interaction",        regime_interaction)
+        if economic is not None:
+            _write_sheet(writer, "economic_performance",      economic)
+        if economic_threshold is not None:
+            _write_sheet(writer, "economic_by_threshold",     economic_threshold)
+        if economic_by_ticker is not None:
+            _write_sheet(writer, "economic_by_ticker",        economic_by_ticker)
         if mcnemar is not None:
-            _write_sheet(writer, "mcnemar_tests",         mcnemar)
-        _write_sheet(writer, "leaderboard",               leaderboard)
-        _write_sheet(writer, "summary",                   summary)
+            _write_sheet(writer, "mcnemar_tests",             mcnemar)
+        _write_sheet(writer, "leaderboard",                   leaderboard)
+        _write_sheet(writer, "summary",                       summary)
     return out_path
 
 
@@ -254,7 +370,11 @@ def print_console_summary(*,
                           pooled: pd.DataFrame,
                           threshold: pd.DataFrame,
                           mcnemar: pd.DataFrame,
-                          threshold_lift: pd.DataFrame | None = None) -> None:
+                          threshold_lift: pd.DataFrame | None = None,
+                          market_cap: pd.DataFrame | None = None,
+                          regime_interaction: pd.DataFrame | None = None,
+                          economic: pd.DataFrame | None = None,
+                          economic_threshold: pd.DataFrame | None = None) -> None:
     print("\n" + "=" * 72)
     print(" SIGNAL EVALUATION SUMMARY")
     print("=" * 72)
@@ -339,4 +459,72 @@ def print_console_summary(*,
                       f"(model={r['accuracy_model']:.4f}, "
                       f"bench={r['accuracy_benchmark']:.4f}, "
                       f"n={int(r['n_matched'])})")
+
+    # Market-cap stratification — strongest small-cap lift.
+    if market_cap is not None and not market_cap.empty:
+        print("\n  Strongest small-cap accuracy per horizon:")
+        small = (market_cap[market_cap["mcap_regime"] == "small"]
+                 .dropna(subset=["accuracy"])
+                 .sort_values("accuracy", ascending=False)
+                 .groupby("horizon", group_keys=False).head(3))
+        for hz, grp in small.groupby("horizon"):
+            print(f"   [{hz}]")
+            for _, r in grp.iterrows():
+                sm = r.get("sentiment_model", "-")
+                tag = f"/{sm}" if sm and sm != "-" else ""
+                print(f"     {r['set_id']}{tag:14s} acc={r['accuracy']:.4f}  "
+                      f"brier={r.get('brier_score', float('nan')):.4f}  "
+                      f"n={int(r.get('n_obs', 0))}")
+
+    # Small-cap × high-vol interaction — central thesis hypothesis.
+    if regime_interaction is not None and not regime_interaction.empty:
+        sub = (regime_interaction[(regime_interaction["mcap_regime"] == "small") &
+                                  (regime_interaction["vol_regime"]  == "high")]
+               .dropna(subset=["accuracy"])
+               .sort_values("accuracy", ascending=False))
+        if not sub.empty:
+            print("\n  Best small-cap × high-vol accuracy per horizon:")
+            top = sub.groupby("horizon", group_keys=False).head(3)
+            for hz, grp in top.groupby("horizon"):
+                print(f"   [{hz}]")
+                for _, r in grp.iterrows():
+                    sm = r.get("sentiment_model", "-")
+                    tag = f"/{sm}" if sm and sm != "-" else ""
+                    print(f"     {r['set_id']}{tag:14s} acc={r['accuracy']:.4f}  "
+                          f"n={int(r.get('n_obs', 0))}  "
+                          f"days={int(r.get('n_days', 0))}")
+
+    # Economic — best Sharpe / cumulative return per horizon and cost.
+    if economic is not None and not economic.empty:
+        print("\n  Best Sharpe per (horizon × cost_bps):")
+        valid = economic.dropna(subset=["sharpe"])
+        if not valid.empty:
+            best = (valid.sort_values("sharpe", ascending=False)
+                         .groupby(["horizon", "cost_bps"], group_keys=False).head(1))
+            for _, r in best.iterrows():
+                sm = r.get("sentiment_model", "-")
+                tag = f"/{sm}" if sm and sm != "-" else ""
+                print(f"     {r['horizon']:>3s}  cost={int(r['cost_bps'])}bps  "
+                      f"{r['set_id']}{tag:14s} "
+                      f"sharpe={r['sharpe']:+.3f}  "
+                      f"cum_ret={r.get('cumulative_return', float('nan')):+.3f}  "
+                      f"max_dd={r.get('max_drawdown', float('nan')):.3f}  "
+                      f"turnover={r.get('turnover', float('nan')):.3f}")
+
+    if economic_threshold is not None and not economic_threshold.empty:
+        print("\n  Best Sharpe per (horizon × threshold × cost_bps):")
+        valid = economic_threshold.dropna(subset=["sharpe"])
+        if not valid.empty:
+            best = (valid.sort_values("sharpe", ascending=False)
+                         .groupby(["horizon", "threshold", "cost_bps"],
+                                  group_keys=False).head(1))
+            for _, r in best.iterrows():
+                sm = r.get("sentiment_model", "-")
+                tag = f"/{sm}" if sm and sm != "-" else ""
+                print(f"     {r['horizon']:>3s}  t={r['threshold']:.2f}  "
+                      f"cost={int(r['cost_bps'])}bps  "
+                      f"{r['set_id']}{tag:14s} "
+                      f"sharpe={r['sharpe']:+.3f}  "
+                      f"cov={r.get('coverage', float('nan')):.3f}  "
+                      f"n_trades={int(r.get('n_trades', 0))}")
     print()
