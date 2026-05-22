@@ -1,56 +1,76 @@
 # Backtest / economic-evaluation configuration.
 #
-# Consumed by :mod:`thesis_pipeline.evaluation.economic` via
-# :func:`thesis_pipeline.config.load_config("backtest")`. The CLI flag
+# Consumed by :mod:`thesis_pipeline.evaluation.economic`. The CLI flag
 # ``evaluate-signals --backtest-config path/to/file.yaml`` overrides this
-# default at the call site.
+# default; ``--transaction-cost-bps`` overrides the cost grid only.
+#
+# The backtest is a **cross-sectional High-Low portfolio**:
+#   * For each timestamp t, the model produces a probability per coin.
+#   * The top-quantile coins by probability form the equal-weight long leg
+#     (long weights sum to +1).
+#   * The bottom-quantile coins form the equal-weight short leg
+#     (short weights sum to -1).
+#   * Net exposure ≈ 0 (dollar-neutral); gross exposure = 2.
+#   * portfolio_log_return_t = mean(forward_long) − mean(forward_short).
+#   * Transaction costs are charged on portfolio-level turnover, computed
+#     from per-asset weight changes.
+#   * Returns are *log returns* throughout; ``annualized_simple_return`` is
+#     derived as ``expm1(annualized_log_return)``.
+#   * Drawdown is the percentage drawdown on the equity curve
+#     ``exp(cumulative_log_return)``.
+#
+# ⚠  Previous versions treated every (ticker × timestamp) observation as a
+#    separate trading row. That over-counted periods-per-year by the
+#    cross-section size (≈ 24× for the thesis universe) and inflated Sharpe
+#    and cumulative return. All historical economic_* numbers from that
+#    code path should be discarded and re-run.
 
-# Annualisation regime. ``crypto`` uses ``crypto_calendar_days`` (365);
-# ``traditional`` would use 252. Crypto trades 24/7 so 365 is the right
-# default for the thesis.
-annualization_mode: crypto
-crypto_calendar_days: 365
+portfolio_mode: high_low
 
-# Transaction-cost grid in basis points (one bps = 1 / 10000).
-# Net returns are computed for every entry in this list; ``0`` keeps the
-# gross series in the output for comparison.
-transaction_cost_bps:
-  - 0
-  - 5
-  - 10
+# Quantile cutoffs (computed cross-sectionally per timestamp, on the model
+# probabilities). long_quantile = 0.8 keeps the top 20 % by probability;
+# short_quantile = 0.2 keeps the bottom 20 %.
+long_quantile:  0.8
+short_quantile: 0.2
 
-# High-conviction trade thresholds. ``0.5`` is implicit (long ↔ short with
-# no neutral band) and is always included by the economic module; the
-# extra entries here add the asymmetric "no-trade" middle band.
+# Minimum number of assets needed on each leg for the portfolio to trade
+# the timestamp. ``allow_single_leg: false`` means: if one leg is empty,
+# the timestamp is skipped entirely (no half-portfolio).
+min_assets_per_leg: 1
+allow_single_leg:   false
+
+# Weighting scheme inside each leg. Only equal-weight is implemented today
+# — value-weighted / probability-weighted are future work.
+weighting: equal_weight
+
+# Conviction-band thresholds for the threshold backtest. Long if p > t,
+# short if p < 1 − t, else flat. Not the same as a classification
+# threshold (see :func:`summarize_high_low_threshold_backtest`).
 thresholds:
   - 0.55
   - 0.60
   - 0.65
 
-# Turnover convention: half of the absolute position change per step
-# (``abs(pos_t - pos_{t-1}) / 2``). Switching from -1 to +1 → turnover 1,
-# matches a round-trip.
-turnover_method: half_abs_diff
+# Transaction-cost grid in basis points (1 bps = 1/10000). Costs apply to
+# portfolio-level turnover ``0.5 · sum_i |w_t,i − w_{t-1,i}|``.
+transaction_cost_bps:
+  - 0
+  - 5
+  - 10
 
-# Long-short toggle. ``true`` mirrors the existing prediction convention
-# (1 → long, 0 → short). ``false`` collapses shorts to flat (0).
-long_short_enabled: true
+# Annualisation. ``crypto`` uses ``crypto_calendar_days`` (365); a tradFi
+# 252-day calendar can be requested by setting ``crypto_calendar_days: 252``.
+annualization_mode: crypto
+crypto_calendar_days: 365
 
-# When ``true``, threshold backtests apply ``flat`` to observations inside
-# the neutral band; when ``false`` every observation is traded according
-# to the default sign rule.
-flat_middle_zone: true
+risk_free_rate: 0.0
 
-# Sets to use as economic benchmarks. Must exist as ``set_id`` values in
-# the signal universe; missing sets are skipped with a warning.
+# Sets to use as economic benchmarks (lift columns vs B1 / B2 are appended
+# to the pooled economic table).
 benchmark_ids:
   - B1
   - B2
 
-# Risk-free rate (annual, decimal). Crypto thesis convention: 0.0.
-risk_free_rate: 0.0
-
-# Optional buy-and-hold benchmark, computed from raw close prices when
-# OHLCV data is locally available. Per-ticker series are averaged
-# equal-weight to give one number per horizon.
+# Equal-weight long-only buy-and-hold reference computed from raw close
+# prices when locally available. One row per (horizon × cost_bps).
 include_buy_and_hold: true

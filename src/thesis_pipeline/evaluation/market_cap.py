@@ -171,11 +171,35 @@ def _daily_tertiles(values: pd.Series,
     return full
 
 
-def build_market_cap_lookup(mcap_path: str | Path | None = None) -> pd.DataFrame:
-    """Return ``(date, ticker, market_cap_lag, mcap_regime)`` lookup."""
+def build_market_cap_lookup(mcap_path: str | Path | None = None,
+                            tickers: Iterable[str] | None = None) -> pd.DataFrame:
+    """Return ``(date, ticker, market_cap_lag, mcap_regime)`` lookup.
+
+    Parameters
+    ----------
+    mcap_path
+        Path to the wide-format CMC parquet. Defaults to
+        ``configs/paths.yaml :: cmc_market_cap``.
+    tickers
+        Restrict the cross-section to the model's signal universe. Without
+        this restriction the daily tertiles would be computed over every
+        coin in the CMC dump, which is methodologically wrong for the
+        thesis — the model only trades the configured universe so the
+        small/mid/large bins must be defined within it.
+    """
     raw = load_market_cap(mcap_path)
     if raw.empty:
         return pd.DataFrame(columns=["date", "ticker", "market_cap_lag", "mcap_regime"])
+
+    if tickers is not None:
+        universe = {_normalise_ticker(t) for t in tickers}
+        raw = raw[raw["ticker"].isin(universe)].copy()
+        if raw.empty:
+            get_logger().warning(
+                "evaluate-signals: market-cap data contains none of the "
+                "signal-universe tickers — mcap stratification will be empty"
+            )
+            return pd.DataFrame(columns=["date", "ticker", "market_cap_lag", "mcap_regime"])
 
     lagged = normalize_market_cap(raw)
     # Daily cross-sectional tertile assignment using lagged mcap (no leakage).
@@ -242,14 +266,16 @@ def _aggregate_correctness(group: pd.DataFrame) -> dict:
                 "brier_score": np.nan, "n_obs": 0, "n_days": 0, "n_tickers": 0}
     n_classes = int(np.unique(y).size)
     if n_classes < 2:
-        prec = rec = f1v = np.nan
+        # Single-class slice: all classification metrics are undefined.
+        prec = rec = f1v = bal_acc = np.nan
     else:
         prec = precision_score(y, p, zero_division=0)
         rec  = recall_score(y, p, zero_division=0)
         f1v  = f1_score(y, p, zero_division=0)
+        bal_acc = float(balanced_accuracy_score(y, p))
     out = {
         "accuracy":          float(accuracy_score(y, p)),
-        "balanced_accuracy": float(balanced_accuracy_score(y, p)),
+        "balanced_accuracy": bal_acc if n_classes >= 2 else np.nan,
         "precision":         float(prec) if not np.isnan(prec) else np.nan,
         "recall":            float(rec)  if not np.isnan(rec)  else np.nan,
         "f1":                float(f1v)  if not np.isnan(f1v)  else np.nan,
@@ -355,7 +381,8 @@ def build_market_cap_summary(mcap_strat: pd.DataFrame,
     """Return summary rows highlighting small-cap and small-high-vol effects."""
     rows: list[dict] = []
     if mcap_strat is not None and not mcap_strat.empty:
-        small = (mcap_strat[mcap_strat["mcap_regime"] == "small"]
+        small = (mcap_strat[(mcap_strat["mcap_regime"] == "small")
+                            & (mcap_strat["n_obs"] > 0)]
                  .dropna(subset=["accuracy"])
                  .sort_values("accuracy", ascending=False))
         if not small.empty:
@@ -372,7 +399,8 @@ def build_market_cap_summary(mcap_strat: pd.DataFrame,
                 })
     if interaction is not None and not interaction.empty:
         sub = (interaction[(interaction["mcap_regime"] == "small") &
-                           (interaction["vol_regime"]  == "high")]
+                           (interaction["vol_regime"]  == "high") &
+                           (interaction["n_obs"] > 0)]
                .dropna(subset=["accuracy"])
                .sort_values("accuracy", ascending=False))
         if not sub.empty:

@@ -38,9 +38,11 @@ from .market_cap import (
 )
 from .metrics import pooled_metrics_table, per_ticker_metrics_table
 from .economic import (
-    buy_and_hold_benchmark, load_backtest_config, load_forward_returns,
-    summarize_backtest, summarize_backtest_by_ticker,
-    summarize_threshold_backtest,
+    attach_benchmark_lifts, buy_and_hold_benchmark,
+    load_backtest_config, load_forward_returns,
+    summarize_backtest_by_ticker,
+    summarize_high_low_backtest,
+    summarize_high_low_threshold_backtest,
 )
 from .reporting import (
     build_leaderboard, build_summary,
@@ -269,7 +271,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.no_market_cap:
         logger.info("evaluate-signals: --no-market-cap set, skipping mcap stratification")
     else:
-        mcap_lookup = build_market_cap_lookup()
+        # Constrain the cross-section to the model's signal universe.
+        mcap_lookup = build_market_cap_lookup(tickers=tickers)
         if mcap_lookup.empty:
             logger.warning("evaluate-signals: market-cap lookup is empty — "
                            "mcap_stratification + regime_interaction tables "
@@ -307,25 +310,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                                "backtest will skip this horizon", hz)
                 continue
             economic_df     = pd.concat(
-                [economic_df, summarize_backtest(hz_signals, fr, bcfg)],
+                [economic_df,
+                 summarize_high_low_backtest(hz_signals, fr, bcfg, horizon=hz)],
                 ignore_index=True,
             )
             economic_thr_df = pd.concat(
-                [economic_thr_df, summarize_threshold_backtest(hz_signals, fr, bcfg)],
+                [economic_thr_df,
+                 summarize_high_low_threshold_backtest(hz_signals, fr, bcfg,
+                                                       horizon=hz)],
                 ignore_index=True,
             )
             economic_tk_df  = pd.concat(
-                [economic_tk_df, summarize_backtest_by_ticker(hz_signals, fr, bcfg)],
+                [economic_tk_df,
+                 summarize_backtest_by_ticker(hz_signals, fr, bcfg, horizon=hz)],
                 ignore_index=True,
             )
-            # Buy-and-hold reference row (optional)
+            # Buy-and-hold reference rows — one per cost level (was: cost=0 only).
             if bcfg.get("include_buy_and_hold"):
                 bh = buy_and_hold_benchmark(hz_tickers, fr, bcfg, hz)
-                if bh is not None:
-                    economic_df = pd.concat(
-                        [economic_df, pd.DataFrame([bh])],
-                        ignore_index=True,
-                    )
+                if bh is not None and not bh.empty:
+                    economic_df = pd.concat([economic_df, bh], ignore_index=True)
+
+        # Append per-benchmark lift columns (sharpe / cumulative_return).
+        if not economic_df.empty:
+            economic_df = attach_benchmark_lifts(
+                economic_df, bcfg.get("benchmark_ids", ["B1", "B2"]),
+            )
 
     # ── 9. Leaderboard + thesis-style summary ───────────────────
     leaderboard = build_leaderboard(pooled)
