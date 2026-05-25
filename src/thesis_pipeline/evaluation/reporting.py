@@ -52,6 +52,7 @@ def build_summary(pooled: pd.DataFrame,
                   interaction_df: pd.DataFrame | None = None,
                   economic_df: pd.DataFrame | None = None,
                   economic_threshold_df: pd.DataFrame | None = None,
+                  regime_mcnemar_df: pd.DataFrame | None = None,
                   extra_rows: list[dict] | None = None) -> pd.DataFrame:
     """Thesis-ready aggregate overview as a long-form table."""
     rows: list[dict] = []
@@ -187,6 +188,54 @@ def build_summary(pooled: pd.DataFrame,
                     "metric":   "sharpe", "value": float(r["sharpe"]),
                 })
 
+    if regime_mcnemar_df is not None and not regime_mcnemar_df.empty:
+        valid = regime_mcnemar_df[regime_mcnemar_df["test_valid"]]
+        rows.append({
+            "section": "regime_mcnemar_overview",
+            "metric": "n_valid_tests", "value": int(len(valid)),
+        })
+        rows.append({
+            "section": "regime_mcnemar_overview",
+            "metric": "n_significant_raw_5pct",
+            "value": int(valid["significant_5pct"].fillna(False).sum()),
+        })
+        if "significant_bh_5pct" in regime_mcnemar_df.columns:
+            rows.append({
+                "section": "regime_mcnemar_overview",
+                "metric": "n_significant_bh_5pct",
+                "value": int(regime_mcnemar_df["significant_bh_5pct"].fillna(False).sum()),
+            })
+        # Strongest c − b improvement among valid tests.
+        if not valid.empty:
+            tmp = valid.assign(c_minus_b=valid["c"] - valid["b"])
+            best = tmp.sort_values("c_minus_b", ascending=False).head(1)
+            for _, r in best.iterrows():
+                rows.append({
+                    "section": "best_regime_correction",
+                    "regime_type": r.get("regime_type"),
+                    "horizon": r["horizon"], "set_id": r["set_id"],
+                    "sentiment_model": r.get("sentiment_model", "-"),
+                    "benchmark": r.get("benchmark"),
+                    "vol_regime": r.get("vol_regime"),
+                    "mcap_regime": r.get("mcap_regime"),
+                    "metric": "c_minus_b", "value": int(r["c"] - r["b"]),
+                    "q_value_bh": r.get("q_value_bh"),
+                })
+            # Best small-cap × high-vol interaction result, if present.
+            inter = tmp[(tmp.get("regime_type") == "interaction")
+                        & (tmp.get("mcap_regime") == "small")
+                        & (tmp.get("vol_regime")  == "high")]
+            if not inter.empty:
+                r = inter.sort_values("c_minus_b", ascending=False).iloc[0]
+                rows.append({
+                    "section": "best_small_high_regime_mcnemar",
+                    "horizon": r["horizon"], "set_id": r["set_id"],
+                    "sentiment_model": r.get("sentiment_model", "-"),
+                    "benchmark": r.get("benchmark"),
+                    "metric": "c_minus_b", "value": int(r["c"] - r["b"]),
+                    "q_value_bh": r.get("q_value_bh"),
+                })
+
     if extra_rows:
         rows.extend(extra_rows)
 
@@ -286,7 +335,8 @@ def write_csv_outputs(out_dir: Path, *,
                       regime_interaction: pd.DataFrame | None = None,
                       economic: pd.DataFrame | None = None,
                       economic_threshold: pd.DataFrame | None = None,
-                      economic_by_ticker: pd.DataFrame | None = None
+                      economic_by_ticker: pd.DataFrame | None = None,
+                      regime_mcnemar: pd.DataFrame | None = None
                       ) -> dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = {
@@ -320,6 +370,9 @@ def write_csv_outputs(out_dir: Path, *,
     if economic_by_ticker is not None:
         paths["economic_by_ticker"] = out_dir / "economic_performance_by_ticker.csv"
         economic_by_ticker.to_csv(paths["economic_by_ticker"], index=False)
+    if regime_mcnemar is not None:
+        paths["regime_mcnemar"] = out_dir / "regime_mcnemar_tests.csv"
+        regime_mcnemar.to_csv(paths["regime_mcnemar"], index=False)
     return paths
 
 
@@ -336,7 +389,8 @@ def write_excel_report(out_path: Path, *,
                        regime_interaction: pd.DataFrame | None = None,
                        economic: pd.DataFrame | None = None,
                        economic_threshold: pd.DataFrame | None = None,
-                       economic_by_ticker: pd.DataFrame | None = None) -> Path:
+                       economic_by_ticker: pd.DataFrame | None = None,
+                       regime_mcnemar: pd.DataFrame | None = None) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         _write_sheet(writer, "pooled_metrics",                pooled)
@@ -357,6 +411,8 @@ def write_excel_report(out_path: Path, *,
             _write_sheet(writer, "economic_by_ticker",        economic_by_ticker)
         if mcnemar is not None:
             _write_sheet(writer, "mcnemar_tests",             mcnemar)
+        if regime_mcnemar is not None:
+            _write_sheet(writer, "regime_mcnemar_tests",      regime_mcnemar)
         _write_sheet(writer, "leaderboard",                   leaderboard)
         _write_sheet(writer, "summary",                       summary)
     return out_path
@@ -374,7 +430,8 @@ def print_console_summary(*,
                           market_cap: pd.DataFrame | None = None,
                           regime_interaction: pd.DataFrame | None = None,
                           economic: pd.DataFrame | None = None,
-                          economic_threshold: pd.DataFrame | None = None) -> None:
+                          economic_threshold: pd.DataFrame | None = None,
+                          regime_mcnemar: pd.DataFrame | None = None) -> None:
     print("\n" + "=" * 72)
     print(" SIGNAL EVALUATION SUMMARY")
     print("=" * 72)
@@ -527,4 +584,32 @@ def print_console_summary(*,
                       f"sharpe={r['sharpe']:+.3f}  "
                       f"cov={r.get('coverage', float('nan')):.3f}  "
                       f"n_periods={int(r.get('n_periods', 0))}")
+
+    # Regime-specific McNemar tests (supplementary, BH-corrected).
+    if regime_mcnemar is not None and not regime_mcnemar.empty:
+        valid = regime_mcnemar[regime_mcnemar["test_valid"]]
+        n_valid = int(len(valid))
+        n_bh = int(regime_mcnemar.get("significant_bh_5pct",
+                                      pd.Series(dtype=bool)).fillna(False).sum())
+        print("\n  Regime McNemar tests (supplementary, BH-corrected):")
+        print(f"    valid tests: {n_valid}   BH-significant @5%: {n_bh}")
+        if n_valid > 0:
+            ranked = valid.assign(c_minus_b=valid["c"] - valid["b"])
+            # Prefer ranking by q-value; fall back to c-b when q is absent.
+            if "q_value_bh" in ranked.columns and ranked["q_value_bh"].notna().any():
+                ranked = ranked.sort_values(["q_value_bh", "c_minus_b"],
+                                            ascending=[True, False])
+            else:
+                ranked = ranked.sort_values("c_minus_b", ascending=False)
+            for _, r in ranked.head(5).iterrows():
+                sm = r.get("sentiment_model", "-")
+                tag = f"/{sm}" if sm and sm != "-" else ""
+                reg = (r.get("interaction") if r.get("regime_type") == "interaction"
+                       else r.get("vol_regime") if r.get("regime_type") == "volatility"
+                       else r.get("mcap_regime"))
+                q = r.get("q_value_bh", float("nan"))
+                print(f"     {r['regime_type']:11s} {r['set_id']}{tag:12s} "
+                      f"vs {r['benchmark']}  regime={reg}  "
+                      f"c-b={int(r['c'] - r['b']):+d}  "
+                      f"p={r['mcnemar_pval']:.4f}  q={q:.4f}")
     print()

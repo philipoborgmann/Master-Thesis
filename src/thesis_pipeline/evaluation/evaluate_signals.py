@@ -48,7 +48,9 @@ from .reporting import (
     build_leaderboard, build_summary,
     print_console_summary, write_csv_outputs, write_excel_report,
 )
-from .significance import DEFAULT_BENCHMARKS, mcnemar_table, mcnemar_wide
+from .significance import (
+    DEFAULT_BENCHMARKS, mcnemar_table, mcnemar_wide, regime_mcnemar_table,
+)
 from .thresholds import threshold_analysis_table, threshold_lift_table
 from .volatility import build_regime_lookup, volatility_stratification_table
 
@@ -95,6 +97,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-economic", "--no_economic",
                         dest="no_economic", action="store_true",
                         help="Skip the turnover/cost-aware backtest step.")
+    parser.add_argument("--no-regime-mcnemar", "--no_regime_mcnemar",
+                        dest="no_regime_mcnemar", action="store_true",
+                        help="Skip the regime-specific (volatility / market-cap / "
+                             "interaction) McNemar tests.")
     return parser
 
 
@@ -119,6 +125,7 @@ def run(*, horizon: str | None = None,
         smoke: bool = False, dry_run: bool = False,
         force: bool = False, no_volatility: bool = False,
         no_market_cap: bool = False, no_economic: bool = False,
+        no_regime_mcnemar: bool = False,
         feature_config: str | None = None,
         backtest_config: str | None = None,
         transaction_cost_bps: list[float] | None = None) -> int:
@@ -146,6 +153,8 @@ def run(*, horizon: str | None = None,
         argv.append("--no-market-cap")
     if no_economic:
         argv.append("--no-economic")
+    if no_regime_mcnemar:
+        argv.append("--no-regime-mcnemar")
     return main(argv)
 
 
@@ -180,6 +189,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         outputs += [out_root / "economic_performance.csv",
                     out_root / "economic_performance_by_threshold.csv",
                     out_root / "economic_performance_by_ticker.csv"]
+    if not args.no_regime_mcnemar:
+        outputs.append(out_root / "regime_mcnemar_tests.csv")
 
     log_stage_header(
         "evaluate_signals",
@@ -192,6 +203,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "no_volatility":        args.no_volatility,
             "no_market_cap":        args.no_market_cap,
             "no_economic":          args.no_economic,
+            "no_regime_mcnemar":    args.no_regime_mcnemar,
             "transaction_cost_bps": args.transaction_cost_bps or "(from config)",
             "backtest_config":      args.backtest_config or "(default)",
             "force":                args.force,
@@ -268,6 +280,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     mcap_df         = pd.DataFrame()
     interaction_df  = pd.DataFrame()
     extra_summary: list[dict] = []
+    mcap_lookup     = pd.DataFrame()
     if args.no_market_cap:
         logger.info("evaluate-signals: --no-market-cap set, skipping mcap stratification")
     else:
@@ -287,6 +300,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 logger.info("evaluate-signals: skipping regime_interaction — "
                             "volatility lookup is empty")
         extra_summary = build_market_cap_summary(mcap_df, interaction_df)
+
+    # ── 7b. Regime-specific McNemar tests (supplementary) ───────
+    regime_mcnemar_df = pd.DataFrame()
+    if args.no_regime_mcnemar:
+        logger.info("evaluate-signals: --no-regime-mcnemar set, skipping regime McNemar")
+    else:
+        has_vol  = not vol_lookup.empty
+        has_mcap = not mcap_lookup.empty
+        if not has_vol and not has_mcap:
+            logger.info("evaluate-signals: no regime lookups available — "
+                        "skipping regime McNemar")
+        else:
+            regime_mcnemar_df = regime_mcnemar_table(
+                signals,
+                vol_lookup=vol_lookup if has_vol else None,
+                mcap_lookup=mcap_lookup if has_mcap else None,
+                benchmarks=DEFAULT_BENCHMARKS,
+            )
 
     # ── 8. Economic / backtest layer ────────────────────────────
     economic_df      = pd.DataFrame()
@@ -346,6 +377,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         interaction_df=interaction_df,
         economic_df=economic_df,
         economic_threshold_df=economic_thr_df,
+        regime_mcnemar_df=regime_mcnemar_df,
         extra_rows=extra_summary,
     )
 
@@ -389,6 +421,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         economic_tk_df = economic_tk_df.sort_values(
             ["horizon", "set_id", "sentiment_model", "ticker", "cost_bps"]
         ).reset_index(drop=True)
+    if not regime_mcnemar_df.empty:
+        regime_mcnemar_df = regime_mcnemar_df.sort_values(
+            ["regime_type", "horizon", "set_id", "sentiment_model", "benchmark"]
+        ).reset_index(drop=True)
 
     # ── 11. Write outputs ───────────────────────────────────────
     csv_paths = write_csv_outputs(
@@ -402,6 +438,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         economic=(economic_df       if not args.no_economic   else None),
         economic_threshold=(economic_thr_df if not args.no_economic else None),
         economic_by_ticker=(economic_tk_df  if not args.no_economic else None),
+        regime_mcnemar=(regime_mcnemar_df if not args.no_regime_mcnemar else None),
     )
     xlsx = write_excel_report(
         xlsx_path,
@@ -415,6 +452,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         economic=(economic_df       if not args.no_economic   else None),
         economic_threshold=(economic_thr_df if not args.no_economic else None),
         economic_by_ticker=(economic_tk_df  if not args.no_economic else None),
+        regime_mcnemar=(regime_mcnemar_df if not args.no_regime_mcnemar else None),
     )
     logger.info("evaluate-signals: wrote Excel report %s", xlsx)
     for label, path in csv_paths.items():
@@ -426,6 +464,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         mcnemar=mcnemar_df_long, threshold_lift=threshold_lift_df,
         market_cap=mcap_df, regime_interaction=interaction_df,
         economic=economic_df, economic_threshold=economic_thr_df,
+        regime_mcnemar=regime_mcnemar_df,
     )
     return 0
 
