@@ -17,9 +17,17 @@ fresh checkout of the package can be validated against:
 
 All tests run inside a ``tmp_path`` via ``monkeypatch.chdir`` so the real
 ``Data/`` and ``Outputs/`` trees are never touched.
+
+Optional report
+---------------
+Set ``THESIS_WRITE_SYNTH_REPORT=1`` to additionally persist the validation
+metrics to ``Outputs/diagnostics/synthetic_validation.csv`` in the real
+repository root (gitignored). Without the flag nothing is written outside
+the ephemeral ``tmp_path``.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -27,8 +35,14 @@ import pandas as pd
 import pytest
 
 from thesis_pipeline.modeling.run_models import (
-    load_feature_sets, main, run_walk_forward,
+    compute_metrics, load_feature_sets, main,
+    run_rolling_probability, run_walk_forward,
 )
+
+# Real repository root (resolved before any monkeypatch.chdir).
+REPO_ROOT = Path(__file__).resolve().parents[1]
+_WRITE_REPORT = os.environ.get("THESIS_WRITE_SYNTH_REPORT", "").strip().lower() \
+    in ("1", "true", "yes", "on")
 
 # ---------------------------------------------------------------------------
 # Synthetic-data helpers
@@ -303,3 +317,111 @@ def test_feature_sets_loader_normalises_majority_class_sentinel(synth_repo):
     # ``__majority_class__`` is rewritten to ``__rolling_probability__`` by
     # the loader so the benchmark code path triggers downstream.
     assert b1_features == "__rolling_probability__"
+
+
+# ---------------------------------------------------------------------------
+# Optional persisted report
+# ---------------------------------------------------------------------------
+
+def _pooled_accuracy(signals: pd.DataFrame) -> float:
+    if signals.empty:
+        return float("nan")
+    return float((signals["prediction"] == signals["target"]).mean())
+
+
+def _collect_validation_metrics() -> pd.DataFrame:
+    """Compute a coherent set of validation metrics on one fixed dataset.
+
+    Uses the canonical walk-forward and rolling-probability functions
+    directly (no full pipeline / no disk writes) so the numbers are
+    deterministic (seed=42) and fast. Returns a tidy long-form table.
+    """
+    df = _build_synthetic_features(n_per_ticker=300, tickers=("BTC", "ETH"), seed=42)
+
+    def _pooled(feature_cols, mode):
+        frames = []
+        for tk, g in df.groupby("ticker"):
+            g = g.sort_values("timestamp")
+            if mode == "walk_forward":
+                sig = run_walk_forward(g, feature_cols=feature_cols)
+            else:  # rolling_probability benchmark (B1)
+                sig = run_rolling_probability(g)
+            if not sig.empty:
+                frames.append(sig)
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    syn1  = _pooled(["signal_feature"], "walk_forward")
+    noise = _pooled(["noise_feature"],  "walk_forward")
+    b1    = _pooled(None,               "rolling_probability")
+
+    acc_syn1  = _pooled_accuracy(syn1)
+    acc_noise = _pooled_accuracy(noise)
+    acc_b1    = _pooled_accuracy(b1)
+
+    def _metric_block(label, set_id, feature, signals, acc, expectation, passed):
+        m = compute_metrics(signals, "pooled") if not signals.empty else {}
+        return {
+            "set_id":       set_id,
+            "feature":      feature,
+            "label":        label,
+            "accuracy":     round(acc, 6) if acc == acc else float("nan"),
+            "balanced_accuracy": m.get("balanced_accuracy", float("nan")),
+            "f1":           m.get("f1", float("nan")),
+            "brier_score":  m.get("brier_score", float("nan")),
+            "n_obs":        int(m.get("n_obs", 0)),
+            "expectation":  expectation,
+            "status":       "PASS" if passed else "FAIL",
+        }
+
+    rows = [
+        _metric_block("logistic on strong signal", "SYN1", "signal_feature",
+                      syn1, acc_syn1, "accuracy > 0.65", acc_syn1 > 0.65),
+        _metric_block("logistic on pure noise", "SYN_NOISE", "noise_feature",
+                      noise, acc_noise, "accuracy < 0.60 (no leakage)",
+                      acc_noise < 0.60),
+        _metric_block("rolling-probability benchmark", "B1", "__rolling_probability__",
+                      b1, acc_b1, "baseline ≈ 0.50", True),
+    ]
+    # Lift rows (not tied to a single set).
+    lift = acc_syn1 - acc_b1
+    rows.append({
+        "set_id": "SYN1_vs_B1", "feature": "-", "label": "signal lift over benchmark",
+        "accuracy": float("nan"), "balanced_accuracy": float("nan"),
+        "f1": float("nan"), "brier_score": float("nan"), "n_obs": 0,
+        "expectation": "lift >= 0.05", "status": "PASS" if lift >= 0.05 else "FAIL",
+        "lift_accuracy": round(lift, 6),
+    })
+    out = pd.DataFrame(rows)
+    out["target_balance"] = round(float(df["target"].mean()), 6)
+    out["n_per_ticker"]   = 300
+    out["seed"]           = 42
+    return out
+
+
+def test_collect_validation_metrics_all_pass():
+    """The coherent metric sweep must satisfy every documented expectation."""
+    report = _collect_validation_metrics()
+    assert (report["status"] == "PASS").all(), (
+        f"validation expectations not met:\n{report.to_string(index=False)}"
+    )
+
+
+@pytest.mark.skipif(
+    not _WRITE_REPORT,
+    reason="set THESIS_WRITE_SYNTH_REPORT=1 to persist the validation CSV",
+)
+def test_write_synthetic_validation_report():
+    """Opt-in: persist the validation metrics to Outputs/diagnostics/.
+
+    Enabled only when ``THESIS_WRITE_SYNTH_REPORT=1``. Writes to the real
+    repository root (REPO_ROOT), which is gitignored under Outputs/.
+    """
+    report = _collect_validation_metrics()
+    out_dir = REPO_ROOT / "Outputs" / "diagnostics"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "synthetic_validation.csv"
+    report.to_csv(out_path, index=False)
+    assert out_path.exists()
+    # Round-trip sanity.
+    reloaded = pd.read_csv(out_path)
+    assert set(reloaded["set_id"]) >= {"SYN1", "SYN_NOISE", "B1", "SYN1_vs_B1"}
