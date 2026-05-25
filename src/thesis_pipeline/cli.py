@@ -57,7 +57,7 @@ def _stage_dry_run(stage: str, args: argparse.Namespace) -> int | None:
     for opt in ("set_id", "sentiment_model", "max_rows", "batch_size",
                 "winsor_p", "no_plots", "restart", "force",
                 "feature_config", "output_dir", "no_volatility",
-                "no_market_cap", "no_economic",
+                "no_market_cap", "no_economic", "no_regime_mcnemar",
                 "backtest_config", "transaction_cost_bps"):
         if hasattr(args, opt) and getattr(args, opt) not in (None, False):
             extras[opt] = getattr(args, opt)
@@ -226,6 +226,8 @@ def cmd_evaluate_signals(args: argparse.Namespace) -> int:
         argv.append("--no-market-cap")
     if getattr(args, "no_economic", False):
         argv.append("--no-economic")
+    if getattr(args, "no_regime_mcnemar", False):
+        argv.append("--no-regime-mcnemar")
     return _es.main(argv)
 
 
@@ -382,6 +384,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Skip the market-cap stratification + interaction step.")
     sp.add_argument("--no-economic", dest="no_economic", action="store_true",
                     help="Skip the turnover/cost-aware backtest step.")
+    sp.add_argument("--no-regime-mcnemar", dest="no_regime_mcnemar",
+                    action="store_true",
+                    help="Skip the regime-specific McNemar tests.")
     _add_common(sp)
     sp.set_defaults(func=cmd_evaluate_signals)
 
@@ -403,6 +408,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-volatility",  dest="no_volatility",  action="store_true")
     sp.add_argument("--no-market-cap",  dest="no_market_cap",  action="store_true")
     sp.add_argument("--no-economic",    dest="no_economic",    action="store_true")
+    sp.add_argument("--no-regime-mcnemar", dest="no_regime_mcnemar", action="store_true")
     sp.add_argument("--backtest-config", dest="backtest_config", default=None)
     sp.add_argument("--transaction-cost-bps", dest="transaction_cost_bps",
                     type=float, nargs="*", default=None)
@@ -429,6 +435,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-volatility",  dest="no_volatility",  action="store_true")
     sp.add_argument("--no-market-cap",  dest="no_market_cap",  action="store_true")
     sp.add_argument("--no-economic",    dest="no_economic",    action="store_true")
+    sp.add_argument("--no-regime-mcnemar", dest="no_regime_mcnemar", action="store_true")
     sp.add_argument("--backtest-config", dest="backtest_config", default=None)
     sp.add_argument("--transaction-cost-bps", dest="transaction_cost_bps",
                     type=float, nargs="*", default=None)
