@@ -187,12 +187,22 @@ MIN_N_MATCHED_DEFAULT = 50
 MIN_DISCORDANT_DEFAULT = 20
 
 _REGIME_FRONT_COLS = [
+    # Identity
     "regime_type", "horizon", "set_id", "category", "sentiment_model",
     "benchmark", "vol_regime", "mcap_regime", "interaction",
+    # Direction + effect size up front so the table reads at a glance.
+    "direction", "net_improvement", "abs_net_improvement",
+    "improvement_rate", "discordant_advantage",
+    # Raw counts
     "b", "c", "n_matched", "discordant_n",
+    # Significance (p / q never hidden)
     "mcnemar_stat", "mcnemar_pval", "q_value_bh",
     "significant_5pct", "significant_10pct",
-    "significant_bh_5pct", "significant_bh_10pct", "test_valid",
+    "significant_bh_5pct", "significant_bh_10pct",
+    # Direction-aware significance
+    "model_better_raw_5pct", "benchmark_better_raw_5pct",
+    "model_better_bh_5pct", "benchmark_better_bh_5pct",
+    "practical_effect_flag", "test_valid",
 ]
 
 
@@ -217,7 +227,8 @@ def mcnemar_by_group(signals: pd.DataFrame,
                      group_cols: list[str],
                      benchmarks: Sequence[str] = DEFAULT_BENCHMARKS,
                      min_n_matched: int = MIN_N_MATCHED_DEFAULT,
-                     min_discordant: int = MIN_DISCORDANT_DEFAULT) -> pd.DataFrame:
+                     min_discordant: int = MIN_DISCORDANT_DEFAULT,
+                     min_effect_rate: float = 0.01) -> pd.DataFrame:
     """Continuity-corrected McNemar per
     (horizon × set_id × sentiment_model × benchmark × group_cols).
 
@@ -225,6 +236,22 @@ def mcnemar_by_group(signals: pd.DataFrame,
     from the model side. A cell is ``test_valid`` only when
     ``n_matched >= min_n_matched`` **and** ``discordant_n >= min_discordant``;
     invalid cells carry NaN statistics and ``False`` significance flags.
+
+    Effect-size / direction columns (McNemar significance is *symmetric*, so
+    direction must be read off b vs c):
+
+    * ``net_improvement = c - b`` — the central effect: > 0 means the model
+      corrects more benchmark errors than vice versa; < 0 the opposite.
+    * ``abs_net_improvement = |c - b|``
+    * ``improvement_rate = (c - b) / n_matched`` — net effect per matched obs.
+    * ``discordant_advantage = c / (b + c)`` — share of *disagreement* cases
+      the model wins; > 0.5 ⇒ model is right more often when they disagree.
+      NaN when ``b + c == 0``.
+    * ``direction`` ∈ {model_better, benchmark_better, tie}.
+    * ``practical_effect_flag`` — valid AND |improvement_rate| ≥
+      ``min_effect_rate`` AND ``discordant_n ≥ min_discordant``.
+    * ``model_better_raw_5pct`` / ``benchmark_better_raw_5pct`` —
+      raw-significant AND the corresponding direction.
     """
     if signals.empty or "category" not in signals.columns:
         return pd.DataFrame()
@@ -270,12 +297,38 @@ def mcnemar_by_group(signals: pd.DataFrame,
                     else:
                         stat, pval = np.nan, np.nan
                         sig5 = sig10 = False
+
+                    # ── Effect size + direction ──────────────────
+                    net_improvement = c - b
+                    abs_net = abs(net_improvement)
+                    improvement_rate = (net_improvement / n_matched) if n_matched else np.nan
+                    discordant_advantage = (c / discordant) if discordant > 0 else np.nan
+                    if c > b:
+                        direction = "model_better"
+                    elif b > c:
+                        direction = "benchmark_better"
+                    else:
+                        direction = "tie"
+                    practical_effect_flag = bool(
+                        test_valid
+                        and (improvement_rate == improvement_rate)  # not NaN
+                        and abs(improvement_rate) >= min_effect_rate
+                        and discordant >= min_discordant
+                    )
+                    model_better_raw_5pct     = bool(sig5 and direction == "model_better")
+                    benchmark_better_raw_5pct = bool(sig5 and direction == "benchmark_better")
+
                     row = {
                         "horizon":          keys[0],
                         "set_id":           keys[1],
                         "sentiment_model":  keys[2],
                         "category":         category,
                         "benchmark":        bid,
+                        "direction":        direction,
+                        "net_improvement":  net_improvement,
+                        "abs_net_improvement": abs_net,
+                        "improvement_rate": improvement_rate,
+                        "discordant_advantage": discordant_advantage,
                         "b":                b,
                         "c":                c,
                         "n_matched":        n_matched,
@@ -284,6 +337,9 @@ def mcnemar_by_group(signals: pd.DataFrame,
                         "mcnemar_pval":     pval,
                         "significant_5pct":  sig5,
                         "significant_10pct": sig10,
+                        "model_better_raw_5pct":     model_better_raw_5pct,
+                        "benchmark_better_raw_5pct": benchmark_better_raw_5pct,
+                        "practical_effect_flag":     practical_effect_flag,
                         "test_valid":       test_valid,
                     }
                     for col, val in zip(group_cols, gvals):
@@ -442,6 +498,114 @@ def regime_mcnemar_table(signals: pd.DataFrame,
         if col not in out.columns:
             out[col] = np.nan
     out = adjust_pvalues_bh(out, "mcnemar_pval")
+
+    # Direction-aware BH flags (McNemar is symmetric → split by direction).
+    direction = out.get("direction", pd.Series(["tie"] * len(out)))
+    bh5 = out.get("significant_bh_5pct", pd.Series([False] * len(out))).fillna(False)
+    out["model_better_bh_5pct"]     = bh5 & (direction == "model_better")
+    out["benchmark_better_bh_5pct"] = bh5 & (direction == "benchmark_better")
+
     ordered = [c for c in _REGIME_FRONT_COLS if c in out.columns]
     rest = [c for c in out.columns if c not in ordered]
     return out[ordered + rest].reset_index(drop=True)
+
+
+def build_regime_mcnemar_summary(regime_mcnemar_df: pd.DataFrame) -> pd.DataFrame:
+    """Distil the regime McNemar table into thesis-ready highlight rows.
+
+    Sections produced (each contributes 0-1 rows, sorted as described):
+
+    * ``top_model_better_raw`` / ``top_model_better_bh`` — strongest cells
+      where the *model* beats the benchmark (raw / BH-significant). Sorted
+      BH-significant first, then ``q_value_bh`` ascending, then
+      ``net_improvement`` descending.
+    * ``top_benchmark_better_raw`` / ``top_benchmark_better_bh`` — strongest
+      cells where the *benchmark* wins. Sorted BH-significant first, then
+      ``q_value_bh`` ascending, then ``net_improvement`` ascending (most
+      negative first).
+    * ``best_small_high_model`` / ``best_small_low_model`` — best model cell
+      in the small-cap × high-vol / small-cap × low-vol interaction regime.
+    * ``best_cryptobert_model_better`` — best model cell for the cryptobert
+      scorer.
+    * ``strongest_benchmark_win`` — most negative ``net_improvement`` overall.
+
+    Always returns a DataFrame (possibly empty) — never raises on empty
+    input. Regime McNemar stays exploratory; interpret with the
+    multiple-testing caveat in mind.
+    """
+    cols = ["section", "horizon", "set_id", "sentiment_model", "benchmark",
+            "regime_type", "mcap_regime", "vol_regime", "interaction",
+            "direction", "net_improvement", "improvement_rate",
+            "discordant_advantage", "n_matched", "discordant_n",
+            "mcnemar_pval", "q_value_bh"]
+    if regime_mcnemar_df is None or regime_mcnemar_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    df = regime_mcnemar_df[regime_mcnemar_df.get("test_valid", False) == True].copy()  # noqa: E712
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    # Stable helper to pull the columns we want out of one row.
+    def _row(section: str, r: pd.Series) -> dict:
+        out = {"section": section}
+        for c in cols[1:]:
+            out[c] = r.get(c, np.nan)
+        return out
+
+    rows: list[dict] = []
+
+    def _sorted_model(frame: pd.DataFrame) -> pd.DataFrame:
+        # BH-significant first, then q ascending, then net_improvement desc.
+        f = frame.copy()
+        f["_bh"] = f.get("significant_bh_5pct", False).fillna(False).astype(int)
+        f["_q"] = f.get("q_value_bh", np.nan)
+        return f.sort_values(["_bh", "_q", "net_improvement"],
+                             ascending=[False, True, False])
+
+    def _sorted_bench(frame: pd.DataFrame) -> pd.DataFrame:
+        f = frame.copy()
+        f["_bh"] = f.get("significant_bh_5pct", False).fillna(False).astype(int)
+        f["_q"] = f.get("q_value_bh", np.nan)
+        return f.sort_values(["_bh", "_q", "net_improvement"],
+                             ascending=[False, True, True])
+
+    model = df[df["direction"] == "model_better"]
+    bench = df[df["direction"] == "benchmark_better"]
+
+    if not model.empty:
+        rows.append(_row("top_model_better_raw",
+                         _sorted_model(model[model.get("significant_5pct", False) == True]  # noqa: E712
+                                       if (model.get("significant_5pct", False) == True).any()  # noqa: E712
+                                       else model).iloc[0]))
+        bh_model = model[model.get("significant_bh_5pct", False) == True]  # noqa: E712
+        if not bh_model.empty:
+            rows.append(_row("top_model_better_bh", _sorted_model(bh_model).iloc[0]))
+
+    if not bench.empty:
+        rows.append(_row("top_benchmark_better_raw",
+                         _sorted_bench(bench[bench.get("significant_5pct", False) == True]  # noqa: E712
+                                       if (bench.get("significant_5pct", False) == True).any()  # noqa: E712
+                                       else bench).iloc[0]))
+        bh_bench = bench[bench.get("significant_bh_5pct", False) == True]  # noqa: E712
+        if not bh_bench.empty:
+            rows.append(_row("top_benchmark_better_bh", _sorted_bench(bh_bench).iloc[0]))
+
+    # Interaction-specific highlights (model side).
+    inter = model[model["regime_type"] == "interaction"]
+    for label, mcap_r, vol_r in (("best_small_high_model", "small", "high"),
+                                 ("best_small_low_model",  "small", "low")):
+        sub = inter[(inter["mcap_regime"] == mcap_r) & (inter["vol_regime"] == vol_r)]
+        if not sub.empty:
+            rows.append(_row(label, _sorted_model(sub).iloc[0]))
+
+    # Best cryptobert model cell.
+    cb = model[model["sentiment_model"].astype(str).str.lower() == "cryptobert"]
+    if not cb.empty:
+        rows.append(_row("best_cryptobert_model_better", _sorted_model(cb).iloc[0]))
+
+    # Strongest benchmark win overall (most negative net_improvement).
+    if not bench.empty:
+        rows.append(_row("strongest_benchmark_win",
+                         bench.sort_values("net_improvement", ascending=True).iloc[0]))
+
+    return pd.DataFrame(rows, columns=cols)

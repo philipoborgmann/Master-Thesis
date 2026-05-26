@@ -409,13 +409,15 @@ def test_full_evaluation_writes_excel_and_csvs(signals_env):
     for name in ("pooled_metrics.csv", "per_ticker_metrics.csv",
                  "threshold_analysis.csv", "volatility_stratification.csv",
                  "threshold_lift.csv", "mcnemar_tests.csv",
-                 "regime_mcnemar_tests.csv"):
+                 "regime_mcnemar_tests.csv", "regime_mcnemar_summary.csv"):
         assert (out_dir / name).exists()
-    # The regime McNemar table must carry the BH/FDR columns even if every
-    # cell is below the validity thresholds on this small synthetic sample.
+    # The regime McNemar table must carry the BH/FDR + direction columns even
+    # if every cell is below the validity thresholds on this small sample.
     regime = pd.read_csv(out_dir / "regime_mcnemar_tests.csv")
-    for col in ("regime_type", "q_value_bh", "test_valid",
-                "significant_bh_5pct"):
+    for col in ("regime_type", "direction", "net_improvement",
+                "discordant_advantage", "q_value_bh", "test_valid",
+                "significant_bh_5pct", "model_better_bh_5pct",
+                "benchmark_better_bh_5pct"):
         assert col in regime.columns
     # Pooled CSV must carry both the disambiguated McNemar columns AND the
     # legacy back-compat aliases.
