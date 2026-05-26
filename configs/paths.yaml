@@ -102,6 +102,7 @@ evaluation_volatility_csv:     "Outputs/Evaluation/volatility_stratification.csv
 evaluation_threshold_lift_csv: "Outputs/Evaluation/threshold_lift.csv"
 evaluation_mcnemar_csv:        "Outputs/Evaluation/mcnemar_tests.csv"
 evaluation_regime_mcnemar_csv: "Outputs/Evaluation/regime_mcnemar_tests.csv"
+evaluation_regime_mcnemar_summary_csv: "Outputs/Evaluation/regime_mcnemar_summary.csv"
 evaluation_market_cap_csv:     "Outputs/Evaluation/market_cap_stratification.csv"
 evaluation_regime_interaction_csv: "Outputs/Evaluation/regime_interaction.csv"
 evaluation_economic_csv:       "Outputs/Evaluation/economic_performance.csv"

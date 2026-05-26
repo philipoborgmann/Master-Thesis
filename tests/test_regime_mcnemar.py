@@ -276,3 +276,172 @@ def test_cli_dry_run_default_includes_regime_mcnemar_output():
     # Default (no flag) must still dry-run cleanly.
     rc = cli.main(["evaluate-signals", "--horizon", "1d", "--dry-run"])
     assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# Effect-size + direction columns
+# ---------------------------------------------------------------------------
+
+def _build_directional(seed, model_edge, n_per_regime=200, regime_col="vol_regime"):
+    """Helper: model better in 'high' regime, ~tie elsewhere."""
+    return _signals_with_regime(n_per_regime=n_per_regime, seed=seed,
+                                model_edge=model_edge, regime_col=regime_col)
+
+
+def test_direction_model_better_when_c_gt_b():
+    df = _build_directional(seed=11, model_edge=0.35)
+    out = sig.mcnemar_by_group(df, ["vol_regime"], benchmarks=("B1",),
+                               min_n_matched=10, min_discordant=5)
+    high = out[out["vol_regime"] == "high"].iloc[0]
+    assert high["c"] > high["b"]
+    assert high["direction"] == "model_better"
+    assert high["net_improvement"] == high["c"] - high["b"]
+    assert high["abs_net_improvement"] == abs(high["c"] - high["b"])
+
+
+def test_direction_benchmark_better_when_b_gt_c():
+    # Negative model edge → benchmark wins in the 'high' regime.
+    df = _build_directional(seed=12, model_edge=-0.35)
+    out = sig.mcnemar_by_group(df, ["vol_regime"], benchmarks=("B1",),
+                               min_n_matched=10, min_discordant=5)
+    high = out[out["vol_regime"] == "high"].iloc[0]
+    assert high["b"] > high["c"]
+    assert high["direction"] == "benchmark_better"
+    assert high["net_improvement"] < 0
+
+
+def test_discordant_advantage_and_improvement_rate_formulas():
+    # Direct construction: b=30, c=70 over n_matched=1000 in a single regime.
+    # Build a frame where exactly those discordant counts arise.
+    rows = []
+    ts0 = pd.Timestamp("2024-01-01", tz="UTC")
+    # 70 cases model-right/bench-wrong, 30 bench-right/model-wrong,
+    # 900 agreement cases (both correct).
+    specs = ([("c", 70)] + [("b", 30)] + [("agree", 900)])
+    i = 0
+    for kind, count in specs:
+        for _ in range(count):
+            ts = ts0 + pd.Timedelta(hours=i); i += 1
+            target = 1
+            if kind == "c":          # model correct, benchmark wrong
+                m_pred, b_pred = 1, 0
+            elif kind == "b":        # benchmark correct, model wrong
+                m_pred, b_pred = 0, 1
+            else:                    # both correct
+                m_pred, b_pred = 1, 1
+            common = dict(timestamp=ts, ticker="BTC", target=target,
+                          horizon="1d", vol_regime="high")
+            rows.append({**common, "prediction": m_pred, "probability": 0.6,
+                         "set_id": "S1", "sentiment_model": "vader",
+                         "category": "sentiment"})
+            rows.append({**common, "prediction": b_pred, "probability": 0.5,
+                         "set_id": "B1", "sentiment_model": "-",
+                         "category": "benchmark"})
+    df = pd.DataFrame(rows)
+    out = sig.mcnemar_by_group(df, ["vol_regime"], benchmarks=("B1",),
+                               min_n_matched=10, min_discordant=5)
+    r = out.iloc[0]
+    assert r["b"] == 30 and r["c"] == 70
+    assert r["n_matched"] == 1000
+    # discordant_advantage = c / (b + c) = 70 / 100 = 0.7
+    assert r["discordant_advantage"] == pytest.approx(0.7)
+    # improvement_rate = (c - b) / n_matched = 40 / 1000 = 0.04
+    assert r["improvement_rate"] == pytest.approx(0.04)
+
+
+def test_discordant_advantage_nan_when_no_discordant():
+    # All agreement → b + c == 0 → discordant_advantage NaN.
+    rows = []
+    ts0 = pd.Timestamp("2024-01-01", tz="UTC")
+    for i in range(120):
+        ts = ts0 + pd.Timedelta(hours=i)
+        common = dict(timestamp=ts, ticker="BTC", target=1, horizon="1d",
+                      vol_regime="low")
+        rows.append({**common, "prediction": 1, "probability": 0.6,
+                     "set_id": "S1", "sentiment_model": "vader",
+                     "category": "sentiment"})
+        rows.append({**common, "prediction": 1, "probability": 0.5,
+                     "set_id": "B1", "sentiment_model": "-",
+                     "category": "benchmark"})
+    df = pd.DataFrame(rows)
+    out = sig.mcnemar_by_group(df, ["vol_regime"], benchmarks=("B1",),
+                               min_n_matched=10, min_discordant=0)
+    r = out.iloc[0]
+    assert r["b"] == 0 and r["c"] == 0
+    assert pd.isna(r["discordant_advantage"])
+
+
+def test_practical_effect_flag_triggers_above_min_rate():
+    # Strong edge → improvement_rate well above 0.01.
+    df = _build_directional(seed=13, model_edge=0.4, n_per_regime=400)
+    out = sig.mcnemar_by_group(df, ["vol_regime"], benchmarks=("B1",),
+                               min_n_matched=10, min_discordant=5,
+                               min_effect_rate=0.01)
+    high = out[out["vol_regime"] == "high"].iloc[0]
+    assert abs(high["improvement_rate"]) >= 0.01
+    assert bool(high["practical_effect_flag"])
+    # A tiny min_effect_rate threshold that the effect cannot exceed → False.
+    out2 = sig.mcnemar_by_group(df, ["vol_regime"], benchmarks=("B1",),
+                                min_n_matched=10, min_discordant=5,
+                                min_effect_rate=0.99)
+    high2 = out2[out2["vol_regime"] == "high"].iloc[0]
+    assert not bool(high2["practical_effect_flag"])
+
+
+def test_raw_direction_flags():
+    df = _build_directional(seed=14, model_edge=0.4, n_per_regime=600)
+    out = sig.mcnemar_by_group(df, ["vol_regime"], benchmarks=("B1",),
+                               min_n_matched=10, min_discordant=5)
+    high = out[out["vol_regime"] == "high"].iloc[0]
+    # Strong model edge in high-vol → raw-significant model_better.
+    if high["significant_5pct"]:
+        assert high["model_better_raw_5pct"]
+        assert not high["benchmark_better_raw_5pct"]
+
+
+def test_bh_direction_flags_present_after_table():
+    signals = _plain_signals(n=400, seed=20)
+    dates = pd.date_range("2024-01-01", periods=400, freq="D", tz="UTC")
+    out = sig.regime_mcnemar_table(signals, vol_lookup=_vol_lookup(dates),
+                                   mcap_lookup=None, benchmarks=("B1",),
+                                   min_n_matched=10, min_discordant=5)
+    for col in ("model_better_bh_5pct", "benchmark_better_bh_5pct",
+                "model_better_raw_5pct", "benchmark_better_raw_5pct",
+                "net_improvement", "direction", "discordant_advantage",
+                "improvement_rate", "practical_effect_flag"):
+        assert col in out.columns
+    # BH flags are a subset of the symmetric BH significance.
+    bh = out["significant_bh_5pct"].fillna(False)
+    assert (out["model_better_bh_5pct"].fillna(False) <= bh).all()
+    assert (out["benchmark_better_bh_5pct"].fillna(False) <= bh).all()
+
+
+# ---------------------------------------------------------------------------
+# build_regime_mcnemar_summary
+# ---------------------------------------------------------------------------
+
+def test_build_regime_mcnemar_summary_top_rows():
+    signals = _plain_signals(n=400, seed=21)
+    dates = pd.date_range("2024-01-01", periods=400, freq="D", tz="UTC")
+    table = sig.regime_mcnemar_table(signals,
+                                     vol_lookup=_vol_lookup(dates),
+                                     mcap_lookup=_mcap_lookup(dates),
+                                     benchmarks=("B1",),
+                                     min_n_matched=5, min_discordant=1)
+    summary = sig.build_regime_mcnemar_summary(table)
+    assert isinstance(summary, pd.DataFrame)
+    if not summary.empty:
+        assert "section" in summary.columns
+        # Each section appears at most once.
+        assert summary["section"].is_unique
+        # Direction and net_improvement columns surfaced.
+        for c in ("direction", "net_improvement", "q_value_bh"):
+            assert c in summary.columns
+
+
+def test_build_regime_mcnemar_summary_empty_input_no_crash():
+    assert sig.build_regime_mcnemar_summary(pd.DataFrame()).empty
+    assert sig.build_regime_mcnemar_summary(None).empty
+    # All-invalid input → empty summary, no crash.
+    df = pd.DataFrame({"test_valid": [False, False], "direction": ["tie", "tie"]})
+    assert sig.build_regime_mcnemar_summary(df).empty

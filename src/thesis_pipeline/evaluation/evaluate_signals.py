@@ -49,7 +49,8 @@ from .reporting import (
     print_console_summary, write_csv_outputs, write_excel_report,
 )
 from .significance import (
-    DEFAULT_BENCHMARKS, mcnemar_table, mcnemar_wide, regime_mcnemar_table,
+    DEFAULT_BENCHMARKS, build_regime_mcnemar_summary,
+    mcnemar_table, mcnemar_wide, regime_mcnemar_table,
 )
 from .thresholds import threshold_analysis_table, threshold_lift_table
 from .volatility import build_regime_lookup, volatility_stratification_table
@@ -191,6 +192,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     out_root / "economic_performance_by_ticker.csv"]
     if not args.no_regime_mcnemar:
         outputs.append(out_root / "regime_mcnemar_tests.csv")
+        outputs.append(out_root / "regime_mcnemar_summary.csv")
 
     log_stage_header(
         "evaluate_signals",
@@ -303,6 +305,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # ── 7b. Regime-specific McNemar tests (supplementary) ───────
     regime_mcnemar_df = pd.DataFrame()
+    regime_mcnemar_summary_df = pd.DataFrame()
     if args.no_regime_mcnemar:
         logger.info("evaluate-signals: --no-regime-mcnemar set, skipping regime McNemar")
     else:
@@ -318,6 +321,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 mcap_lookup=mcap_lookup if has_mcap else None,
                 benchmarks=DEFAULT_BENCHMARKS,
             )
+            regime_mcnemar_summary_df = build_regime_mcnemar_summary(regime_mcnemar_df)
 
     # ── 8. Economic / backtest layer ────────────────────────────
     economic_df      = pd.DataFrame()
@@ -439,6 +443,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         economic_threshold=(economic_thr_df if not args.no_economic else None),
         economic_by_ticker=(economic_tk_df  if not args.no_economic else None),
         regime_mcnemar=(regime_mcnemar_df if not args.no_regime_mcnemar else None),
+        regime_mcnemar_summary=(regime_mcnemar_summary_df
+                                if not args.no_regime_mcnemar else None),
     )
     xlsx = write_excel_report(
         xlsx_path,
@@ -453,6 +459,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         economic_threshold=(economic_thr_df if not args.no_economic else None),
         economic_by_ticker=(economic_tk_df  if not args.no_economic else None),
         regime_mcnemar=(regime_mcnemar_df if not args.no_regime_mcnemar else None),
+        regime_mcnemar_summary=(regime_mcnemar_summary_df
+                                if not args.no_regime_mcnemar else None),
     )
     logger.info("evaluate-signals: wrote Excel report %s", xlsx)
     for label, path in csv_paths.items():

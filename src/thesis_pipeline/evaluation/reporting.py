@@ -2,11 +2,37 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Mapping
 
 import numpy as np
 import pandas as pd
+
+from ..logging_utils import get_logger
+
+
+def _safe_to_csv(df: pd.DataFrame, path: Path) -> Path:
+    """Write ``df`` to ``path``; on a locked file (Windows / OneDrive / open
+    in Excel) fall back to a timestamped sibling instead of crashing the
+    whole evaluation after minutes of computation.
+
+    Returns the path actually written.
+    """
+    try:
+        df.to_csv(path, index=False)
+        return path
+    except (PermissionError, OSError) as exc:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fallback = path.with_name(f"{path.stem}.locked-{ts}{path.suffix}")
+        get_logger().warning(
+            "evaluate-signals: could not write %s (%s). The file is likely "
+            "open in Excel or locked by OneDrive sync. Writing to %s instead "
+            "— close the original and re-run, or use the fallback.",
+            path, exc, fallback,
+        )
+        df.to_csv(fallback, index=False)
+        return fallback
 
 # ---------------------------------------------------------------------------
 # Style constants for the Excel sheets.
@@ -199,42 +225,59 @@ def build_summary(pooled: pd.DataFrame,
             "metric": "n_significant_raw_5pct",
             "value": int(valid["significant_5pct"].fillna(False).sum()),
         })
+        # Direction-aware significance counts.
+        for flag, metric in (("model_better_raw_5pct",     "n_model_better_raw_5pct"),
+                             ("model_better_bh_5pct",      "n_model_better_bh_5pct"),
+                             ("benchmark_better_raw_5pct", "n_benchmark_better_raw_5pct"),
+                             ("benchmark_better_bh_5pct",  "n_benchmark_better_bh_5pct")):
+            if flag in regime_mcnemar_df.columns:
+                rows.append({
+                    "section": "regime_mcnemar_overview",
+                    "metric": metric,
+                    "value": int(regime_mcnemar_df[flag].fillna(False).sum()),
+                })
         if "significant_bh_5pct" in regime_mcnemar_df.columns:
             rows.append({
                 "section": "regime_mcnemar_overview",
                 "metric": "n_significant_bh_5pct",
                 "value": int(regime_mcnemar_df["significant_bh_5pct"].fillna(False).sum()),
             })
-        # Strongest c − b improvement among valid tests.
+        # Strongest positive and negative net improvement among valid tests.
         if not valid.empty:
-            tmp = valid.assign(c_minus_b=valid["c"] - valid["b"])
-            best = tmp.sort_values("c_minus_b", ascending=False).head(1)
-            for _, r in best.iterrows():
+            ni = valid["net_improvement"] if "net_improvement" in valid else (valid["c"] - valid["b"])
+            tmp = valid.assign(_ni=ni)
+
+            def _emit_regime(section: str, r: pd.Series) -> None:
                 rows.append({
-                    "section": "best_regime_correction",
+                    "section": section,
                     "regime_type": r.get("regime_type"),
                     "horizon": r["horizon"], "set_id": r["set_id"],
                     "sentiment_model": r.get("sentiment_model", "-"),
                     "benchmark": r.get("benchmark"),
+                    "direction": r.get("direction"),
                     "vol_regime": r.get("vol_regime"),
                     "mcap_regime": r.get("mcap_regime"),
-                    "metric": "c_minus_b", "value": int(r["c"] - r["b"]),
+                    "interaction": r.get("interaction"),
+                    "metric": "net_improvement", "value": int(r["_ni"]),
                     "q_value_bh": r.get("q_value_bh"),
                 })
-            # Best small-cap × high-vol interaction result, if present.
-            inter = tmp[(tmp.get("regime_type") == "interaction")
-                        & (tmp.get("mcap_regime") == "small")
-                        & (tmp.get("vol_regime")  == "high")]
+
+            _emit_regime("strongest_positive_net_improvement",
+                         tmp.sort_values("_ni", ascending=False).iloc[0])
+            _emit_regime("strongest_negative_net_improvement",
+                         tmp.sort_values("_ni", ascending=True).iloc[0])
+
+            # Best interaction regime for model vs for benchmark.
+            inter = tmp[tmp.get("regime_type") == "interaction"]
             if not inter.empty:
-                r = inter.sort_values("c_minus_b", ascending=False).iloc[0]
-                rows.append({
-                    "section": "best_small_high_regime_mcnemar",
-                    "horizon": r["horizon"], "set_id": r["set_id"],
-                    "sentiment_model": r.get("sentiment_model", "-"),
-                    "benchmark": r.get("benchmark"),
-                    "metric": "c_minus_b", "value": int(r["c"] - r["b"]),
-                    "q_value_bh": r.get("q_value_bh"),
-                })
+                model_i = inter[inter.get("direction") == "model_better"]
+                bench_i = inter[inter.get("direction") == "benchmark_better"]
+                if not model_i.empty:
+                    _emit_regime("best_interaction_regime_model",
+                                 model_i.sort_values("_ni", ascending=False).iloc[0])
+                if not bench_i.empty:
+                    _emit_regime("best_interaction_regime_benchmark",
+                                 bench_i.sort_values("_ni", ascending=True).iloc[0])
 
     if extra_rows:
         rows.extend(extra_rows)
@@ -336,43 +379,30 @@ def write_csv_outputs(out_dir: Path, *,
                       economic: pd.DataFrame | None = None,
                       economic_threshold: pd.DataFrame | None = None,
                       economic_by_ticker: pd.DataFrame | None = None,
-                      regime_mcnemar: pd.DataFrame | None = None
+                      regime_mcnemar: pd.DataFrame | None = None,
+                      regime_mcnemar_summary: pd.DataFrame | None = None
                       ) -> dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    paths = {
-        "pooled":    out_dir / "pooled_metrics.csv",
-        "per_ticker": out_dir / "per_ticker_metrics.csv",
-        "threshold":  out_dir / "threshold_analysis.csv",
-        "volatility": out_dir / "volatility_stratification.csv",
-    }
-    pooled.to_csv(paths["pooled"], index=False)
-    per_ticker.to_csv(paths["per_ticker"], index=False)
-    threshold.to_csv(paths["threshold"], index=False)
-    volatility.to_csv(paths["volatility"], index=False)
-    if threshold_lift is not None:
-        paths["threshold_lift"] = out_dir / "threshold_lift.csv"
-        threshold_lift.to_csv(paths["threshold_lift"], index=False)
-    if mcnemar is not None:
-        paths["mcnemar"] = out_dir / "mcnemar_tests.csv"
-        mcnemar.to_csv(paths["mcnemar"], index=False)
-    if market_cap is not None:
-        paths["market_cap"] = out_dir / "market_cap_stratification.csv"
-        market_cap.to_csv(paths["market_cap"], index=False)
-    if regime_interaction is not None:
-        paths["regime_interaction"] = out_dir / "regime_interaction.csv"
-        regime_interaction.to_csv(paths["regime_interaction"], index=False)
-    if economic is not None:
-        paths["economic"] = out_dir / "economic_performance.csv"
-        economic.to_csv(paths["economic"], index=False)
-    if economic_threshold is not None:
-        paths["economic_threshold"] = out_dir / "economic_performance_by_threshold.csv"
-        economic_threshold.to_csv(paths["economic_threshold"], index=False)
-    if economic_by_ticker is not None:
-        paths["economic_by_ticker"] = out_dir / "economic_performance_by_ticker.csv"
-        economic_by_ticker.to_csv(paths["economic_by_ticker"], index=False)
-    if regime_mcnemar is not None:
-        paths["regime_mcnemar"] = out_dir / "regime_mcnemar_tests.csv"
-        regime_mcnemar.to_csv(paths["regime_mcnemar"], index=False)
+    paths: dict[str, Path] = {}
+
+    def _emit(key: str, df: pd.DataFrame | None, filename: str) -> None:
+        if df is None:
+            return
+        paths[key] = _safe_to_csv(df, out_dir / filename)
+
+    _emit("pooled",     pooled,     "pooled_metrics.csv")
+    _emit("per_ticker", per_ticker, "per_ticker_metrics.csv")
+    _emit("threshold",  threshold,  "threshold_analysis.csv")
+    _emit("volatility", volatility, "volatility_stratification.csv")
+    _emit("threshold_lift",     threshold_lift,     "threshold_lift.csv")
+    _emit("mcnemar",            mcnemar,            "mcnemar_tests.csv")
+    _emit("market_cap",         market_cap,         "market_cap_stratification.csv")
+    _emit("regime_interaction", regime_interaction, "regime_interaction.csv")
+    _emit("economic",            economic,            "economic_performance.csv")
+    _emit("economic_threshold",  economic_threshold,  "economic_performance_by_threshold.csv")
+    _emit("economic_by_ticker",  economic_by_ticker,  "economic_performance_by_ticker.csv")
+    _emit("regime_mcnemar",         regime_mcnemar,         "regime_mcnemar_tests.csv")
+    _emit("regime_mcnemar_summary", regime_mcnemar_summary, "regime_mcnemar_summary.csv")
     return paths
 
 
@@ -390,32 +420,50 @@ def write_excel_report(out_path: Path, *,
                        economic: pd.DataFrame | None = None,
                        economic_threshold: pd.DataFrame | None = None,
                        economic_by_ticker: pd.DataFrame | None = None,
-                       regime_mcnemar: pd.DataFrame | None = None) -> Path:
+                       regime_mcnemar: pd.DataFrame | None = None,
+                       regime_mcnemar_summary: pd.DataFrame | None = None) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        _write_sheet(writer, "pooled_metrics",                pooled)
-        _write_sheet(writer, "per_ticker_metrics",            per_ticker)
-        _write_sheet(writer, "threshold_analysis",            threshold)
-        if threshold_lift is not None:
-            _write_sheet(writer, "threshold_lift",            threshold_lift)
-        _write_sheet(writer, "volatility_stratification",     volatility)
-        if market_cap is not None:
-            _write_sheet(writer, "market_cap_stratification", market_cap)
-        if regime_interaction is not None:
-            _write_sheet(writer, "regime_interaction",        regime_interaction)
-        if economic is not None:
-            _write_sheet(writer, "economic_performance",      economic)
-        if economic_threshold is not None:
-            _write_sheet(writer, "economic_by_threshold",     economic_threshold)
-        if economic_by_ticker is not None:
-            _write_sheet(writer, "economic_by_ticker",        economic_by_ticker)
-        if mcnemar is not None:
-            _write_sheet(writer, "mcnemar_tests",             mcnemar)
-        if regime_mcnemar is not None:
-            _write_sheet(writer, "regime_mcnemar_tests",      regime_mcnemar)
-        _write_sheet(writer, "leaderboard",                   leaderboard)
-        _write_sheet(writer, "summary",                       summary)
-    return out_path
+
+    def _write_all(target: Path) -> None:
+        with pd.ExcelWriter(target, engine="openpyxl") as writer:
+            _write_sheet(writer, "pooled_metrics",                pooled)
+            _write_sheet(writer, "per_ticker_metrics",            per_ticker)
+            _write_sheet(writer, "threshold_analysis",            threshold)
+            if threshold_lift is not None:
+                _write_sheet(writer, "threshold_lift",            threshold_lift)
+            _write_sheet(writer, "volatility_stratification",     volatility)
+            if market_cap is not None:
+                _write_sheet(writer, "market_cap_stratification", market_cap)
+            if regime_interaction is not None:
+                _write_sheet(writer, "regime_interaction",        regime_interaction)
+            if economic is not None:
+                _write_sheet(writer, "economic_performance",      economic)
+            if economic_threshold is not None:
+                _write_sheet(writer, "economic_by_threshold",     economic_threshold)
+            if economic_by_ticker is not None:
+                _write_sheet(writer, "economic_by_ticker",        economic_by_ticker)
+            if mcnemar is not None:
+                _write_sheet(writer, "mcnemar_tests",             mcnemar)
+            if regime_mcnemar is not None:
+                _write_sheet(writer, "regime_mcnemar_tests",      regime_mcnemar)
+            if regime_mcnemar_summary is not None:
+                _write_sheet(writer, "regime_mcnemar_summary",    regime_mcnemar_summary)
+            _write_sheet(writer, "leaderboard",                   leaderboard)
+            _write_sheet(writer, "summary",                       summary)
+
+    try:
+        _write_all(out_path)
+        return out_path
+    except (PermissionError, OSError) as exc:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fallback = out_path.with_name(f"{out_path.stem}.locked-{ts}{out_path.suffix}")
+        get_logger().warning(
+            "evaluate-signals: could not write %s (%s) — likely open in Excel "
+            "or locked by OneDrive. Writing to %s instead.",
+            out_path, exc, fallback,
+        )
+        _write_all(fallback)
+        return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -585,31 +633,50 @@ def print_console_summary(*,
                       f"cov={r.get('coverage', float('nan')):.3f}  "
                       f"n_periods={int(r.get('n_periods', 0))}")
 
-    # Regime-specific McNemar tests (supplementary, BH-corrected).
+    # Regime-specific McNemar tests (supplementary, BH-corrected,
+    # direction-aware: net_improvement = c - b).
     if regime_mcnemar is not None and not regime_mcnemar.empty:
         valid = regime_mcnemar[regime_mcnemar["test_valid"]]
         n_valid = int(len(valid))
-        n_bh = int(regime_mcnemar.get("significant_bh_5pct",
-                                      pd.Series(dtype=bool)).fillna(False).sum())
-        print("\n  Regime McNemar tests (supplementary, BH-corrected):")
-        print(f"    valid tests: {n_valid}   BH-significant @5%: {n_bh}")
+
+        def _count(col):
+            return int(regime_mcnemar.get(col, pd.Series(dtype=bool))
+                       .fillna(False).sum())
+
+        print("\n  Regime McNemar (supplementary, exploratory):")
+        print(f"    valid tests: {n_valid}")
+        print(f"    model better BH 5%:     {_count('model_better_bh_5pct')}"
+              f"   (raw 5%: {_count('model_better_raw_5pct')})")
+        print(f"    benchmark better BH 5%: {_count('benchmark_better_bh_5pct')}"
+              f"   (raw 5%: {_count('benchmark_better_raw_5pct')})")
+
+        def _regime_label(r):
+            if r.get("regime_type") == "interaction":
+                return r.get("interaction")
+            if r.get("regime_type") == "volatility":
+                return r.get("vol_regime")
+            return r.get("mcap_regime")
+
         if n_valid > 0:
-            ranked = valid.assign(c_minus_b=valid["c"] - valid["b"])
-            # Prefer ranking by q-value; fall back to c-b when q is absent.
-            if "q_value_bh" in ranked.columns and ranked["q_value_bh"].notna().any():
-                ranked = ranked.sort_values(["q_value_bh", "c_minus_b"],
-                                            ascending=[True, False])
-            else:
-                ranked = ranked.sort_values("c_minus_b", ascending=False)
-            for _, r in ranked.head(5).iterrows():
+            ni = (valid["net_improvement"] if "net_improvement" in valid
+                  else valid["c"] - valid["b"])
+            tmp = valid.assign(_ni=ni)
+            top_model = tmp[tmp["direction"] == "model_better"] \
+                .sort_values("_ni", ascending=False)
+            top_bench = tmp[tmp["direction"] == "benchmark_better"] \
+                .sort_values("_ni", ascending=True)
+            if not top_model.empty:
+                r = top_model.iloc[0]
                 sm = r.get("sentiment_model", "-")
-                tag = f"/{sm}" if sm and sm != "-" else ""
-                reg = (r.get("interaction") if r.get("regime_type") == "interaction"
-                       else r.get("vol_regime") if r.get("regime_type") == "volatility"
-                       else r.get("mcap_regime"))
-                q = r.get("q_value_bh", float("nan"))
-                print(f"     {r['regime_type']:11s} {r['set_id']}{tag:12s} "
-                      f"vs {r['benchmark']}  regime={reg}  "
-                      f"c-b={int(r['c'] - r['b']):+d}  "
-                      f"p={r['mcnemar_pval']:.4f}  q={q:.4f}")
+                tag = f"_{sm}" if sm and sm != "-" else ""
+                print(f"    top model regime:     {r['set_id']}{tag} vs "
+                      f"{r['benchmark']}, {_regime_label(r)}, "
+                      f"c-b={int(r['_ni']):+d}, q={r.get('q_value_bh', float('nan')):.4f}")
+            if not top_bench.empty:
+                r = top_bench.iloc[0]
+                sm = r.get("sentiment_model", "-")
+                tag = f"_{sm}" if sm and sm != "-" else ""
+                print(f"    top benchmark regime: {r['set_id']}{tag} vs "
+                      f"{r['benchmark']}, {_regime_label(r)}, "
+                      f"c-b={int(r['_ni']):+d}, q={r.get('q_value_bh', float('nan')):.4f}")
     print()
