@@ -179,6 +179,10 @@ def cmd_run_models(args: argparse.Namespace) -> int:
         argv += ["--coins", *list(args.coins)]
     if args.sentiment_model:
         argv += ["--sentiment-model", args.sentiment_model]
+    if getattr(args, "model_type", None):
+        argv += ["--model-type", args.model_type]
+    if getattr(args, "panel_mode", None):
+        argv += ["--panel-mode", args.panel_mode]
     if args.smoke:
         argv.append("--smoke")
     if args.dry_run:
@@ -354,6 +358,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--coins", nargs="*")
     sp.add_argument("--sentiment-model", dest="sentiment_model", default=None,
                     choices=[None, "vader", "finbert", "cryptobert"])
+    sp.add_argument("--model-type", dest="model_type", default="per_asset",
+                    choices=["per_asset", "panel_logit"],
+                    help="per_asset (default) or panel_logit.")
+    sp.add_argument("--panel-mode", dest="panel_mode", default="pooled",
+                    choices=["pooled", "ticker_fixed_effects"],
+                    help="Panel variant (only with --model-type panel_logit).")
     sp.add_argument("--restart", action="store_true",
                     help="Ignore cached signal parquets and rerun every set.")
     _add_common(sp)

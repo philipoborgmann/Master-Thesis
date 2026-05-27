@@ -90,3 +90,45 @@ Pooled and per-ticker metrics are written to
 - No nonlinear models or ensembles.
 
 These choices are part of the thesis and are not changed by the refactor.
+
+## Alternative model family: `panel_logit`
+
+In addition to the canonical **per-asset** walk-forward above, a second model
+family is available for comparison:
+`src/thesis_pipeline/modeling/panel_logit.py`.
+
+It estimates a **pooled panel logistic regression** in a forecasting setting
+(not a classical inference panel model). For each unique test timestamp `τ`:
+
+- **train** = every coin observation with `timestamp < τ`
+- **test**  = every coin observation with `timestamp == τ`
+
+so a single logit is fit over the whole panel and predicts all coins at `τ`.
+The initial training window is the first 50 % of the *unique timestamps*
+(not 50 % of observations); the `StandardScaler` is fit on the training rows
+only; the estimator is the identical
+`LogisticRegression(penalty="l2", C=1.0, solver="lbfgs", random_state=42)`.
+
+Two modes:
+
+- `pooled` — `y_it ~ X_it` (shared coefficients).
+- `ticker_fixed_effects` — `y_it ~ X_it + ticker dummies`, approximating
+  coin-specific intercepts. Dummies are fit on training tickers only (one
+  reference dropped); unseen test tickers collapse to the reference. **No time
+  fixed effects** — a test-timestamp dummy is unidentified out-of-sample.
+
+Usage (per-asset remains the default):
+
+```bash
+python -m thesis_pipeline.cli run-models --horizon 1d --set-id C2 \
+    --model-type panel_logit --panel-mode pooled --restart
+python -m thesis_pipeline.cli run-models --horizon 1d --set-id C2 \
+    --model-type panel_logit --panel-mode ticker_fixed_effects --restart
+```
+
+Outputs are written alongside (never overwriting) the per-asset signals:
+`Outputs/Signals/<horizon>/<set_id>[_<sentiment_model>]_panel_pooled.parquet`
+or `..._panel_ticker_fe.parquet`, with extra columns `model_type` and
+`panel_mode`. `metrics_summary.csv` gains the same two columns. The B1
+rolling-probability benchmark is not a panel-logit model and is skipped with
+a warning under `--model-type panel_logit`.
