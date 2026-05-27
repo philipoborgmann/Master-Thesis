@@ -349,6 +349,14 @@ def build_parser() -> argparse.ArgumentParser:
                         dest="sentiment_model", default=None)
     parser.add_argument("--C", type=float, default=DEFAULT_C,
                         help=f"Ridge regularisation strength (default: {DEFAULT_C})")
+    parser.add_argument("--model-type", "--model_type", dest="model_type",
+                        default="per_asset", choices=["per_asset", "panel_logit"],
+                        help="per_asset (canonical, default) or panel_logit "
+                             "(pooled / ticker-FE panel regression).")
+    parser.add_argument("--panel-mode", "--panel_mode", dest="panel_mode",
+                        default="pooled", choices=["pooled", "ticker_fixed_effects"],
+                        help="Panel-logit variant (only used when "
+                             "--model-type panel_logit).")
     parser.add_argument("--smoke", action="store_true",
                         help="Smoke mode: defaults to horizon=1d, coins=[BTC, ETH], set_id=B1.")
     parser.add_argument("--dry-run", "--dry_run", dest="dry_run",
@@ -369,6 +377,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Entry point used by the legacy ``Run_Models.py``, ``scripts/run_models.py``
     and the package CLI. Returns 0 on success."""
     args = build_parser().parse_args(argv)
+
+    # ── Alternative model family: delegate to the panel-logit module ──
+    # The per-asset logic below is unchanged; panel_logit is purely additive.
+    if getattr(args, "model_type", "per_asset") == "panel_logit":
+        from .panel_logit import _run_panel
+        return _run_panel(args)
 
     # ── Smoke defaults ──────────────────────────────────────────
     if args.smoke:
