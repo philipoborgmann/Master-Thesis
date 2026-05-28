@@ -24,7 +24,9 @@ from sklearn.metrics import (
     accuracy_score, f1_score, precision_score, recall_score, brier_score_loss,
 )
 
-from .metrics import GROUP_KEYS, _group_meta
+from ..logging_utils import get_logger
+from .metrics import GROUP_KEYS, FRONT_META, _front_order, _group_meta, ensure_group_columns
+from .significance import _family_benchmark_frames
 
 DEFAULT_THRESHOLDS: tuple[float, ...] = (0.50, 0.55, 0.60, 0.65)
 
@@ -98,6 +100,7 @@ def threshold_analysis_table(signals: pd.DataFrame,
     """Stack threshold metrics across every (horizon, set_id, sentiment_model)."""
     if signals.empty:
         return pd.DataFrame()
+    signals = ensure_group_columns(signals)
     rows = []
     for keys, grp in signals.groupby(list(GROUP_KEYS), dropna=False):
         tdf = threshold_metrics_for_group(grp, thresholds)
@@ -112,9 +115,7 @@ def threshold_analysis_table(signals: pd.DataFrame,
     if not rows:
         return pd.DataFrame()
     out = pd.concat(rows, ignore_index=True)
-    front = ["horizon", "set_id", "category", "sentiment_model", "label", "threshold"]
-    rest = [c for c in out.columns if c not in front]
-    return out[front + rest].reset_index(drop=True)
+    return _front_order(out, FRONT_META + ["threshold"])
 
 
 # ---------------------------------------------------------------------------
@@ -204,19 +205,32 @@ def _matched_lift(model_grp: pd.DataFrame,
 def threshold_lift_table(signals: pd.DataFrame,
                          benchmarks: tuple[str, ...] = ("B1", "B2"),
                          thresholds: tuple[float, ...] = DEFAULT_THRESHOLDS,
+                         allow_cross_model_benchmark: bool = False,
                          ) -> pd.DataFrame:
-    """Per (horizon × set × threshold × benchmark): matched-observation lift.
+    """Per (horizon × model_type × panel_mode × set × threshold × benchmark):
+    matched-observation lift.
 
-    Rows for the benchmark set itself are omitted (you don't lift a benchmark
-    against itself). Eligibility follows the McNemar contract — sentiment and
-    combined sets only.
+    Benchmark matching is restricted to the **same model family** — a
+    ``panel_logit`` / ``pooled`` model is only ever lifted against a
+    ``panel_logit`` / ``pooled`` benchmark, never against a per-asset one.
+    With ``allow_cross_model_benchmark=True`` a missing same-family benchmark
+    falls back to the per-asset benchmark of the same horizon; the default
+    (``False``) leaves the lift columns NaN and logs a warning instead.
+
+    Rows for the benchmark set itself are omitted. Eligibility follows the
+    McNemar contract — sentiment and combined sets only.
     """
     if signals.empty or "category" not in signals.columns:
         return pd.DataFrame()
+    signals = ensure_group_columns(signals)
+    family_cols = ["horizon", "model_type", "panel_mode"]
     rows: list[dict] = []
-    for horizon, hz_grp in signals.groupby("horizon", dropna=False):
-        bench_frames = {bid: hz_grp[hz_grp["set_id"] == bid] for bid in benchmarks}
-        for keys, grp in hz_grp.groupby(list(GROUP_KEYS), dropna=False):
+    for fam_keys, fam_grp in signals.groupby(family_cols, dropna=False):
+        bench_frames = _family_benchmark_frames(
+            fam_grp, signals, fam_keys, benchmarks, allow_cross_model_benchmark,
+            context="threshold-lift",
+        )
+        for keys, grp in fam_grp.groupby(list(GROUP_KEYS), dropna=False):
             set_id = keys[1]
             if set_id in benchmarks:
                 continue
@@ -241,9 +255,8 @@ def threshold_lift_table(signals: pd.DataFrame,
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    front = ["horizon", "set_id", "category", "sentiment_model", "benchmark",
-             "threshold", "n_traded", "coverage_model", "n_matched",
-             "accuracy_model", "accuracy_benchmark", "lift_accuracy",
-             "mcnemar_stat", "mcnemar_pval", "significant_vs_benchmark"]
-    rest = [col for col in out.columns if col not in front]
-    return out[front + rest].reset_index(drop=True)
+    front = FRONT_META + ["benchmark", "threshold", "n_traded", "coverage_model",
+                          "n_matched", "accuracy_model", "accuracy_benchmark",
+                          "lift_accuracy", "mcnemar_stat", "mcnemar_pval",
+                          "significant_vs_benchmark"]
+    return _front_order(out, front)

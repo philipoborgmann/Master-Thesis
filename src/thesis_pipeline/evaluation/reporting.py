@@ -55,7 +55,8 @@ CATEGORY_COLORS: dict[str, str] = {
 def build_leaderboard(pooled: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
     if pooled.empty:
         return pooled
-    cols = [c for c in ("horizon", "set_id", "category", "sentiment_model", "label",
+    cols = [c for c in ("horizon", "model_type", "panel_mode", "set_id",
+                        "category", "sentiment_model", "label",
                         "accuracy", "balanced_accuracy", "f1", "brier_score",
                         "log_loss", "n_obs", "n_tickers",
                         "mcnemar_pval_vs_b1", "significant_vs_b1",
@@ -103,6 +104,8 @@ def build_summary(pooled: pd.DataFrame,
                 rows.append({
                     "section": "best_sentiment_model",
                     "horizon": r["horizon"],
+                    "model_type": r.get("model_type", "per_asset"),
+                    "panel_mode": r.get("panel_mode", "-"),
                     "set_id":  r["set_id"],
                     "sentiment_model": r["sentiment_model"],
                     "metric": "accuracy", "value": r["accuracy"],
@@ -150,7 +153,10 @@ def build_summary(pooled: pd.DataFrame,
         for _, r in small.iterrows():
             rows.append({
                 "section": "best_small_cap_model",
-                "horizon": r["horizon"], "set_id": r["set_id"],
+                "horizon": r["horizon"],
+                "model_type": r.get("model_type", "per_asset"),
+                "panel_mode": r.get("panel_mode", "-"),
+                "set_id": r["set_id"],
                 "sentiment_model": r.get("sentiment_model", "-"),
                 "metric": "accuracy", "value": float(r["accuracy"]),
             })
@@ -164,7 +170,10 @@ def build_summary(pooled: pd.DataFrame,
         for _, r in sub.iterrows():
             rows.append({
                 "section": "best_small_high_vol_model",
-                "horizon": r["horizon"], "set_id": r["set_id"],
+                "horizon": r["horizon"],
+                "model_type": r.get("model_type", "per_asset"),
+                "panel_mode": r.get("panel_mode", "-"),
+                "set_id": r["set_id"],
                 "sentiment_model": r.get("sentiment_model", "-"),
                 "metric": "accuracy", "value": float(r["accuracy"]),
             })
@@ -181,7 +190,10 @@ def build_summary(pooled: pd.DataFrame,
             for _, r in gross.iterrows():
                 rows.append({
                     "section": label,
-                    "horizon": r["horizon"], "set_id": r["set_id"],
+                    "horizon": r["horizon"],
+                    "model_type": r.get("model_type", "per_asset"),
+                    "panel_mode": r.get("panel_mode", "-"),
+                    "set_id": r["set_id"],
                     "sentiment_model": r.get("sentiment_model", "-"),
                     "cost_bps": int(r["cost_bps"]),
                     "metric": metric, "value": float(r[metric]),
@@ -193,7 +205,10 @@ def build_summary(pooled: pd.DataFrame,
                 for _, r in net.iterrows():
                     rows.append({
                         "section": "best_net_sharpe",
-                        "horizon": r["horizon"], "set_id": r["set_id"],
+                        "horizon": r["horizon"],
+                        "model_type": r.get("model_type", "per_asset"),
+                        "panel_mode": r.get("panel_mode", "-"),
+                        "set_id": r["set_id"],
                         "sentiment_model": r.get("sentiment_model", "-"),
                         "cost_bps": int(r["cost_bps"]),
                         "metric": metric, "value": float(r[metric]),
@@ -207,7 +222,10 @@ def build_summary(pooled: pd.DataFrame,
             for _, r in best.iterrows():
                 rows.append({
                     "section":  "best_threshold_sharpe",
-                    "horizon":  r["horizon"], "set_id": r["set_id"],
+                    "horizon":  r["horizon"],
+                    "model_type": r.get("model_type", "per_asset"),
+                    "panel_mode": r.get("panel_mode", "-"),
+                    "set_id": r["set_id"],
                     "sentiment_model": r.get("sentiment_model", "-"),
                     "threshold": float(r["threshold"]),
                     "cost_bps":  int(r["cost_bps"]),
@@ -251,7 +269,10 @@ def build_summary(pooled: pd.DataFrame,
                 rows.append({
                     "section": section,
                     "regime_type": r.get("regime_type"),
-                    "horizon": r["horizon"], "set_id": r["set_id"],
+                    "horizon": r["horizon"],
+                    "model_type": r.get("model_type", "per_asset"),
+                    "panel_mode": r.get("panel_mode", "-"),
+                    "set_id": r["set_id"],
                     "sentiment_model": r.get("sentiment_model", "-"),
                     "benchmark": r.get("benchmark"),
                     "direction": r.get("direction"),
@@ -292,6 +313,8 @@ def build_summary(pooled: pd.DataFrame,
             rows.append({
                 "section": "best_threshold_lift",
                 "horizon": r["horizon"], "threshold": r["threshold"],
+                "model_type": r.get("model_type", "per_asset"),
+                "panel_mode": r.get("panel_mode", "-"),
                 "benchmark": r["benchmark"],
                 "set_id":    r["set_id"],
                 "sentiment_model": r.get("sentiment_model", "-"),
@@ -487,6 +510,14 @@ def print_console_summary(*,
         print("  (no pooled metrics available)")
         return
 
+    def _fam(r) -> str:
+        """Compact ' [panel_logit/pooled]' tag; empty for the per-asset family."""
+        mt = str(r.get("model_type", "per_asset"))
+        pm = str(r.get("panel_mode", "-"))
+        if mt == "per_asset":
+            return ""
+        return f" [{mt}/{pm}]" if pm and pm != "-" else f" [{mt}]"
+
     # Benchmark accuracy per horizon
     bench = pooled[pooled["set_id"] == "B1"][["horizon", "accuracy"]].sort_values("horizon")
     if not bench.empty:
@@ -504,7 +535,7 @@ def print_console_summary(*,
         for _, r in top.iterrows():
             sm = r.get("sentiment_model", "-")
             tag = f"/{sm}" if sm and sm != "-" else ""
-            print(f"     {r['set_id']}{tag:14s} acc={r['accuracy']:.4f}  "
+            print(f"     {r['set_id']}{tag:14s}{_fam(r)} acc={r['accuracy']:.4f}  "
                   f"f1={r.get('f1', float('nan')):.4f}  "
                   f"brier={r.get('brier_score', float('nan')):.4f}  "
                   f"n={int(r.get('n_obs', 0))}")
@@ -518,7 +549,7 @@ def print_console_summary(*,
             for _, r in sig.head(10).iterrows():
                 sm = r.get("sentiment_model", "-")
                 tag = f"/{sm}" if sm and sm != "-" else ""
-                print(f"    {r['horizon']:>3s}  {r['set_id']}{tag:14s} "
+                print(f"    {r['horizon']:>3s}  {r['set_id']}{tag:14s}{_fam(r)} "
                       f"stat={r['mcnemar_stat']:.3f}  p={r['mcnemar_pval']:.4f}")
 
     # Best sentiment model per horizon
@@ -529,8 +560,8 @@ def print_console_summary(*,
                     .sort_values("accuracy", ascending=False)
                     .groupby("horizon").head(1))
         for _, r in best.iterrows():
-            print(f"    {r['horizon']:>3s}  {r['set_id']}/{r['sentiment_model']:8s} "
-                  f"acc={r['accuracy']:.4f}")
+            print(f"    {r['horizon']:>3s}  {r['set_id']}/{r['sentiment_model']:8s}"
+                  f"{_fam(r)} acc={r['accuracy']:.4f}")
 
     # Threshold highlights
     if not threshold.empty:

@@ -25,7 +25,7 @@ import pandas as pd
 
 from ..config import resolve_path
 from ..logging_utils import get_logger
-from .metrics import GROUP_KEYS, _group_meta
+from .metrics import GROUP_KEYS, FRONT_META, _front_order, _group_meta, ensure_group_columns
 from .volatility import _attach_date  # reuse: signal date normalisation
 
 REGIME_LABELS = ("small", "mid", "large")
@@ -292,7 +292,7 @@ def market_cap_stratification_table(signals: pd.DataFrame,
     """One row per (horizon × set × sentiment_model × mcap_regime)."""
     if signals.empty:
         return pd.DataFrame()
-    enriched = attach_market_cap_regimes(signals, mcap_lookup)
+    enriched = ensure_group_columns(attach_market_cap_regimes(signals, mcap_lookup))
     if "mcap_regime" not in enriched.columns or enriched["mcap_regime"].isna().all():
         return pd.DataFrame()
 
@@ -303,8 +303,7 @@ def market_cap_stratification_table(signals: pd.DataFrame,
             sub = grp[grp["mcap_regime"] == regime]
             metrics_ = _aggregate_correctness(sub)
             row = {
-                "horizon": keys[0], "set_id": keys[1],
-                "sentiment_model": keys[2],
+                **dict(zip(GROUP_KEYS, keys)),
                 "mcap_regime": regime,
                 **meta,
                 **metrics_,
@@ -312,9 +311,7 @@ def market_cap_stratification_table(signals: pd.DataFrame,
             rows.append(row)
 
     out = pd.DataFrame(rows)
-    front = ["horizon", "set_id", "category", "sentiment_model", "label", "mcap_regime"]
-    rest = [c for c in out.columns if c not in front]
-    return out[front + rest].reset_index(drop=True)
+    return _front_order(out, FRONT_META + ["mcap_regime"])
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +333,7 @@ def regime_interaction_table(signals: pd.DataFrame,
 
     from .volatility import attach_regimes
     enriched = attach_regimes(signals, vol_lookup)
-    enriched = attach_market_cap_regimes(enriched, mcap_lookup)
+    enriched = ensure_group_columns(attach_market_cap_regimes(enriched, mcap_lookup))
     needed = {"regime", "mcap_regime"}
     if not needed.issubset(enriched.columns):
         return pd.DataFrame()
@@ -353,8 +350,7 @@ def regime_interaction_table(signals: pd.DataFrame,
                 metrics_ = _aggregate_correctness(sub)
                 # The interaction-only fields the PRD asks for.
                 row = {
-                    "horizon": keys[0], "set_id": keys[1],
-                    "sentiment_model": keys[2],
+                    **dict(zip(GROUP_KEYS, keys)),
                     "mcap_regime": mcap_r,
                     "vol_regime":  vol_r,
                     "interaction": f"{mcap_r}_{vol_r}",
@@ -366,10 +362,7 @@ def regime_interaction_table(signals: pd.DataFrame,
                 rows.append(row)
 
     out = pd.DataFrame(rows)
-    front = ["horizon", "set_id", "category", "sentiment_model", "label",
-             "mcap_regime", "vol_regime", "interaction"]
-    rest = [c for c in out.columns if c not in front]
-    return out[front + rest].reset_index(drop=True)
+    return _front_order(out, FRONT_META + ["mcap_regime", "vol_regime", "interaction"])
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +384,8 @@ def build_market_cap_summary(mcap_strat: pd.DataFrame,
                 rows.append({
                     "section":  "best_small_cap_model",
                     "horizon":  r["horizon"],
+                    "model_type": r.get("model_type", "per_asset"),
+                    "panel_mode": r.get("panel_mode", "-"),
                     "set_id":   r["set_id"],
                     "sentiment_model": r.get("sentiment_model", "-"),
                     "metric":   "accuracy",
@@ -409,6 +404,8 @@ def build_market_cap_summary(mcap_strat: pd.DataFrame,
                 rows.append({
                     "section":  "best_small_high_vol_model",
                     "horizon":  r["horizon"],
+                    "model_type": r.get("model_type", "per_asset"),
+                    "panel_mode": r.get("panel_mode", "-"),
                     "set_id":   r["set_id"],
                     "sentiment_model": r.get("sentiment_model", "-"),
                     "metric":   "accuracy",

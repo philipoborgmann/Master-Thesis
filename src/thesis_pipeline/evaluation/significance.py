@@ -24,7 +24,7 @@ import pandas as pd
 from scipy.stats import chi2
 
 from ..logging_utils import get_logger
-from .metrics import GROUP_KEYS
+from .metrics import GROUP_KEYS, FRONT_META, _front_order, ensure_group_columns
 
 DEFAULT_BENCHMARKS: tuple[str, ...] = ("B1", "B2")
 ELIGIBLE_CATEGORIES = ("sentiment", "combined")
@@ -32,6 +32,51 @@ SIGNIFICANCE_ALPHA = 0.05
 
 # Back-compat: some external callers still reference this name.
 BENCHMARK_SET_ID = "B1"
+
+# Columns identifying a model family. Benchmark matching is confined to a
+# single family so a panel-logit model is never silently compared against a
+# per-asset benchmark.
+FAMILY_COLS = ["horizon", "model_type", "panel_mode"]
+
+
+def _family_benchmark_frames(fam_grp: pd.DataFrame,
+                             signals: pd.DataFrame,
+                             fam_keys,
+                             benchmarks: Sequence[str],
+                             allow_cross_model_benchmark: bool,
+                             *,
+                             context: str = "mcnemar") -> dict[str, pd.DataFrame]:
+    """Resolve the benchmark frames available *within one model family*.
+
+    ``fam_keys`` is the ``(horizon, model_type, panel_mode)`` tuple of the
+    family. By default a benchmark must live in the same family. With
+    ``allow_cross_model_benchmark=True`` a missing same-family benchmark falls
+    back to the per-asset benchmark of the same horizon. A benchmark that is
+    unavailable under either rule yields an empty frame (the caller skips that
+    comparison) and a single WARN is logged — never a silent cross-family mix.
+    """
+    if not isinstance(fam_keys, tuple):
+        fam_keys = (fam_keys,)
+    horizon = fam_keys[0]
+    model_type = fam_keys[1] if len(fam_keys) > 1 else "per_asset"
+    panel_mode = fam_keys[2] if len(fam_keys) > 2 else "-"
+    frames: dict[str, pd.DataFrame] = {}
+    for bid in benchmarks:
+        bench = fam_grp[fam_grp["set_id"] == bid]
+        if bench.empty and allow_cross_model_benchmark:
+            bench = signals[(signals["horizon"] == horizon)
+                            & (signals["set_id"] == bid)
+                            & (signals["model_type"] == "per_asset")]
+        if bench.empty:
+            get_logger().warning(
+                "%s: no %s benchmark within family "
+                "(horizon=%s, model_type=%s, panel_mode=%s) — skipping that "
+                "comparison (allow_cross_model_benchmark=%s)",
+                context, bid, horizon, model_type, panel_mode,
+                allow_cross_model_benchmark,
+            )
+        frames[bid] = bench
+    return frames
 
 
 def mcnemar_continuity_corrected(b: int, c: int) -> tuple[float, float]:
@@ -86,22 +131,31 @@ def mcnemar_for_pair(model_df: pd.DataFrame,
 
 
 def mcnemar_table(signals: pd.DataFrame,
-                  benchmarks: Sequence[str] = DEFAULT_BENCHMARKS) -> pd.DataFrame:
-    """Long-form McNemar table: one row per (horizon × set × benchmark).
+                  benchmarks: Sequence[str] = DEFAULT_BENCHMARKS,
+                  allow_cross_model_benchmark: bool = False) -> pd.DataFrame:
+    """Long-form McNemar table: one row per
+    (horizon × model_type × panel_mode × set × benchmark).
 
     The benchmark itself is excluded from the rows it benchmarks (you don't
     test B1 against B1). Rows whose ``category`` is not in
     :data:`ELIGIBLE_CATEGORIES` are skipped — i.e. economic-only sets do not
     appear because the thesis question is about sentiment-augmented sets.
+
+    Benchmark matching is **confined to the same model family**
+    (horizon + model_type + panel_mode). A panel-logit model is therefore
+    never compared against a per-asset benchmark unless
+    ``allow_cross_model_benchmark=True`` is passed explicitly (default
+    ``False`` — no implicit cross-family fallback).
     """
     if signals.empty or "category" not in signals.columns:
         return pd.DataFrame()
+    signals = ensure_group_columns(signals)
     rows: list[dict] = []
-    for horizon, hz_grp in signals.groupby("horizon", dropna=False):
-        bench_frames: dict[str, pd.DataFrame] = {
-            bid: hz_grp[hz_grp["set_id"] == bid] for bid in benchmarks
-        }
-        for keys, grp in hz_grp.groupby(list(GROUP_KEYS), dropna=False):
+    for fam_keys, fam_grp in signals.groupby(FAMILY_COLS, dropna=False):
+        bench_frames = _family_benchmark_frames(
+            fam_grp, signals, fam_keys, benchmarks, allow_cross_model_benchmark,
+        )
+        for keys, grp in fam_grp.groupby(list(GROUP_KEYS), dropna=False):
             set_id = keys[1]
             if set_id in benchmarks:
                 continue
@@ -123,11 +177,9 @@ def mcnemar_table(signals: pd.DataFrame,
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    front = ["horizon", "set_id", "category", "sentiment_model", "benchmark",
-             "mcnemar_stat", "mcnemar_pval", "significant_vs_benchmark",
-             "b", "c", "n_matched"]
-    rest = [col for col in out.columns if col not in front]
-    return out[front + rest].reset_index(drop=True)
+    front = FRONT_META + ["benchmark", "mcnemar_stat", "mcnemar_pval",
+                          "significant_vs_benchmark", "b", "c", "n_matched"]
+    return _front_order(out, front)
 
 
 def mcnemar_wide(mcnemar_long: pd.DataFrame,
@@ -139,15 +191,16 @@ def mcnemar_wide(mcnemar_long: pd.DataFrame,
     """
     if mcnemar_long is None or mcnemar_long.empty:
         return pd.DataFrame()
+    mcnemar_long = ensure_group_columns(mcnemar_long)
+    id_cols = ["horizon", "set_id", "sentiment_model", "model_type", "panel_mode"]
     pieces = []
     for bid in benchmarks:
         sub = mcnemar_long[mcnemar_long["benchmark"] == bid].copy()
         if sub.empty:
             continue
         suffix = f"_vs_{bid.lower()}"
-        keep = ["horizon", "set_id", "sentiment_model",
-                "mcnemar_stat", "mcnemar_pval",
-                "significant_vs_benchmark", "b", "c", "n_matched"]
+        keep = id_cols + ["mcnemar_stat", "mcnemar_pval",
+                          "significant_vs_benchmark", "b", "c", "n_matched"]
         sub = sub[keep].rename(columns={
             "mcnemar_stat":              f"mcnemar_stat{suffix}",
             "mcnemar_pval":              f"mcnemar_pval{suffix}",
@@ -161,7 +214,7 @@ def mcnemar_wide(mcnemar_long: pd.DataFrame,
         return pd.DataFrame()
     out = pieces[0]
     for nxt in pieces[1:]:
-        out = out.merge(nxt, on=["horizon", "set_id", "sentiment_model"], how="outer")
+        out = out.merge(nxt, on=id_cols, how="outer")
     return out.reset_index(drop=True)
 
 
@@ -188,7 +241,8 @@ MIN_DISCORDANT_DEFAULT = 20
 
 _REGIME_FRONT_COLS = [
     # Identity
-    "regime_type", "horizon", "set_id", "category", "sentiment_model",
+    "regime_type", "horizon", "model_type", "panel_mode", "set_id", "category",
+    "sentiment_model",
     "benchmark", "vol_regime", "mcap_regime", "interaction",
     # Direction + effect size up front so the table reads at a glance.
     "direction", "net_improvement", "abs_net_improvement",
@@ -228,7 +282,8 @@ def mcnemar_by_group(signals: pd.DataFrame,
                      benchmarks: Sequence[str] = DEFAULT_BENCHMARKS,
                      min_n_matched: int = MIN_N_MATCHED_DEFAULT,
                      min_discordant: int = MIN_DISCORDANT_DEFAULT,
-                     min_effect_rate: float = 0.01) -> pd.DataFrame:
+                     min_effect_rate: float = 0.01,
+                     allow_cross_model_benchmark: bool = False) -> pd.DataFrame:
     """Continuity-corrected McNemar per
     (horizon × set_id × sentiment_model × benchmark × group_cols).
 
@@ -260,11 +315,15 @@ def mcnemar_by_group(signals: pd.DataFrame,
         get_logger().warning("regime-mcnemar: missing group columns %s — skipping",
                              missing)
         return pd.DataFrame()
+    signals = ensure_group_columns(signals)
 
     rows: list[dict] = []
-    for _, hz_grp in signals.groupby("horizon", dropna=False):
-        bench_frames = {bid: hz_grp[hz_grp["set_id"] == bid] for bid in benchmarks}
-        for keys, grp in hz_grp.groupby(list(GROUP_KEYS), dropna=False):
+    for fam_keys, fam_grp in signals.groupby(FAMILY_COLS, dropna=False):
+        bench_frames = _family_benchmark_frames(
+            fam_grp, signals, fam_keys, benchmarks, allow_cross_model_benchmark,
+            context="regime-mcnemar",
+        )
+        for keys, grp in fam_grp.groupby(list(GROUP_KEYS), dropna=False):
             set_id = keys[1]
             if set_id in benchmarks:
                 continue
@@ -322,6 +381,8 @@ def mcnemar_by_group(signals: pd.DataFrame,
                         "horizon":          keys[0],
                         "set_id":           keys[1],
                         "sentiment_model":  keys[2],
+                        "model_type":       keys[3],
+                        "panel_mode":       keys[4],
                         "category":         category,
                         "benchmark":        bid,
                         "direction":        direction,
@@ -533,7 +594,8 @@ def build_regime_mcnemar_summary(regime_mcnemar_df: pd.DataFrame) -> pd.DataFram
     input. Regime McNemar stays exploratory; interpret with the
     multiple-testing caveat in mind.
     """
-    cols = ["section", "horizon", "set_id", "sentiment_model", "benchmark",
+    cols = ["section", "horizon", "model_type", "panel_mode", "set_id",
+            "sentiment_model", "benchmark",
             "regime_type", "mcap_regime", "vol_regime", "interaction",
             "direction", "net_improvement", "improvement_rate",
             "discordant_advantage", "n_matched", "discordant_n",
