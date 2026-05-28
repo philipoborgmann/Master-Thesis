@@ -254,7 +254,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     mcnemar_wide_df = mcnemar_wide(mcnemar_df_long, benchmarks=DEFAULT_BENCHMARKS)
     if not pooled.empty and not mcnemar_wide_df.empty:
         pooled = pooled.merge(
-            mcnemar_wide_df, on=["horizon", "set_id", "sentiment_model"],
+            mcnemar_wide_df,
+            on=["horizon", "set_id", "sentiment_model", "model_type", "panel_mode"],
             how="left",
         )
     if "mcnemar_pval_vs_b1" in pooled.columns and "mcnemar_pval" not in pooled.columns:
@@ -386,48 +387,56 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     # ── 10. Sorting (deterministic output) ──────────────────────
+    # Sort order keeps the model family (model_type, panel_mode) adjacent to
+    # the horizon so per-asset and panel-logit rows never interleave.
+    fam = ["model_type", "panel_mode"]
     if not pooled.empty:
-        pooled = pooled.sort_values(["horizon", "accuracy"],
-                                    ascending=[True, False]).reset_index(drop=True)
+        pooled = pooled.sort_values(["horizon", *fam, "accuracy"],
+                                    ascending=[True, True, True, False]
+                                    ).reset_index(drop=True)
     if not per_ticker.empty:
         per_ticker = per_ticker.sort_values(
-            ["horizon", "set_id", "sentiment_model", "ticker"]).reset_index(drop=True)
+            ["horizon", *fam, "set_id", "sentiment_model", "ticker"]
+        ).reset_index(drop=True)
     if not threshold_df.empty:
         threshold_df = threshold_df.sort_values(
-            ["horizon", "set_id", "sentiment_model", "threshold"]).reset_index(drop=True)
+            ["horizon", *fam, "set_id", "sentiment_model", "threshold"]
+        ).reset_index(drop=True)
     if not threshold_lift_df.empty:
         threshold_lift_df = threshold_lift_df.sort_values(
-            ["horizon", "set_id", "sentiment_model", "benchmark", "threshold"]
+            ["horizon", *fam, "set_id", "sentiment_model", "benchmark", "threshold"]
         ).reset_index(drop=True)
     if not volatility_df.empty:
         volatility_df = volatility_df.sort_values(
-            ["horizon", "set_id", "sentiment_model", "vol_regime"]).reset_index(drop=True)
+            ["horizon", *fam, "set_id", "sentiment_model", "vol_regime"]
+        ).reset_index(drop=True)
     if not mcap_df.empty:
         mcap_df = mcap_df.sort_values(
-            ["horizon", "set_id", "sentiment_model", "mcap_regime"]).reset_index(drop=True)
+            ["horizon", *fam, "set_id", "sentiment_model", "mcap_regime"]
+        ).reset_index(drop=True)
     if not interaction_df.empty:
         interaction_df = interaction_df.sort_values(
-            ["horizon", "set_id", "sentiment_model", "mcap_regime", "vol_regime"]
+            ["horizon", *fam, "set_id", "sentiment_model", "mcap_regime", "vol_regime"]
         ).reset_index(drop=True)
     if not mcnemar_df_long.empty:
         mcnemar_df_long = mcnemar_df_long.sort_values(
-            ["horizon", "set_id", "sentiment_model", "benchmark"]
+            ["horizon", *fam, "set_id", "sentiment_model", "benchmark"]
         ).reset_index(drop=True)
     if not economic_df.empty:
         economic_df = economic_df.sort_values(
-            ["horizon", "cost_bps", "sharpe"],
-            ascending=[True, True, False]).reset_index(drop=True)
+            ["horizon", *fam, "cost_bps", "sharpe"],
+            ascending=[True, True, True, True, False]).reset_index(drop=True)
     if not economic_thr_df.empty:
         economic_thr_df = economic_thr_df.sort_values(
-            ["horizon", "threshold", "cost_bps", "sharpe"],
-            ascending=[True, True, True, False]).reset_index(drop=True)
+            ["horizon", *fam, "threshold", "cost_bps", "sharpe"],
+            ascending=[True, True, True, True, True, False]).reset_index(drop=True)
     if not economic_tk_df.empty:
         economic_tk_df = economic_tk_df.sort_values(
-            ["horizon", "set_id", "sentiment_model", "ticker", "cost_bps"]
+            ["horizon", *fam, "set_id", "sentiment_model", "ticker", "cost_bps"]
         ).reset_index(drop=True)
     if not regime_mcnemar_df.empty:
         regime_mcnemar_df = regime_mcnemar_df.sort_values(
-            ["regime_type", "horizon", "set_id", "sentiment_model", "benchmark"]
+            ["regime_type", "horizon", *fam, "set_id", "sentiment_model", "benchmark"]
         ).reset_index(drop=True)
 
     # ── 11. Write outputs ───────────────────────────────────────

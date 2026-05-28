@@ -35,7 +35,7 @@ import pandas as pd
 
 from ..config import load_config, resolve_path
 from ..logging_utils import get_logger
-from .metrics import GROUP_KEYS, _group_meta
+from .metrics import GROUP_KEYS, FRONT_META, _front_order, _group_meta, ensure_group_columns
 from .volatility import _ticker_candidates, _normalise_ohlcv
 
 
@@ -583,6 +583,7 @@ def summarize_high_low_backtest(signals: pd.DataFrame,
     merged = _signals_with_forward_returns(signals, forward_returns, horizon=horizon)
     if merged.empty or merged["forward_log_return"].notna().sum() == 0:
         return pd.DataFrame()
+    merged = ensure_group_columns(merged)
 
     cost_grid = list(cfg.get("transaction_cost_bps", [0, 5, 10]))
     rows: list[dict] = []
@@ -596,9 +597,7 @@ def summarize_high_low_backtest(signals: pd.DataFrame,
                 float(row["n_periods"] / n_signal_periods) if n_signal_periods else 0.0
             )
             row.update({
-                "horizon":          keys[0],
-                "set_id":           keys[1],
-                "sentiment_model":  keys[2],
+                **dict(zip(GROUP_KEYS, keys)),
                 "portfolio_mode":   cfg.get("portfolio_mode", "high_low"),
                 "long_quantile":    float(cfg.get("long_quantile", 0.8)),
                 "short_quantile":   float(cfg.get("short_quantile", 0.2)),
@@ -608,17 +607,16 @@ def summarize_high_low_backtest(signals: pd.DataFrame,
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    front = ["horizon", "set_id", "category", "sentiment_model", "label",
-             "portfolio_mode", "long_quantile", "short_quantile", "cost_bps",
-             "n_periods", "n_assets_avg", "long_assets_avg", "short_assets_avg",
-             "turnover_avg", "gross_cumulative_log_return",
-             "net_cumulative_log_return", "net_cumulative_simple_return",
-             "annualized_log_return", "annualized_simple_return",
-             "annualized_volatility", "sharpe", "sortino",
-             "max_drawdown", "calmar_ratio", "hit_rate", "coverage",
-             "mean_return", "median_return"]
-    rest = [c for c in out.columns if c not in front]
-    return out[front + rest].reset_index(drop=True)
+    front = FRONT_META + [
+        "portfolio_mode", "long_quantile", "short_quantile", "cost_bps",
+        "n_periods", "n_assets_avg", "long_assets_avg", "short_assets_avg",
+        "turnover_avg", "gross_cumulative_log_return",
+        "net_cumulative_log_return", "net_cumulative_simple_return",
+        "annualized_log_return", "annualized_simple_return",
+        "annualized_volatility", "sharpe", "sortino",
+        "max_drawdown", "calmar_ratio", "hit_rate", "coverage",
+        "mean_return", "median_return"]
+    return _front_order(out, front)
 
 
 def summarize_high_low_threshold_backtest(signals: pd.DataFrame,
@@ -638,6 +636,7 @@ def summarize_high_low_threshold_backtest(signals: pd.DataFrame,
     merged = _signals_with_forward_returns(signals, forward_returns, horizon=horizon)
     if merged.empty or merged["forward_log_return"].notna().sum() == 0:
         return pd.DataFrame()
+    merged = ensure_group_columns(merged)
 
     thresholds = list(cfg.get("thresholds", [0.55, 0.60, 0.65]))
     cost_grid  = list(cfg.get("transaction_cost_bps", [0, 5, 10]))
@@ -656,9 +655,7 @@ def summarize_high_low_threshold_backtest(signals: pd.DataFrame,
                     if n_signal_periods else 0.0
                 )
                 row.update({
-                    "horizon":          keys[0],
-                    "set_id":           keys[1],
-                    "sentiment_model":  keys[2],
+                    **dict(zip(GROUP_KEYS, keys)),
                     "threshold":        float(thr),
                     **meta,
                 })
@@ -666,13 +663,12 @@ def summarize_high_low_threshold_backtest(signals: pd.DataFrame,
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    front = ["horizon", "set_id", "category", "sentiment_model", "label",
-             "threshold", "cost_bps", "n_periods",
-             "long_assets_avg", "short_assets_avg",
-             "net_cumulative_simple_return", "sharpe", "turnover_avg",
-             "max_drawdown", "coverage"]
-    rest = [c for c in out.columns if c not in front]
-    return out[front + rest].reset_index(drop=True)
+    front = FRONT_META + [
+        "threshold", "cost_bps", "n_periods",
+        "long_assets_avg", "short_assets_avg",
+        "net_cumulative_simple_return", "sharpe", "turnover_avg",
+        "max_drawdown", "coverage"]
+    return _front_order(out, front)
 
 
 def summarize_backtest_by_ticker(signals: pd.DataFrame,
@@ -691,6 +687,7 @@ def summarize_backtest_by_ticker(signals: pd.DataFrame,
     merged = _signals_with_forward_returns(signals, forward_returns, horizon=horizon)
     if merged.empty or merged["forward_log_return"].notna().sum() == 0:
         return pd.DataFrame()
+    merged = ensure_group_columns(merged)
 
     cost_grid = list(cfg.get("transaction_cost_bps", [0, 5, 10]))
     rows: list[dict] = []
@@ -704,6 +701,7 @@ def summarize_backtest_by_ticker(signals: pd.DataFrame,
         spanned = _days_spanned(valid["timestamp"])
         ppy = _periods_per_year(len(valid), spanned,
                                 int(cfg.get("crypto_calendar_days", 365)))
+        ident = dict(zip(GROUP_KEYS, keys[:-1]))
         for cost in cost_grid:
             # Per-ticker turnover from sign changes.
             diff = np.abs(np.diff(pred.astype(float), prepend=0.0)) / 2.0
@@ -713,10 +711,8 @@ def summarize_backtest_by_ticker(signals: pd.DataFrame,
             sharpe = compute_sharpe(net, periods_per_year=ppy,
                                     risk_free_rate=float(cfg.get("risk_free_rate", 0.0)))
             rows.append({
-                "horizon":         keys[0],
-                "set_id":          keys[1],
-                "sentiment_model": keys[2],
-                "ticker":          keys[3],
+                **ident,
+                "ticker":          keys[-1],
                 "cost_bps":        float(cost),
                 "n_obs":           int(len(valid)),
                 "cumulative_log_return": float(net.sum()),
@@ -729,11 +725,10 @@ def summarize_backtest_by_ticker(signals: pd.DataFrame,
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    front = ["horizon", "set_id", "sentiment_model", "ticker", "cost_bps",
+    front = FRONT_META + ["ticker", "cost_bps",
              "n_obs", "cumulative_log_return", "cumulative_simple_return",
              "sharpe", "max_drawdown", "turnover_avg", "hit_rate"]
-    rest = [c for c in out.columns if c not in front]
-    return out[front + rest].reset_index(drop=True)
+    return _front_order(out, front)
 
 
 # ---------------------------------------------------------------------------
@@ -775,6 +770,11 @@ def buy_and_hold_benchmark(tickers: Iterable[str],
             "horizon":         horizon,
             "set_id":          "BUY_HOLD",
             "sentiment_model": "-",
+            # BUY_HOLD is a global, model-independent reference: it is tagged
+            # as its own ``benchmark`` family so it never collides with a
+            # per-asset / panel-logit row and may be quoted across families.
+            "model_type":      "benchmark",
+            "panel_mode":      "-",
             "category":        "benchmark",
             "label":           "equal-weight long-only buy & hold",
             "portfolio_mode":  "buy_and_hold",
@@ -791,20 +791,29 @@ def buy_and_hold_benchmark(tickers: Iterable[str],
 
 def attach_benchmark_lifts(economic_df: pd.DataFrame,
                            benchmark_ids: Sequence[str]) -> pd.DataFrame:
-    """Append sharpe_lift_vs_<bid> and cumulative_return_lift_vs_<bid> columns."""
+    """Append sharpe_lift_vs_<bid> and cumulative_return_lift_vs_<bid> columns.
+
+    The benchmark Sharpe / cumulative return are matched **within the same
+    model family** (horizon + cost_bps + model_type + panel_mode). A
+    panel-logit row is therefore lifted only against the panel-logit B1 / B2
+    rows of the same panel mode — never against the per-asset benchmark.
+    Rows with no same-family benchmark keep NaN lift columns rather than
+    crashing or silently borrowing another family's number.
+    """
     if economic_df is None or economic_df.empty:
         return economic_df
-    out = economic_df.copy()
+    out = ensure_group_columns(economic_df).copy()
+    merge_keys = ["horizon", "cost_bps", "model_type", "panel_mode"]
     for bid in benchmark_ids:
         bench = (out[out["set_id"] == bid]
-                   [["horizon", "cost_bps", "sharpe", "net_cumulative_simple_return"]]
+                   [merge_keys + ["sharpe", "net_cumulative_simple_return"]]
                    .rename(columns={
                        "sharpe":                     f"_bench_sharpe_{bid.lower()}",
                        "net_cumulative_simple_return": f"_bench_cum_{bid.lower()}",
                    }))
         if bench.empty:
             continue
-        out = out.merge(bench, on=["horizon", "cost_bps"], how="left")
+        out = out.merge(bench, on=merge_keys, how="left")
         out[f"sharpe_lift_vs_{bid.lower()}"] = (
             out["sharpe"] - out[f"_bench_sharpe_{bid.lower()}"]
         )

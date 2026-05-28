@@ -12,8 +12,53 @@ import pandas as pd
 
 from ..modeling.run_models import compute_metrics
 
-# Group key used everywhere in this stage.
-GROUP_KEYS = ("horizon", "set_id", "sentiment_model")
+# Group key used everywhere in this stage. ``model_type`` / ``panel_mode``
+# separate the canonical per-asset family from the panel-logit family so the
+# evaluation never pools signals that merely share (set_id, sentiment_model).
+GROUP_KEYS = ("horizon", "set_id", "sentiment_model", "model_type", "panel_mode")
+
+# Defaults for the model-family columns. Mirrors loading.META_DEFAULTS so that
+# frames built directly in tests (without going through the loader) still group
+# cleanly as the canonical per-asset family.
+GROUP_DEFAULTS = {"model_type": "per_asset", "panel_mode": "-"}
+
+# Preferred leading column order for every table this stage emits.
+FRONT_META = ["horizon", "model_type", "panel_mode", "set_id", "category",
+              "sentiment_model", "label"]
+
+
+def ensure_group_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Guarantee ``model_type`` / ``panel_mode`` exist with sane defaults.
+
+    Production frames already carry these (the loader fills them); this is a
+    defensive shim so any frame grouped by :data:`GROUP_KEYS` — including the
+    synthetic frames built in tests — does not raise ``KeyError`` and collapses
+    missing/blank values to the canonical per-asset identity.
+    """
+    if df is None or df.empty:
+        return df
+    out = df
+    copied = False
+    for col, default in GROUP_DEFAULTS.items():
+        if col not in out.columns:
+            if not copied:
+                out, copied = out.copy(), True
+            out[col] = default
+        else:
+            filled = out[col].astype(str).replace({"": default, "nan": default,
+                                                    "None": default})
+            if not filled.equals(out[col].astype(str)):
+                if not copied:
+                    out, copied = out.copy(), True
+                out[col] = filled
+    return out
+
+
+def _front_order(out: pd.DataFrame, front: list[str]) -> pd.DataFrame:
+    """Return ``out`` with ``front`` columns first (those that exist), in order."""
+    lead = [c for c in front if c in out.columns]
+    rest = [c for c in out.columns if c not in lead]
+    return out[lead + rest].reset_index(drop=True)
 
 
 def confusion_diagnostics(signals: pd.DataFrame) -> dict:
@@ -58,6 +103,7 @@ def pooled_metrics_table(signals: pd.DataFrame) -> pd.DataFrame:
     """
     if signals.empty:
         return pd.DataFrame()
+    signals = ensure_group_columns(signals)
     rows = []
     for keys, grp in signals.groupby(list(GROUP_KEYS), dropna=False):
         if len(grp) == 0:
@@ -69,10 +115,7 @@ def pooled_metrics_table(signals: pd.DataFrame) -> pd.DataFrame:
         m.update(confusion_diagnostics(grp))
         rows.append(m)
     out = pd.DataFrame(rows)
-    # Standard column order for downstream sorting/sheets.
-    front = ["horizon", "set_id", "category", "sentiment_model", "label"]
-    rest = [c for c in out.columns if c not in front]
-    return out[front + rest].reset_index(drop=True)
+    return _front_order(out, FRONT_META)
 
 
 def per_ticker_metrics_table(signals: pd.DataFrame) -> pd.DataFrame:
@@ -84,6 +127,7 @@ def per_ticker_metrics_table(signals: pd.DataFrame) -> pd.DataFrame:
     """
     if signals.empty:
         return pd.DataFrame()
+    signals = ensure_group_columns(signals)
     rows = []
     keys = list(GROUP_KEYS) + ["ticker"]
     for k, grp in signals.groupby(keys, dropna=False):
@@ -96,6 +140,4 @@ def per_ticker_metrics_table(signals: pd.DataFrame) -> pd.DataFrame:
         m.update(confusion_diagnostics(grp))
         rows.append(m)
     out = pd.DataFrame(rows)
-    front = ["horizon", "set_id", "category", "sentiment_model", "label", "ticker"]
-    rest = [c for c in out.columns if c not in front]
-    return out[front + rest].reset_index(drop=True)
+    return _front_order(out, FRONT_META + ["ticker"])

@@ -16,7 +16,20 @@ from ..config import resolve_path
 from ..logging_utils import get_logger
 
 REQUIRED_COLUMNS = ("timestamp", "ticker", "target", "prediction", "probability")
-META_COLUMNS     = ("set_id", "sentiment_model", "horizon")
+META_COLUMNS     = ("set_id", "sentiment_model", "horizon", "model_type", "panel_mode")
+
+# Per-column defaults applied when a meta column is absent or blank. These are
+# read from the parquet columns only — never inferred from the filename. Old
+# per-asset signal files (written before the panel-logit family existed) carry
+# neither ``model_type`` nor ``panel_mode``; they collapse to the canonical
+# per-asset identity here.
+META_DEFAULTS = {
+    "set_id":          "",
+    "sentiment_model": "",
+    "horizon":         "",
+    "model_type":      "per_asset",
+    "panel_mode":      "-",
+}
 
 
 def discover_signal_files(horizon: str | None = None) -> list[Path]:
@@ -52,11 +65,15 @@ def _normalise_signal_frame(df: pd.DataFrame, *, source: Path) -> pd.DataFrame:
     df["probability"] = df["probability"].astype(float)
 
     # Fill metadata columns from columns if missing — never from the filename.
+    # Defaults are applied only when the column is absent or its value is blank;
+    # a present, non-empty column value always wins.
     for col in META_COLUMNS:
+        default = META_DEFAULTS.get(col, "")
         if col not in df.columns:
-            df[col] = ""
+            df[col] = default
         else:
-            df[col] = df[col].astype(str).fillna("").replace("nan", "")
+            s = df[col].astype(str).fillna("").replace({"nan": "", "None": ""})
+            df[col] = s.replace("", default) if default else s
     return df
 
 
@@ -109,6 +126,11 @@ def load_all_signals(horizon: str | None = None,
     out = pd.concat(frames, ignore_index=True)
     # Normalise sentiment_model: missing/blank → "-"
     out["sentiment_model"] = out["sentiment_model"].replace({"": "-", "nan": "-"})
+    # Model-family identity: blank → canonical defaults (defensive — the
+    # per-file normaliser already applies these, but a concat of mixed-vintage
+    # files is cheap to re-guard).
+    out["model_type"] = out["model_type"].replace({"": "per_asset", "nan": "per_asset"})
+    out["panel_mode"] = out["panel_mode"].replace({"": "-", "nan": "-"})
     return out
 
 

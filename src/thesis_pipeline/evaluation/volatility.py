@@ -26,7 +26,7 @@ import pandas as pd
 
 from ..config import resolve_path
 from ..logging_utils import get_logger
-from .metrics import GROUP_KEYS, _group_meta
+from .metrics import GROUP_KEYS, FRONT_META, _front_order, _group_meta, ensure_group_columns
 
 REGIME_LABELS = ("low", "mid", "high")
 
@@ -312,13 +312,14 @@ def volatility_stratification_table(signals: pd.DataFrame,
     """One row per (horizon × set_id × sentiment_model × regime)."""
     if signals.empty:
         return pd.DataFrame()
-    enriched = attach_regimes(signals, regime_lookup)
+    enriched = ensure_group_columns(attach_regimes(signals, regime_lookup))
     if "regime" not in enriched.columns or enriched["regime"].isna().all():
         return pd.DataFrame()
 
     rows = []
     for keys, grp in enriched.groupby(list(GROUP_KEYS), dropna=False):
-        horizon = keys[0] if isinstance(keys, tuple) else keys
+        horizon = keys[0]
+        ident = dict(zip(GROUP_KEYS, keys))
         meta = _group_meta(grp)
         if str(horizon) == "1d":
             # Observation-level: each signal row already represents one day.
@@ -329,7 +330,7 @@ def volatility_stratification_table(signals: pd.DataFrame,
             for regime in REGIME_LABELS:
                 sub = grp[grp["regime"] == regime]
                 rows.append({
-                    "horizon": horizon, "set_id": keys[1], "sentiment_model": keys[2],
+                    **ident,
                     "vol_regime": regime,
                     "accuracy":   float(sub["correct"].mean()) if not sub.empty else np.nan,
                     "brier_score": float(sub["sq_err"].mean()) if not sub.empty else np.nan,
@@ -342,7 +343,7 @@ def volatility_stratification_table(signals: pd.DataFrame,
             for regime in REGIME_LABELS:
                 sub = daily[daily["regime"] == regime]
                 rows.append({
-                    "horizon": horizon, "set_id": keys[1], "sentiment_model": keys[2],
+                    **ident,
                     "vol_regime": regime,
                     "accuracy":   float(sub["daily_accuracy"].mean()) if not sub.empty else np.nan,
                     "brier_score": float(sub["daily_brier"].mean()) if not sub.empty else np.nan,
@@ -351,6 +352,4 @@ def volatility_stratification_table(signals: pd.DataFrame,
                     **meta,
                 })
     out = pd.DataFrame(rows)
-    front = ["horizon", "set_id", "category", "sentiment_model", "label", "vol_regime"]
-    rest = [c for c in out.columns if c not in front]
-    return out[front + rest].reset_index(drop=True)
+    return _front_order(out, FRONT_META + ["vol_regime"])
