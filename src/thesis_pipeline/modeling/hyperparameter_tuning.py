@@ -70,6 +70,27 @@ OBJECTIVE_DIRECTIONS: dict[str, str] = {
 }
 ALLOWED_OBJECTIVES = tuple(OBJECTIVE_DIRECTIONS.keys())
 
+# Objective → compact variant label used in output filenames, the
+# ``hpo_variant`` signal column, and the evaluation grouping key. Untuned
+# (fixed-C) runs use the sentinel "fixed".
+OBJECTIVE_SUFFIX: dict[str, str] = {
+    "brier_score": "hpo_brier",
+    "log_loss":    "hpo_logloss",
+    "accuracy":    "hpo_accuracy",
+}
+FIXED_VARIANT = "fixed"
+
+
+def hpo_variant_label(enabled: bool, objective: str | None) -> str:
+    """Return the ``hpo_variant`` label for a run.
+
+    ``"fixed"`` when tuning is disabled, else the objective's variant suffix
+    (``hpo_brier`` / ``hpo_logloss`` / ``hpo_accuracy``).
+    """
+    if not enabled:
+        return FIXED_VARIANT
+    return OBJECTIVE_SUFFIX.get(objective or "brier_score", "hpo_brier")
+
 # Default hyperparameters — identical to the pinned thesis estimator so that
 # any fallback path reproduces the non-tuned behaviour exactly.
 DEFAULT_PARAMS: dict[str, Any] = {"C": 1.0, "class_weight": None}
@@ -89,9 +110,13 @@ PANEL = "panel"
 # Config
 # ---------------------------------------------------------------------------
 
+# Conservative default search space. ``class_weight`` defaults to ``[None]``
+# only: with Brier score as the default objective, ``class_weight="balanced"``
+# can hurt probability calibration. ``balanced`` stays available via
+# model_specs.yaml or ``--hpo-class-weight``.
 _DEFAULT_SEARCH_SPACE = {
     "C": [0.01, 0.1, 1.0, 10.0],
-    "class_weight": [None, "balanced"],
+    "class_weight": [None],
 }
 
 _DEFAULT_HPO = {
@@ -540,6 +565,7 @@ def hpo_row_columns(objective: str, result: Mapping[str, Any]) -> dict:
     return {
         "hpo_enabled":       True,
         "hpo_objective":     objective,
+        "hpo_variant":       hpo_variant_label(True, objective),
         "best_C":            float(best.get("C", DEFAULT_PARAMS["C"])),
         "best_class_weight": class_weight_label(best.get("class_weight")),
         "hpo_score":         result.get("best_score"),
@@ -562,6 +588,8 @@ def summarize_hpo_columns(signals: pd.DataFrame) -> dict:
     out: dict[str, Any] = {"hpo_enabled": True}
     if "hpo_objective" in sub.columns and not sub["hpo_objective"].dropna().empty:
         out["hpo_objective"] = str(sub["hpo_objective"].dropna().iloc[0])
+    if "hpo_variant" in sub.columns and not sub["hpo_variant"].dropna().empty:
+        out["hpo_variant"] = str(sub["hpo_variant"].dropna().iloc[0])
     if "best_C" in sub.columns:
         c = pd.to_numeric(sub["best_C"], errors="coerce").dropna()
         if not c.empty:

@@ -255,7 +255,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not pooled.empty and not mcnemar_wide_df.empty:
         pooled = pooled.merge(
             mcnemar_wide_df,
-            on=["horizon", "set_id", "sentiment_model", "model_type", "panel_mode"],
+            on=["horizon", "set_id", "sentiment_model", "model_type",
+                "panel_mode", "hpo_variant"],
             how="left",
         )
     if "mcnemar_pval_vs_b1" in pooled.columns and "mcnemar_pval" not in pooled.columns:
@@ -387,12 +388,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     # ── 10. Sorting (deterministic output) ──────────────────────
-    # Sort order keeps the model family (model_type, panel_mode) adjacent to
-    # the horizon so per-asset and panel-logit rows never interleave.
-    fam = ["model_type", "panel_mode"]
+    # Sort order keeps the full family (model_type, panel_mode, hpo_variant)
+    # adjacent to the horizon so per-asset/panel and fixed/HPO rows never
+    # interleave.
+    fam = ["model_type", "panel_mode", "hpo_variant"]
     if not pooled.empty:
         pooled = pooled.sort_values(["horizon", *fam, "accuracy"],
-                                    ascending=[True, True, True, False]
+                                    ascending=[True, True, True, True, False]
                                     ).reset_index(drop=True)
     if not per_ticker.empty:
         per_ticker = per_ticker.sort_values(
@@ -425,11 +427,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not economic_df.empty:
         economic_df = economic_df.sort_values(
             ["horizon", *fam, "cost_bps", "sharpe"],
-            ascending=[True, True, True, True, False]).reset_index(drop=True)
+            ascending=[True, True, True, True, True, False]).reset_index(drop=True)
     if not economic_thr_df.empty:
         economic_thr_df = economic_thr_df.sort_values(
             ["horizon", *fam, "threshold", "cost_bps", "sharpe"],
-            ascending=[True, True, True, True, True, False]).reset_index(drop=True)
+            ascending=[True, True, True, True, True, True, False]).reset_index(drop=True)
     if not economic_tk_df.empty:
         economic_tk_df = economic_tk_df.sort_values(
             ["horizon", *fam, "set_id", "sentiment_model", "ticker", "cost_bps"]

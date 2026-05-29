@@ -254,12 +254,21 @@ def _mode_suffix(panel_mode: str) -> str:
     return "panel_pooled" if panel_mode == "pooled" else "panel_ticker_fe"
 
 
-def panel_output_name(set_id: str, sentiment_model: str, panel_mode: str) -> str:
-    """``{set_id}[_{sentiment_model}]_{panel_pooled|panel_ticker_fe}``."""
+def panel_output_name(set_id: str, sentiment_model: str, panel_mode: str,
+                      hpo_variant: str = "fixed") -> str:
+    """``{set_id}[_{sentiment_model}]_{panel_pooled|panel_ticker_fe}[_{hpo_variant}]``.
+
+    A tuned run appends the HPO variant (e.g. ``..._panel_pooled_hpo_brier``)
+    so tuned and fixed-C panel signals never share a filename.
+    """
     suffix = _mode_suffix(panel_mode)
     if sentiment_model and str(sentiment_model) not in ("-", "nan"):
-        return f"{set_id}_{sentiment_model}_{suffix}"
-    return f"{set_id}_{suffix}"
+        base = f"{set_id}_{sentiment_model}_{suffix}"
+    else:
+        base = f"{set_id}_{suffix}"
+    if hpo_variant and hpo_variant not in ("fixed", "-"):
+        base = f"{base}_{hpo_variant}"
+    return base
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -310,8 +319,8 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
     """
     panel_mode = getattr(args, "panel_mode", "pooled") or "pooled"
 
+    from .hyperparameter_tuning import hpo_variant_label, load_hpo_config
     if hpo_cfg is None:
-        from .hyperparameter_tuning import load_hpo_config
         hpo_cfg = load_hpo_config(
             enabled_override=True if getattr(args, "tune_hyperparams", False) else None,
             objective_override=getattr(args, "hpo_objective", None),
@@ -320,6 +329,7 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
             config_path=getattr(args, "hpo_config", None),
         )
     tune_on = bool(hpo_cfg["enabled"])
+    hpo_variant = hpo_variant_label(tune_on, hpo_cfg["objective"])
 
     if getattr(args, "dry_run", False):
         try:
@@ -329,6 +339,12 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
             if args.horizon:
                 inputs.append(resolve_path("final_features_pattern", horizon=args.horizon))
             inputs.append(resolve_path("feature_sets_xlsx"))
+            out_name_example = "(per set_id default)"
+            if args.set_id:
+                out_name_example = (
+                    f"Outputs/Signals/{args.horizon or '<horizon>'}/"
+                    f"{panel_output_name(args.set_id, args.sentiment_model or '-', panel_mode, hpo_variant)}.parquet"
+                )
             log_stage_header(
                 "run_models", mode="dry-run", inputs=inputs, outputs=[],
                 extra={
@@ -338,6 +354,8 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                     "set_id":     args.set_id or "(all)",
                     "coins":      list(args.coins) if args.coins else "(all)",
                     "C":          args.C,
+                    "hpo_variant": hpo_variant,
+                    "output_name": out_name_example,
                     "tune_hyperparams": tune_on,
                     "hpo_objective":   hpo_cfg["objective"] if tune_on else "(off)",
                     "hpo_C_grid":      hpo_cfg["search_space"].get("C") if tune_on else "(off)",
@@ -397,7 +415,7 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
             if not (sent_model and str(sent_model) not in ("-", "nan")):
                 sent_model = "-"
 
-            out_name = panel_output_name(set_id, sent_model, panel_mode)
+            out_name = panel_output_name(set_id, sent_model, panel_mode, hpo_variant)
             out_path = os.path.join(hz_dir, f"{out_name}.parquet")
 
             # Benchmark sentinel is not a panel-logit model.
@@ -408,6 +426,7 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
 
             if os.path.isfile(out_path) and not args.restart:
                 try:
+                    from .hyperparameter_tuning import summarize_hpo_columns
                     cached = pd.read_parquet(out_path)
                     m = compute_metrics(cached, "pooled")
                     m.update({"horizon": hz, "set_id": set_id,
@@ -415,6 +434,7 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                               "category": category,
                               "n_tickers": cached["ticker"].nunique(),
                               "model_type": MODEL_TYPE, "panel_mode": panel_mode})
+                    m.update(summarize_hpo_columns(cached))
                     all_metrics.append(m)
                     print(f"\n  ── {out_name} ({label}) → CACHED "
                           f"acc={m['accuracy']:.4f}, n={m['n_obs']}")
@@ -459,6 +479,12 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
             signals["horizon"]         = hz
             signals["model_type"]      = MODEL_TYPE
             signals["panel_mode"]      = panel_mode
+            # HPO identity. Tuned rows already carry hpo_enabled/hpo_objective/
+            # hpo_variant per row; untuned panel runs get the fixed sentinels.
+            if not tune_on:
+                signals["hpo_enabled"]   = False
+                signals["hpo_objective"] = "-"
+                signals["hpo_variant"]   = "fixed"
             signals.to_parquet(out_path, index=False, engine="pyarrow")
 
             from .hyperparameter_tuning import summarize_hpo_columns
@@ -512,7 +538,12 @@ def run(*, horizon: str | None = None, set_id: str | None = None,
         C: float | None = None,
         dry_run: bool = False, force: bool = False,
         restart: bool = False,
-        feature_config: str | None = None) -> int:
+        feature_config: str | None = None,
+        tune_hyperparams: bool = False,
+        hpo_objective: str | None = None,
+        hpo_config: str | None = None,
+        hpo_grid_C: Sequence[float] | None = None,
+        hpo_class_weight: Sequence[str] | None = None) -> int:
     """Programmatic entry point mirroring :func:`main`."""
     argv: list[str] = []
     if horizon:
@@ -529,6 +560,16 @@ def run(*, horizon: str | None = None, set_id: str | None = None,
         argv += ["--C", str(C)]
     if feature_config:
         argv += ["--feature-config", feature_config]
+    if tune_hyperparams:
+        argv.append("--tune-hyperparams")
+    if hpo_objective:
+        argv += ["--hpo-objective", hpo_objective]
+    if hpo_config:
+        argv += ["--hpo-config", hpo_config]
+    if hpo_grid_C:
+        argv += ["--hpo-grid-C", *(str(c) for c in hpo_grid_C)]
+    if hpo_class_weight:
+        argv += ["--hpo-class-weight", *(str(c) for c in hpo_class_weight)]
     if dry_run:
         argv.append("--dry-run")
     if force:

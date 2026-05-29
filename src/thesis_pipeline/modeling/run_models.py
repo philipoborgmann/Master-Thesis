@@ -450,7 +450,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     # ── Resolve hyperparameter-tuning config (shared by both families) ──
-    from .hyperparameter_tuning import load_hpo_config
+    from .hyperparameter_tuning import hpo_variant_label, load_hpo_config
     hpo_cfg = load_hpo_config(
         enabled_override=True if getattr(args, "tune_hyperparams", False) else None,
         objective_override=getattr(args, "hpo_objective", None),
@@ -459,6 +459,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         config_path=getattr(args, "hpo_config", None),
     )
     tune_on = bool(hpo_cfg["enabled"])
+    hpo_variant = hpo_variant_label(tune_on, hpo_cfg["objective"])
 
     # ── Alternative model family: delegate to the panel-logit module ──
     # The per-asset logic below is unchanged; panel_logit is purely additive.
@@ -488,6 +489,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             outputs.append(resolve_path("signals_pattern",
                                         horizon=args.horizon, set_id=args.set_id))
         outputs.append(resolve_path("signals_metrics"))
+        # Example signal filename so the dry-run shows the (HPO-suffixed) name.
+        out_name_example = "(per set_id default)"
+        if args.set_id:
+            _sm = args.sentiment_model or "-"
+            _base = (f"{args.set_id}_{_sm}"
+                     if _sm and str(_sm) != "-" else str(args.set_id))
+            if tune_on:
+                _base = f"{_base}_{hpo_variant}"
+            out_name_example = f"Outputs/Signals/{args.horizon or '<horizon>'}/{_base}.parquet"
         log_stage_header(
             "run_models",
             mode="dry-run" if args.dry_run else ("smoke" if args.smoke else "full"),
@@ -502,6 +512,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "restart":         args.restart,
                 "force":           args.force,
                 "tune_hyperparams": tune_on,
+                "hpo_variant":     hpo_variant,
+                "output_name":     out_name_example,
                 "hpo_objective":   hpo_cfg["objective"] if tune_on else "(off)",
                 "hpo_C_grid":      hpo_cfg["search_space"].get("C") if tune_on else "(off)",
                 "hpo_class_weight_grid": (
@@ -575,30 +587,42 @@ def main(argv: Sequence[str] | None = None) -> int:
             label      = cfg_row.get("label", "")
             feat_str   = cfg_row["features"]
 
-            # File naming
+            # The rolling-probability benchmark has no hyperparameters, so it is
+            # never tuned (and never suffixed/overwritten under a tuning run).
+            is_benchmark = feat_str.strip() in ("__rolling_probability__",
+                                                "__majority_class__")
+
+            # File naming. Tuned (non-benchmark) runs get a variant suffix so
+            # they never overwrite the fixed-C parquet (and caching/restart
+            # keys on the variant-specific path).
             if sent_model and str(sent_model) != "-" and str(sent_model) != "nan":
                 out_name = f"{set_id}_{sent_model}"
             else:
                 out_name = str(set_id)
                 sent_model = "-"
+            if tune_on and not is_benchmark:
+                out_name = f"{out_name}_{hpo_variant}"
 
             out_path = os.path.join(hz_dir, f"{out_name}.parquet")
 
             # ── Checkpoint: skip if already computed ──────────
             if os.path.isfile(out_path) and not args.restart:
                 try:
+                    from .hyperparameter_tuning import summarize_hpo_columns
                     cached = pd.read_parquet(out_path)
                     m = compute_metrics(cached, "pooled")
                     m.update({"horizon": hz, "set_id": set_id,
                               "sentiment_model": sent_model, "label": label,
                               "category": category,
                               "n_tickers": cached["ticker"].nunique()})
+                    m.update(summarize_hpo_columns(cached))
                     all_metrics.append(m)
                     for tk, grp in cached.groupby("ticker"):
                         mt = compute_metrics(grp, tk)
                         mt.update({"horizon": hz, "set_id": set_id,
                                    "sentiment_model": sent_model, "label": label,
                                    "category": category, "n_tickers": 1})
+                        mt.update(summarize_hpo_columns(grp))
                         all_metrics.append(mt)
                     print(f"\n  ── {out_name} ({label}) "
                           f"→ CACHED acc={m['accuracy']:.4f}, n={m['n_obs']}")
@@ -609,7 +633,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"\n  ── {out_name} ({label}) ", end="", flush=True)
 
             # ── Benchmark: rolling probability ────────────────
-            if feat_str.strip() in ("__rolling_probability__", "__majority_class__"):
+            if is_benchmark:
+                # Rolling probability is not a tuned model; under --tune-hyperparams
+                # skip it so the fixed-C B1 parquet is never overwritten or
+                # mislabelled. The tuned families compare against the (tuned)
+                # logistic benchmark B2 instead, when present.
+                if tune_on:
+                    print("→ SKIP (rolling-probability benchmark is not tuned)")
+                    continue
                 all_signals = []
                 for tk in tickers:
                     df_t = df_all[df_all["ticker"] == tk]
@@ -622,6 +653,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     signals["set_id"] = set_id
                     signals["sentiment_model"] = sent_model
                     signals["horizon"] = hz
+                    # Fixed-C identity sentinels (rolling prob is never tuned).
+                    signals["hpo_enabled"] = False
+                    signals["hpo_objective"] = "-"
+                    signals["hpo_variant"] = "fixed"
                     signals.to_parquet(out_path, index=False, engine="pyarrow")
 
                     m = compute_metrics(signals, "pooled")
@@ -675,6 +710,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 signals["set_id"] = set_id
                 signals["sentiment_model"] = sent_model
                 signals["horizon"] = hz
+                # HPO identity columns. Tuned rows already carry per-row
+                # hpo_enabled/hpo_objective/hpo_variant from the walk-forward;
+                # untuned (fixed-C) runs get the explicit fixed sentinels so the
+                # evaluation can separate them without inspecting filenames.
+                if not tune_on:
+                    signals["hpo_enabled"] = False
+                    signals["hpo_objective"] = "-"
+                    signals["hpo_variant"] = "fixed"
                 signals.to_parquet(out_path, index=False, engine="pyarrow")
 
                 hpo_summary = summarize_hpo_columns(signals)
@@ -747,7 +790,14 @@ def run(*, horizon: str | None = None, set_id: str | None = None,
         smoke: bool = False, dry_run: bool = False,
         force: bool = False, restart: bool = False,
         C: float | None = None,
-        feature_config: str | None = None) -> int:
+        feature_config: str | None = None,
+        model_type: str = "per_asset",
+        panel_mode: str = "pooled",
+        tune_hyperparams: bool = False,
+        hpo_objective: str | None = None,
+        hpo_config: str | None = None,
+        hpo_grid_C: Sequence[float] | None = None,
+        hpo_class_weight: Sequence[str] | None = None) -> int:
     """Programmatic entry point. Translates keyword arguments to argv for
     :func:`main`. Prefer calling :func:`main` directly with an argv list."""
     argv: list[str] = []
@@ -763,6 +813,20 @@ def run(*, horizon: str | None = None, set_id: str | None = None,
         argv += ["--C", str(C)]
     if feature_config:
         argv += ["--feature-config", feature_config]
+    if model_type:
+        argv += ["--model-type", model_type]
+    if panel_mode:
+        argv += ["--panel-mode", panel_mode]
+    if tune_hyperparams:
+        argv.append("--tune-hyperparams")
+    if hpo_objective:
+        argv += ["--hpo-objective", hpo_objective]
+    if hpo_config:
+        argv += ["--hpo-config", hpo_config]
+    if hpo_grid_C:
+        argv += ["--hpo-grid-C", *(str(c) for c in hpo_grid_C)]
+    if hpo_class_weight:
+        argv += ["--hpo-class-weight", *(str(c) for c in hpo_class_weight)]
     if smoke:
         argv.append("--smoke")
     if dry_run:

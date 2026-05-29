@@ -55,8 +55,8 @@ CATEGORY_COLORS: dict[str, str] = {
 def build_leaderboard(pooled: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
     if pooled.empty:
         return pooled
-    cols = [c for c in ("horizon", "model_type", "panel_mode", "set_id",
-                        "category", "sentiment_model", "label",
+    cols = [c for c in ("horizon", "model_type", "panel_mode", "hpo_variant",
+                        "set_id", "category", "sentiment_model", "label",
                         "accuracy", "balanced_accuracy", "f1", "brier_score",
                         "log_loss", "n_obs", "n_tickers",
                         "mcnemar_pval_vs_b1", "significant_vs_b1",
@@ -106,6 +106,7 @@ def build_summary(pooled: pd.DataFrame,
                     "horizon": r["horizon"],
                     "model_type": r.get("model_type", "per_asset"),
                     "panel_mode": r.get("panel_mode", "-"),
+                    "hpo_variant": r.get("hpo_variant", "fixed"),
                     "set_id":  r["set_id"],
                     "sentiment_model": r["sentiment_model"],
                     "metric": "accuracy", "value": r["accuracy"],
@@ -156,6 +157,7 @@ def build_summary(pooled: pd.DataFrame,
                 "horizon": r["horizon"],
                 "model_type": r.get("model_type", "per_asset"),
                 "panel_mode": r.get("panel_mode", "-"),
+                "hpo_variant": r.get("hpo_variant", "fixed"),
                 "set_id": r["set_id"],
                 "sentiment_model": r.get("sentiment_model", "-"),
                 "metric": "accuracy", "value": float(r["accuracy"]),
@@ -173,6 +175,7 @@ def build_summary(pooled: pd.DataFrame,
                 "horizon": r["horizon"],
                 "model_type": r.get("model_type", "per_asset"),
                 "panel_mode": r.get("panel_mode", "-"),
+                "hpo_variant": r.get("hpo_variant", "fixed"),
                 "set_id": r["set_id"],
                 "sentiment_model": r.get("sentiment_model", "-"),
                 "metric": "accuracy", "value": float(r["accuracy"]),
@@ -193,6 +196,7 @@ def build_summary(pooled: pd.DataFrame,
                     "horizon": r["horizon"],
                     "model_type": r.get("model_type", "per_asset"),
                     "panel_mode": r.get("panel_mode", "-"),
+                    "hpo_variant": r.get("hpo_variant", "fixed"),
                     "set_id": r["set_id"],
                     "sentiment_model": r.get("sentiment_model", "-"),
                     "cost_bps": int(r["cost_bps"]),
@@ -208,6 +212,7 @@ def build_summary(pooled: pd.DataFrame,
                         "horizon": r["horizon"],
                         "model_type": r.get("model_type", "per_asset"),
                         "panel_mode": r.get("panel_mode", "-"),
+                        "hpo_variant": r.get("hpo_variant", "fixed"),
                         "set_id": r["set_id"],
                         "sentiment_model": r.get("sentiment_model", "-"),
                         "cost_bps": int(r["cost_bps"]),
@@ -225,6 +230,7 @@ def build_summary(pooled: pd.DataFrame,
                     "horizon":  r["horizon"],
                     "model_type": r.get("model_type", "per_asset"),
                     "panel_mode": r.get("panel_mode", "-"),
+                    "hpo_variant": r.get("hpo_variant", "fixed"),
                     "set_id": r["set_id"],
                     "sentiment_model": r.get("sentiment_model", "-"),
                     "threshold": float(r["threshold"]),
@@ -272,6 +278,7 @@ def build_summary(pooled: pd.DataFrame,
                     "horizon": r["horizon"],
                     "model_type": r.get("model_type", "per_asset"),
                     "panel_mode": r.get("panel_mode", "-"),
+                    "hpo_variant": r.get("hpo_variant", "fixed"),
                     "set_id": r["set_id"],
                     "sentiment_model": r.get("sentiment_model", "-"),
                     "benchmark": r.get("benchmark"),
@@ -315,6 +322,7 @@ def build_summary(pooled: pd.DataFrame,
                 "horizon": r["horizon"], "threshold": r["threshold"],
                 "model_type": r.get("model_type", "per_asset"),
                 "panel_mode": r.get("panel_mode", "-"),
+                "hpo_variant": r.get("hpo_variant", "fixed"),
                 "benchmark": r["benchmark"],
                 "set_id":    r["set_id"],
                 "sentiment_model": r.get("sentiment_model", "-"),
@@ -511,12 +519,22 @@ def print_console_summary(*,
         return
 
     def _fam(r) -> str:
-        """Compact ' [panel_logit/pooled]' tag; empty for the per-asset family."""
+        """Compact ' [model/mode/variant]' tag.
+
+        Shows the model family and the HPO variant. Empty only for the plain
+        per-asset, fixed-C family (the historical default) so untuned per-asset
+        rows print exactly as before; everything else is explicitly labelled,
+        e.g. ' [panel_logit/pooled]', ' [hpo_brier]', ' [panel_logit/pooled/hpo_brier]'.
+        """
         mt = str(r.get("model_type", "per_asset"))
         pm = str(r.get("panel_mode", "-"))
-        if mt == "per_asset":
-            return ""
-        return f" [{mt}/{pm}]" if pm and pm != "-" else f" [{mt}]"
+        hv = str(r.get("hpo_variant", "fixed"))
+        parts: list[str] = []
+        if mt != "per_asset":
+            parts.append(f"{mt}/{pm}" if pm and pm != "-" else mt)
+        if hv and hv not in ("fixed", "-"):
+            parts.append(hv)
+        return f" [{'/'.join(parts)}]" if parts else ""
 
     # Benchmark accuracy per horizon
     bench = pooled[pooled["set_id"] == "B1"][["horizon", "accuracy"]].sort_values("horizon")

@@ -34,9 +34,10 @@ SIGNIFICANCE_ALPHA = 0.05
 BENCHMARK_SET_ID = "B1"
 
 # Columns identifying a model family. Benchmark matching is confined to a
-# single family so a panel-logit model is never silently compared against a
-# per-asset benchmark.
-FAMILY_COLS = ["horizon", "model_type", "panel_mode"]
+# single family so a panel-logit (or HPO) model is never silently compared
+# against a per-asset / fixed-C benchmark. ``hpo_variant`` keeps fixed-C and
+# each tuned variant in separate families.
+FAMILY_COLS = ["horizon", "model_type", "panel_mode", "hpo_variant"]
 
 
 def _family_benchmark_frames(fam_grp: pd.DataFrame,
@@ -48,31 +49,36 @@ def _family_benchmark_frames(fam_grp: pd.DataFrame,
                              context: str = "mcnemar") -> dict[str, pd.DataFrame]:
     """Resolve the benchmark frames available *within one model family*.
 
-    ``fam_keys`` is the ``(horizon, model_type, panel_mode)`` tuple of the
-    family. By default a benchmark must live in the same family. With
-    ``allow_cross_model_benchmark=True`` a missing same-family benchmark falls
-    back to the per-asset benchmark of the same horizon. A benchmark that is
-    unavailable under either rule yields an empty frame (the caller skips that
-    comparison) and a single WARN is logged — never a silent cross-family mix.
+    ``fam_keys`` is the ``(horizon, model_type, panel_mode, hpo_variant)``
+    tuple of the family. By default a benchmark must live in the same family.
+    With ``allow_cross_model_benchmark=True`` a missing same-family benchmark
+    falls back to the per-asset benchmark of the same horizon **and the same
+    ``hpo_variant``** — fixed-C and HPO are never mixed, even under the opt-in.
+    A benchmark that is unavailable under either rule yields an empty frame
+    (the caller skips that comparison) and a single WARN is logged — never a
+    silent cross-family mix.
     """
     if not isinstance(fam_keys, tuple):
         fam_keys = (fam_keys,)
     horizon = fam_keys[0]
     model_type = fam_keys[1] if len(fam_keys) > 1 else "per_asset"
     panel_mode = fam_keys[2] if len(fam_keys) > 2 else "-"
+    hpo_variant = fam_keys[3] if len(fam_keys) > 3 else "fixed"
     frames: dict[str, pd.DataFrame] = {}
     for bid in benchmarks:
         bench = fam_grp[fam_grp["set_id"] == bid]
         if bench.empty and allow_cross_model_benchmark:
+            # Relax model_type / panel_mode only — never the HPO variant.
             bench = signals[(signals["horizon"] == horizon)
                             & (signals["set_id"] == bid)
-                            & (signals["model_type"] == "per_asset")]
+                            & (signals["model_type"] == "per_asset")
+                            & (signals.get("hpo_variant", "fixed") == hpo_variant)]
         if bench.empty:
             get_logger().warning(
                 "%s: no %s benchmark within family "
-                "(horizon=%s, model_type=%s, panel_mode=%s) — skipping that "
-                "comparison (allow_cross_model_benchmark=%s)",
-                context, bid, horizon, model_type, panel_mode,
+                "(horizon=%s, model_type=%s, panel_mode=%s, hpo_variant=%s) — "
+                "skipping that comparison (allow_cross_model_benchmark=%s)",
+                context, bid, horizon, model_type, panel_mode, hpo_variant,
                 allow_cross_model_benchmark,
             )
         frames[bid] = bench
@@ -192,7 +198,8 @@ def mcnemar_wide(mcnemar_long: pd.DataFrame,
     if mcnemar_long is None or mcnemar_long.empty:
         return pd.DataFrame()
     mcnemar_long = ensure_group_columns(mcnemar_long)
-    id_cols = ["horizon", "set_id", "sentiment_model", "model_type", "panel_mode"]
+    id_cols = ["horizon", "set_id", "sentiment_model", "model_type",
+               "panel_mode", "hpo_variant"]
     pieces = []
     for bid in benchmarks:
         sub = mcnemar_long[mcnemar_long["benchmark"] == bid].copy()
@@ -241,8 +248,8 @@ MIN_DISCORDANT_DEFAULT = 20
 
 _REGIME_FRONT_COLS = [
     # Identity
-    "regime_type", "horizon", "model_type", "panel_mode", "set_id", "category",
-    "sentiment_model",
+    "regime_type", "horizon", "model_type", "panel_mode", "hpo_variant",
+    "set_id", "category", "sentiment_model",
     "benchmark", "vol_regime", "mcap_regime", "interaction",
     # Direction + effect size up front so the table reads at a glance.
     "direction", "net_improvement", "abs_net_improvement",
@@ -383,6 +390,7 @@ def mcnemar_by_group(signals: pd.DataFrame,
                         "sentiment_model":  keys[2],
                         "model_type":       keys[3],
                         "panel_mode":       keys[4],
+                        "hpo_variant":      keys[5],
                         "category":         category,
                         "benchmark":        bid,
                         "direction":        direction,
@@ -594,8 +602,8 @@ def build_regime_mcnemar_summary(regime_mcnemar_df: pd.DataFrame) -> pd.DataFram
     input. Regime McNemar stays exploratory; interpret with the
     multiple-testing caveat in mind.
     """
-    cols = ["section", "horizon", "model_type", "panel_mode", "set_id",
-            "sentiment_model", "benchmark",
+    cols = ["section", "horizon", "model_type", "panel_mode", "hpo_variant",
+            "set_id", "sentiment_model", "benchmark",
             "regime_type", "mcap_regime", "vol_regime", "interaction",
             "direction", "net_improvement", "improvement_rate",
             "discordant_advantage", "n_matched", "discordant_n",

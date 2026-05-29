@@ -775,6 +775,7 @@ def buy_and_hold_benchmark(tickers: Iterable[str],
             # per-asset / panel-logit row and may be quoted across families.
             "model_type":      "benchmark",
             "panel_mode":      "-",
+            "hpo_variant":     "-",
             "category":        "benchmark",
             "label":           "equal-weight long-only buy & hold",
             "portfolio_mode":  "buy_and_hold",
@@ -794,16 +795,18 @@ def attach_benchmark_lifts(economic_df: pd.DataFrame,
     """Append sharpe_lift_vs_<bid> and cumulative_return_lift_vs_<bid> columns.
 
     The benchmark Sharpe / cumulative return are matched **within the same
-    model family** (horizon + cost_bps + model_type + panel_mode). A
-    panel-logit row is therefore lifted only against the panel-logit B1 / B2
-    rows of the same panel mode — never against the per-asset benchmark.
-    Rows with no same-family benchmark keep NaN lift columns rather than
-    crashing or silently borrowing another family's number.
+    model family** (horizon + cost_bps + model_type + panel_mode +
+    hpo_variant). A panel-logit row is therefore lifted only against the
+    panel-logit B1 / B2 rows of the same panel mode and HPO variant — fixed-C
+    and HPO are never mixed, nor per-asset and panel. Rows with no same-family
+    benchmark keep NaN lift columns rather than crashing or silently borrowing
+    another family's number. (BUY_HOLD is a separate global reference and is
+    not used here.)
     """
     if economic_df is None or economic_df.empty:
         return economic_df
     out = ensure_group_columns(economic_df).copy()
-    merge_keys = ["horizon", "cost_bps", "model_type", "panel_mode"]
+    merge_keys = ["horizon", "cost_bps", "model_type", "panel_mode", "hpo_variant"]
     for bid in benchmark_ids:
         bench = (out[out["set_id"] == bid]
                    [merge_keys + ["sharpe", "net_cumulative_simple_return"]]
