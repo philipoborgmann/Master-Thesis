@@ -26,7 +26,7 @@ from sklearn.metrics import (
 
 from ..logging_utils import get_logger
 from .metrics import GROUP_KEYS, FRONT_META, _front_order, _group_meta, ensure_group_columns
-from .significance import _family_benchmark_frames
+from .significance import FAMILY_COLS, _family_benchmark_frames
 
 DEFAULT_THRESHOLDS: tuple[float, ...] = (0.50, 0.55, 0.60, 0.65)
 
@@ -223,7 +223,7 @@ def threshold_lift_table(signals: pd.DataFrame,
     if signals.empty or "category" not in signals.columns:
         return pd.DataFrame()
     signals = ensure_group_columns(signals)
-    family_cols = ["horizon", "model_type", "panel_mode"]
+    family_cols = list(FAMILY_COLS)
     rows: list[dict] = []
     for fam_keys, fam_grp in signals.groupby(family_cols, dropna=False):
         bench_frames = _family_benchmark_frames(

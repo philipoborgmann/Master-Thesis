@@ -34,7 +34,14 @@ probability_clip:
   low:  1.0e-15
   high: 0.999999999999999      # 1 - 1e-15
 
-# Columns written to Outputs/Signals/<horizon>/<set_id>.parquet.
+# Columns written to Outputs/Signals/<horizon>/<set_id>[...].parquet.
+#
+# The first block is always written. ``model_type`` / ``panel_mode`` are
+# written by the panel-logit family (per-asset files default to "per_asset" /
+# "-" on read). The HPO block is written by every run: tuned runs carry the
+# real values; fixed-C runs carry the sentinels hpo_enabled=False,
+# hpo_objective="-", hpo_variant="fixed". best_C / best_class_weight /
+# hpo_score / hpo_status are present only on tuned (HPO) signal files.
 output_columns:
   - timestamp
   - ticker
@@ -43,6 +50,18 @@ output_columns:
   - probability
   - set_id
   - sentiment_model    # null/empty for benchmark and economic sets
+  # Model-family identity
+  - model_type         # per_asset | panel_logit | (benchmark for BUY_HOLD)
+  - panel_mode         # - | pooled | ticker_fixed_effects
+  # HPO identity (always written)
+  - hpo_enabled        # bool
+  - hpo_objective      # - | brier_score | log_loss | accuracy
+  - hpo_variant        # fixed | hpo_brier | hpo_logloss | hpo_accuracy
+  # HPO provenance (tuned files only)
+  - best_C
+  - best_class_weight
+  - hpo_score
+  - hpo_status
 
 # Hyperparameter tuning. Conservative, leakage-safe grid search nested inside
 # each walk-forward training window (see
@@ -71,6 +90,10 @@ hyperparameter_tuning:
       - 0.1
       - 1.0
       - 10.0
+    # Conservative default: regularisation strength only. class_weight is left
+    # at [null] because class_weight="balanced" can degrade probability
+    # calibration, and the default objective (Brier) cares about calibration.
+    # Add ``- balanced`` here (or pass --hpo-class-weight none balanced) to
+    # explore it.
     class_weight:
       - null
-      - balanced

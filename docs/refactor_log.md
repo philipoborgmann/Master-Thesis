@@ -133,6 +133,35 @@ fit-failure paths fall back to the default hyperparameters with a recorded
 `hpo_status`. New CLI flags on `run-models`: `--tune-hyperparams`,
 `--hpo-objective`, `--hpo-config`, `--hpo-grid-C`, `--hpo-class-weight`.
 
+## HPO variant separation (output naming + evaluation)
+
+Hardening pass so tuned runs never overwrite or get pooled with fixed-C runs:
+
+* **Filenames.** A tuned per-asset run writes
+  ``<set>[_<sent>]_hpo_{brier,logloss,accuracy}.parquet``; a tuned panel run
+  appends the same suffix after the mode tag, e.g.
+  ``C3_cryptobert_panel_pooled_hpo_brier.parquet`` /
+  ``..._panel_ticker_fe_hpo_brier.parquet``. Caching/restart and the dry-run
+  ``output_name`` all key on the variant-specific path, so the fixed-C parquet
+  is untouched. The rolling-probability benchmark (B1) has no hyperparameters
+  and is skipped under ``--tune-hyperparams`` (never suffixed/overwritten).
+* **Signal metadata.** Every signal file now carries ``hpo_enabled``,
+  ``hpo_objective`` and ``hpo_variant`` (fixed-C runs get
+  ``False`` / ``"-"`` / ``"fixed"``); tuned files additionally carry
+  ``best_C, best_class_weight, hpo_score, hpo_status``.
+* **Evaluation grouping.** ``GROUP_KEYS`` gained ``hpo_variant`` (after
+  ``model_type``/``panel_mode``), so fixed and each HPO variant are never
+  pooled. ``loading.py`` defaults old column-less files to
+  ``fixed`` / ``per_asset`` / ``-``.
+* **Benchmark families.** McNemar, threshold lift and economic benchmark lift
+  match benchmarks within the same horizon + model_type + panel_mode +
+  hpo_variant. No fixed↔HPO or per-asset↔panel mixing — even the
+  ``allow_cross_model_benchmark`` opt-in never crosses the HPO variant.
+  BUY_HOLD remains a separate global economic reference.
+* **Conservative default.** ``model_specs.yaml`` search space now defaults
+  ``class_weight: [null]`` (``balanced`` opt-in via config/CLI) since
+  ``balanced`` can hurt the Brier-calibrated probabilities.
+
 ## Things explicitly **not** changed
 
 - Target construction (`Create_Price_Features.py`).

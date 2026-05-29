@@ -13,22 +13,26 @@ import pandas as pd
 from ..modeling.run_models import compute_metrics
 
 # Group key used everywhere in this stage. ``model_type`` / ``panel_mode``
-# separate the canonical per-asset family from the panel-logit family so the
+# separate the canonical per-asset family from the panel-logit family;
+# ``hpo_variant`` additionally separates fixed-C runs ("fixed") from each
+# tuned variant ("hpo_brier" / "hpo_logloss" / "hpo_accuracy") so the
 # evaluation never pools signals that merely share (set_id, sentiment_model).
-GROUP_KEYS = ("horizon", "set_id", "sentiment_model", "model_type", "panel_mode")
+GROUP_KEYS = ("horizon", "set_id", "sentiment_model", "model_type",
+              "panel_mode", "hpo_variant")
 
 # Defaults for the model-family columns. Mirrors loading.META_DEFAULTS so that
 # frames built directly in tests (without going through the loader) still group
-# cleanly as the canonical per-asset family.
-GROUP_DEFAULTS = {"model_type": "per_asset", "panel_mode": "-"}
+# cleanly as the canonical per-asset, fixed-C family.
+GROUP_DEFAULTS = {"model_type": "per_asset", "panel_mode": "-",
+                  "hpo_variant": "fixed"}
 
 # Preferred leading column order for every table this stage emits.
-FRONT_META = ["horizon", "model_type", "panel_mode", "set_id", "category",
-              "sentiment_model", "label"]
+FRONT_META = ["horizon", "model_type", "panel_mode", "hpo_variant", "set_id",
+              "category", "sentiment_model", "label"]
 
 
 def ensure_group_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Guarantee ``model_type`` / ``panel_mode`` exist with sane defaults.
+    """Guarantee ``model_type`` / ``panel_mode`` / ``hpo_variant`` exist.
 
     Production frames already carry these (the loader fills them); this is a
     defensive shim so any frame grouped by :data:`GROUP_KEYS` — including the
