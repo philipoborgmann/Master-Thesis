@@ -75,6 +75,26 @@ def _add_run_models_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hpo-class-weight", "--hpo_class_weight",
                         dest="hpo_class_weight", nargs="+", default=None,
                         help="Override the class_weight grid (e.g. none balanced).")
+    # ── Checkpointing / resume ──────────────────────────────────
+    parser.add_argument("--checkpoint", dest="checkpoint",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Write per-ticker / per-chunk checkpoints so a "
+                             "crashed run can resume (default: on; --no-checkpoint "
+                             "restores the old behaviour).")
+    parser.add_argument("--resume", dest="resume",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Reuse existing checkpoints instead of recomputing "
+                             "(default: on).")
+    parser.add_argument("--checkpoint-dir", "--checkpoint_dir",
+                        dest="checkpoint_dir", default="Outputs/Checkpoints/Models",
+                        help="Root directory for model checkpoints.")
+    parser.add_argument("--checkpoint-chunk-size", "--checkpoint_chunk_size",
+                        dest="checkpoint_chunk_size", type=int, default=20,
+                        help="Number of panel test timestamps per checkpoint chunk.")
+    parser.add_argument("--clear-checkpoints", "--clear_checkpoints",
+                        dest="clear_checkpoints", action="store_true",
+                        help="Delete this run's checkpoint directory before "
+                             "starting (does not happen automatically on --restart).")
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +258,19 @@ def cmd_run_models(args: argparse.Namespace) -> int:
         argv += ["--hpo-grid-C", *(str(c) for c in args.hpo_grid_C)]
     if getattr(args, "hpo_class_weight", None):
         argv += ["--hpo-class-weight", *(str(c) for c in args.hpo_class_weight)]
+    # Checkpointing — forward only when diverging from the model defaults
+    # (checkpoint=True, resume=True) so run-stage / run-pipeline (which don't
+    # define these flags) keep the default behaviour.
+    if getattr(args, "checkpoint", True) is False:
+        argv.append("--no-checkpoint")
+    if getattr(args, "resume", True) is False:
+        argv.append("--no-resume")
+    if getattr(args, "checkpoint_dir", None):
+        argv += ["--checkpoint-dir", args.checkpoint_dir]
+    if getattr(args, "checkpoint_chunk_size", None) is not None:
+        argv += ["--checkpoint-chunk-size", str(args.checkpoint_chunk_size)]
+    if getattr(args, "clear_checkpoints", False):
+        argv.append("--clear-checkpoints")
     if args.smoke:
         argv.append("--smoke")
     if args.dry_run:

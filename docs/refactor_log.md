@@ -162,6 +162,39 @@ Hardening pass so tuned runs never overwrite or get pooled with fixed-C runs:
   ``class_weight: [null]`` (``balanced`` opt-in via config/CLI) since
   ``balanced`` can hurt the Brier-calibrated probabilities.
 
+## Model-run checkpointing (resume after crash)
+
+New module `src/thesis_pipeline/modeling/checkpointing.py` adds optional,
+resume-able intermediate checkpoints under
+`Outputs/Checkpoints/Models/{horizon}/{out_name}/` (gitignored). `out_name` is
+the variant-specific signal name, so fixed / HPO / panel-pooled / panel-ticker-FE
+runs never share a checkpoint directory.
+
+* **Per-asset** — one parquet per ticker (`tickers/{ticker}.parquet`). The
+  ticker loop in `run_models.main` (both the logistic and the rolling-probability
+  benchmark paths) saves each finished ticker and, on resume, reloads it instead
+  of recomputing.
+* **Panel-logit** — one parquet per *timestamp chunk*
+  (`chunks/chunk_NNNN.parquet`). `run_panel_walk_forward` gained a
+  `checkpoint_context` argument; the ordered test timestamps are split into
+  storage chunks of `--checkpoint-chunk-size`. A chunk is a storage partition
+  only — every τ still trains on all rows with `timestamp < τ`, so predictions
+  are byte-identical to a non-checkpointed run (regression-tested).
+* **Atomic writes** — every checkpoint and `manifest.json` is written to a
+  `*.tmp` sibling then `os.replace`-d in. Corrupt/unreadable checkpoints are
+  logged and recomputed, never fatal.
+* **Resume / restart / clear** — defaults: `checkpoint=true`, `resume=true`,
+  `checkpoint_dir=Outputs/Checkpoints/Models`, `checkpoint_chunk_size=20`,
+  `clear_checkpoints=false`. The final-signal-file cache is unchanged; with
+  `--restart` the final file is ignored but checkpoints are reused (rebuilding
+  the final file without recompute when complete). Checkpoints are deleted only
+  with `--clear-checkpoints` (which removes just this run's directory).
+* CLI/parser flags `--checkpoint/--no-checkpoint`, `--resume/--no-resume`,
+  `--checkpoint-dir`, `--checkpoint-chunk-size`, `--clear-checkpoints` were added
+  to `cli.run-models`, `run_models.build_parser`, `panel_logit.build_parser` and
+  both `run(...)` wrappers. `metrics_summary.csv` gains `checkpoint_enabled`,
+  `resumed_from_checkpoint`, `n_checkpoints_loaded`, `n_checkpoints_written`.
+
 ## Things explicitly **not** changed
 
 - Target construction (`Create_Price_Features.py`).

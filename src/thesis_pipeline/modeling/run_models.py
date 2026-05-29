@@ -55,6 +55,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 FINAL_DIR      = os.path.join("Data", "Final")
 FEATURE_CONFIG = "feature_sets.xlsx"
 SIGNAL_DIR     = os.path.join("Outputs", "Signals")
+CHECKPOINT_DIR = os.path.join("Outputs", "Checkpoints", "Models")
 
 HORIZONS       = ["1h", "6h", "1d"]
 
@@ -437,7 +438,110 @@ def build_parser() -> argparse.ArgumentParser:
                         dest="hpo_class_weight", nargs="+", default=None,
                         help="Override the class_weight grid, e.g. "
                              "--hpo-class-weight none balanced.")
+    # ── Checkpointing / resume ──────────────────────────────────
+    parser.add_argument("--checkpoint", dest="checkpoint",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Write per-ticker checkpoints so a crashed run can "
+                             "resume (default: on).")
+    parser.add_argument("--resume", dest="resume",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Reuse existing checkpoints (default: on).")
+    parser.add_argument("--checkpoint-dir", "--checkpoint_dir",
+                        dest="checkpoint_dir",
+                        default=CHECKPOINT_DIR,
+                        help="Root directory for model checkpoints.")
+    parser.add_argument("--checkpoint-chunk-size", "--checkpoint_chunk_size",
+                        dest="checkpoint_chunk_size", type=int, default=20,
+                        help="Panel test timestamps per checkpoint chunk.")
+    parser.add_argument("--clear-checkpoints", "--clear_checkpoints",
+                        dest="clear_checkpoints", action="store_true",
+                        help="Delete this run's checkpoint directory before start.")
     return parser
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PER-ASSET CHECKPOINTING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _ckpt_metric_cols(ckpt_on: bool, n_loaded: int, n_written: int) -> dict:
+    """Optional checkpoint-provenance columns for ``metrics_summary.csv``."""
+    return {
+        "checkpoint_enabled":      bool(ckpt_on),
+        "resumed_from_checkpoint": bool(n_loaded > 0),
+        "n_checkpoints_loaded":    int(n_loaded),
+        "n_checkpoints_written":   int(n_written),
+    }
+
+
+def _attach_per_asset_meta(sig: pd.DataFrame, *, set_id, sentiment_model,
+                           horizon, tune_on: bool) -> pd.DataFrame:
+    """Attach the per-asset identity columns to a single-ticker signal frame.
+
+    Mirrors the post-concat metadata so each ticker checkpoint is
+    self-describing and a final file rebuilt purely from checkpoints is
+    identical to a normal run. For tuned runs the per-row HPO columns are
+    already present (from ``run_walk_forward``); for fixed-C runs we stamp the
+    ``hpo_*`` sentinels here.
+    """
+    sig = sig.copy()
+    sig["set_id"] = set_id
+    sig["sentiment_model"] = sentiment_model
+    sig["horizon"] = horizon
+    if not tune_on:
+        sig["hpo_enabled"] = False
+        sig["hpo_objective"] = "-"
+        sig["hpo_variant"] = "fixed"
+    return sig
+
+
+def _checkpointed_ticker_loop(tickers, df_all, compute_fn, *,
+                              root, ckpt_on: bool, resume: bool,
+                              set_id, sentiment_model, horizon, tune_on: bool,
+                              manifest_base: dict | None = None):
+    """Run a per-ticker compute loop with optional resume-able checkpointing.
+
+    ``compute_fn(df_t)`` returns the raw signal frame for one ticker (e.g.
+    ``run_walk_forward`` or ``run_rolling_probability``). Returns
+    ``(all_signals, n_loaded, n_written)``.
+    """
+    from . import checkpointing as ckpt
+    all_signals: list[pd.DataFrame] = []
+    n_loaded = n_written = 0
+
+    manifest = None
+    if ckpt_on:
+        base = dict(manifest_base or {})
+        base["total_tickers"] = len(tickers)
+        manifest = ckpt.init_manifest(root, base=base)
+
+    for tk in tickers:
+        cp_path = ckpt.ticker_checkpoint_path(root, tk) if ckpt_on else None
+        if ckpt_on and resume and cp_path.exists():
+            cached = ckpt.load_checkpoint(cp_path)
+            if cached is not None and not cached.empty:
+                all_signals.append(cached)
+                n_loaded += 1
+                print(f"     {tk} → CACHED CHECKPOINT")
+                continue
+            # corrupt / empty → fall through and recompute
+
+        df_t = df_all[df_all["ticker"] == tk]
+        sig = compute_fn(df_t)
+        if sig is not None and not sig.empty:
+            sig = _attach_per_asset_meta(
+                sig, set_id=set_id, sentiment_model=sentiment_model,
+                horizon=horizon, tune_on=tune_on)
+            all_signals.append(sig)
+            if ckpt_on:
+                ckpt.save_checkpoint_atomic(sig, cp_path)
+                n_written += 1
+                manifest["completed_tickers"] = ckpt.list_completed_tickers(root)
+                ckpt.write_manifest(root, manifest)
+                print(f"     {tk} → computed + checkpointed")
+        else:
+            print(f"     {tk} → no signals")
+
+    return all_signals, n_loaded, n_written
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -476,10 +580,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.set_id:
             args.set_id = "B1"
 
+    # ── Checkpointing config ────────────────────────────────────
+    ckpt_on   = bool(getattr(args, "checkpoint", True))
+    resume    = bool(getattr(args, "resume", True))
+    ckpt_dir  = getattr(args, "checkpoint_dir", CHECKPOINT_DIR) or CHECKPOINT_DIR
+    clear_ckpt = bool(getattr(args, "clear_checkpoints", False))
+
     # ── Stage header (best-effort; never fails the run) ─────────
     try:
         from ..logging_utils import log_stage_header
         from ..config import resolve_path
+        from . import checkpointing as _ckpt
         inputs = []
         if args.horizon:
             inputs.append(resolve_path("final_features_pattern", horizon=args.horizon))
@@ -522,6 +633,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if tune_on else "(off)"),
                 "hpo_validation_fraction": (
                     hpo_cfg["validation_fraction"] if tune_on else "(off)"),
+                "checkpoint_enabled":     ckpt_on,
+                "resume":                 resume,
+                "checkpoint_dir":         ckpt_dir,
+                "checkpoint_chunk_size":  getattr(args, "checkpoint_chunk_size", 20),
+                "clear_checkpoints":      clear_ckpt,
+                "run_checkpoint_path": (
+                    str(_ckpt.checkpoint_root(
+                        ckpt_dir, args.horizon or "<horizon>",
+                        (out_name_example.split("/")[-1].replace(".parquet", "")
+                         if args.set_id else "<out_name>")))
+                    if ckpt_on else "(off)"),
             },
         )
     except Exception:  # noqa: BLE001 — logging is best-effort
@@ -641,29 +763,38 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if tune_on:
                     print("→ SKIP (rolling-probability benchmark is not tuned)")
                     continue
-                all_signals = []
-                for tk in tickers:
-                    df_t = df_all[df_all["ticker"] == tk]
-                    sig = run_rolling_probability(df_t)
-                    if not sig.empty:
-                        all_signals.append(sig)
+                print()
+                from . import checkpointing as ckpt
+                root = ckpt.checkpoint_root(ckpt_dir, hz, out_name)
+                if ckpt_on and clear_ckpt:
+                    ckpt.clear_run_checkpoints(root)
+                manifest_base = {
+                    "horizon": hz, "set_id": set_id, "sentiment_model": sent_model,
+                    "model_type": "per_asset", "panel_mode": "-",
+                    "hpo_variant": "fixed", "hpo_objective": "-",
+                    "feature_cols": ["__rolling_probability__"],
+                }
+                all_signals, n_loaded, n_written = _checkpointed_ticker_loop(
+                    tickers, df_all, run_rolling_probability,
+                    root=root, ckpt_on=ckpt_on, resume=resume,
+                    set_id=set_id, sentiment_model=sent_model, horizon=hz,
+                    tune_on=False, manifest_base=manifest_base,
+                )
 
                 if all_signals:
                     signals = pd.concat(all_signals, ignore_index=True)
-                    signals["set_id"] = set_id
-                    signals["sentiment_model"] = sent_model
-                    signals["horizon"] = hz
-                    # Fixed-C identity sentinels (rolling prob is never tuned).
-                    signals["hpo_enabled"] = False
-                    signals["hpo_objective"] = "-"
-                    signals["hpo_variant"] = "fixed"
                     signals.to_parquet(out_path, index=False, engine="pyarrow")
+                    if ckpt_on:
+                        mf = ckpt.load_manifest(root)
+                        mf["status"] = "complete"
+                        ckpt.write_manifest(root, mf)
 
                     m = compute_metrics(signals, "pooled")
                     m.update({"horizon": hz, "set_id": set_id,
                               "sentiment_model": sent_model, "label": label,
                               "category": category,
-                              "n_tickers": len(all_signals)})
+                              "n_tickers": signals["ticker"].nunique()})
+                    m.update(_ckpt_metric_cols(ckpt_on, n_loaded, n_written))
                     all_metrics.append(m)
                     for tk, grp in signals.groupby("ticker"):
                         mt = compute_metrics(grp, tk)
@@ -671,10 +802,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                                    "sentiment_model": sent_model, "label": label,
                                    "category": category, "n_tickers": 1})
                         all_metrics.append(mt)
-                    print(f"→ acc={m['accuracy']:.4f}, brier={m.get('brier_score', np.nan):.4f}, "
+                    print(f"  → acc={m['accuracy']:.4f}, brier={m.get('brier_score', np.nan):.4f}, "
                           f"n={m['n_obs']}")
                 else:
-                    print("→ no signals")
+                    print("  → no signals")
                 continue
 
             # ── Parse feature list ────────────────────────────
@@ -691,42 +822,51 @@ def main(argv: Sequence[str] | None = None) -> int:
                 })
                 continue
 
-            # ── Run per ticker ────────────────────────────────
+            # ── Run per ticker (with optional checkpointing) ──
+            print()
             t0 = time.time()
-            all_signals = []
-
-            for tk in tickers:
-                df_t = df_all[df_all["ticker"] == tk]
-                sig = run_walk_forward(df_t, feature_cols, C=args.C,
-                                       tune_hyperparams=tune_on, hpo_config=hpo_cfg)
-                if not sig.empty:
-                    all_signals.append(sig)
-
+            from . import checkpointing as ckpt
+            root = ckpt.checkpoint_root(ckpt_dir, hz, out_name)
+            if ckpt_on and clear_ckpt:
+                ckpt.clear_run_checkpoints(root)
+            manifest_base = {
+                "horizon": hz, "set_id": set_id, "sentiment_model": sent_model,
+                "model_type": "per_asset", "panel_mode": "-",
+                "hpo_variant": hpo_variant if tune_on else "fixed",
+                "hpo_objective": hpo_cfg["objective"] if tune_on else "-",
+                "feature_cols": feature_cols,
+            }
+            all_signals, n_loaded, n_written = _checkpointed_ticker_loop(
+                tickers, df_all,
+                lambda df_t: run_walk_forward(df_t, feature_cols, C=args.C,
+                                              tune_hyperparams=tune_on,
+                                              hpo_config=hpo_cfg),
+                root=root, ckpt_on=ckpt_on, resume=resume,
+                set_id=set_id, sentiment_model=sent_model, horizon=hz,
+                tune_on=tune_on, manifest_base=manifest_base,
+            )
             elapsed = time.time() - t0
 
             if all_signals:
                 from .hyperparameter_tuning import summarize_hpo_columns
+                # Per-ticker metadata is already attached by the checkpoint loop,
+                # so the concat (whether freshly computed or rebuilt purely from
+                # checkpoints) is the complete final signal frame.
                 signals = pd.concat(all_signals, ignore_index=True)
-                signals["set_id"] = set_id
-                signals["sentiment_model"] = sent_model
-                signals["horizon"] = hz
-                # HPO identity columns. Tuned rows already carry per-row
-                # hpo_enabled/hpo_objective/hpo_variant from the walk-forward;
-                # untuned (fixed-C) runs get the explicit fixed sentinels so the
-                # evaluation can separate them without inspecting filenames.
-                if not tune_on:
-                    signals["hpo_enabled"] = False
-                    signals["hpo_objective"] = "-"
-                    signals["hpo_variant"] = "fixed"
                 signals.to_parquet(out_path, index=False, engine="pyarrow")
+                if ckpt_on:
+                    mf = ckpt.load_manifest(root)
+                    mf["status"] = "complete"
+                    ckpt.write_manifest(root, mf)
 
                 hpo_summary = summarize_hpo_columns(signals)
                 m = compute_metrics(signals, "pooled")
                 m.update({"horizon": hz, "set_id": set_id,
                           "sentiment_model": sent_model, "label": label,
                           "category": category,
-                          "n_tickers": len(all_signals)})
+                          "n_tickers": signals["ticker"].nunique()})
                 m.update(hpo_summary)
+                m.update(_ckpt_metric_cols(ckpt_on, n_loaded, n_written))
                 all_metrics.append(m)
 
                 for tk, grp in signals.groupby("ticker"):
@@ -737,12 +877,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     mt.update(summarize_hpo_columns(grp))
                     all_metrics.append(mt)
 
-                print(f"→ acc={m['accuracy']:.4f}, "
+                print(f"  → acc={m['accuracy']:.4f}, "
                       f"f1={m['f1']:.4f}, "
                       f"brier={m.get('brier_score', np.nan):.4f}, "
-                      f"n={m['n_obs']}, {elapsed:.1f}s")
+                      f"n={m['n_obs']}, {elapsed:.1f}s "
+                      f"(ckpt loaded={n_loaded}, written={n_written})")
             else:
-                print(f"→ no signals ({elapsed:.1f}s)")
+                print(f"  → no signals ({elapsed:.1f}s)")
                 all_metrics.append({
                     "horizon": hz, "set_id": set_id, "sentiment_model": sent_model,
                     "label": label, "category": category, "ticker": "pooled",
@@ -797,7 +938,12 @@ def run(*, horizon: str | None = None, set_id: str | None = None,
         hpo_objective: str | None = None,
         hpo_config: str | None = None,
         hpo_grid_C: Sequence[float] | None = None,
-        hpo_class_weight: Sequence[str] | None = None) -> int:
+        hpo_class_weight: Sequence[str] | None = None,
+        checkpoint: bool = True,
+        resume: bool = True,
+        checkpoint_dir: str | None = None,
+        checkpoint_chunk_size: int | None = None,
+        clear_checkpoints: bool = False) -> int:
     """Programmatic entry point. Translates keyword arguments to argv for
     :func:`main`. Prefer calling :func:`main` directly with an argv list."""
     argv: list[str] = []
@@ -827,6 +973,16 @@ def run(*, horizon: str | None = None, set_id: str | None = None,
         argv += ["--hpo-grid-C", *(str(c) for c in hpo_grid_C)]
     if hpo_class_weight:
         argv += ["--hpo-class-weight", *(str(c) for c in hpo_class_weight)]
+    if not checkpoint:
+        argv.append("--no-checkpoint")
+    if not resume:
+        argv.append("--no-resume")
+    if checkpoint_dir:
+        argv += ["--checkpoint-dir", checkpoint_dir]
+    if checkpoint_chunk_size is not None:
+        argv += ["--checkpoint-chunk-size", str(checkpoint_chunk_size)]
+    if clear_checkpoints:
+        argv.append("--clear-checkpoints")
     if smoke:
         argv.append("--smoke")
     if dry_run:
