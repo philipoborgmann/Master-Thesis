@@ -151,7 +151,9 @@ def load_feature_sets(path: str) -> pd.DataFrame:
 
 def run_walk_forward(df_ticker: pd.DataFrame,
                      feature_cols: list[str],
-                     C: float = DEFAULT_C) -> pd.DataFrame:
+                     C: float = DEFAULT_C,
+                     tune_hyperparams: bool = False,
+                     hpo_config: dict | None = None) -> pd.DataFrame:
     """
     Expanding-window walk-forward validation for a single ticker.
 
@@ -162,7 +164,23 @@ def run_walk_forward(df_ticker: pd.DataFrame,
       4. Predict observation t
       5. Advance t by 1
 
-    Returns DataFrame with: timestamp, ticker, target, prediction, probability
+    Returns DataFrame with: timestamp, ticker, target, prediction, probability.
+
+    Hyperparameter tuning (``tune_hyperparams=True``)
+    -------------------------------------------------
+    When enabled, the fixed ``C`` is ignored. Instead, at every step the
+    current training window ``[0, t-1]`` is handed to
+    :func:`thesis_pipeline.modeling.hyperparameter_tuning.tune_logistic_hyperparams`,
+    which splits *that window* chronologically into inner-train / validation,
+    grid-searches the regularisation strength (and optional class weight), and
+    re-fits the best model on the full window before predicting step ``t``. The
+    test point ``t`` is never used for tuning or for fitting — there is no
+    lookahead leakage. Tuned rows carry extra provenance columns
+    (``hpo_enabled``, ``hpo_objective``, ``best_C``, ``best_class_weight``,
+    ``hpo_score``, ``hpo_status``).
+
+    When ``tune_hyperparams=False`` the behaviour is unchanged: the same fixed
+    ``C`` is used and no HPO columns are written.
     """
     df = df_ticker.sort_values("timestamp").reset_index(drop=True)
     n = len(df)
@@ -172,6 +190,14 @@ def run_walk_forward(df_ticker: pd.DataFrame,
     y_all = df["target"].values.astype(float)
     timestamps = df["timestamp"].values
     ticker = df["ticker"].iloc[0]
+
+    if tune_hyperparams:
+        from .hyperparameter_tuning import (
+            PER_ASSET, hpo_row_columns, predict_proba, tune_logistic_hyperparams,
+        )
+        hpo_config = hpo_config or {}
+        objective = hpo_config.get("objective", "brier_score")
+        search_space = hpo_config.get("search_space", {})
 
     results = []
 
@@ -190,6 +216,30 @@ def run_walk_forward(df_ticker: pd.DataFrame,
 
         # Need at least 20 observations and both classes
         if len(y_tr) < 20 or len(np.unique(y_tr)) < 2:
+            continue
+
+        if tune_hyperparams:
+            # Leakage-safe nested tuning on the training window only. The slice
+            # df.iloc[:t][valid_mask] is exactly the rows behind (X_tr, y_tr).
+            train_df = df.iloc[:t][valid_mask]
+            test_df  = df.iloc[t:t + 1]
+            res = tune_logistic_hyperparams(
+                train_df, feature_cols,
+                family=PER_ASSET, objective=objective,
+                search_space=search_space, hpo_cfg=hpo_config,
+            )
+            prob = float(predict_proba(res["artifacts"], test_df, feature_cols,
+                                       family=PER_ASSET)[0])
+            pred = int(prob >= 0.5)
+            row = {
+                "timestamp":   timestamps[t],
+                "ticker":      ticker,
+                "target":      int(y_all[t]),
+                "prediction":  pred,
+                "probability": prob,
+            }
+            row.update(hpo_row_columns(objective, res))
+            results.append(row)
             continue
 
         # ── Scale: fit on training only, transform test ───────
@@ -366,6 +416,27 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Reserved (no overwrite-protection currently); accepted for CLI uniformity.")
     parser.add_argument("--restart", action="store_true",
                         help="Ignore cached signal parquets and rerun every set.")
+    # ── Hyperparameter tuning (conservative, leakage-safe grid search) ──
+    parser.add_argument("--tune-hyperparams", "--tune_hyperparams",
+                        dest="tune_hyperparams", action="store_true",
+                        help="Enable nested grid-search HPO inside each "
+                             "walk-forward training window (overrides "
+                             "model_specs.yaml enabled).")
+    parser.add_argument("--hpo-objective", "--hpo_objective",
+                        dest="hpo_objective", default=None,
+                        choices=["brier_score", "log_loss", "accuracy"],
+                        help="HPO selection metric (default from model_specs.yaml).")
+    parser.add_argument("--hpo-config", "--hpo_config", dest="hpo_config",
+                        default=None,
+                        help="Path to a YAML holding a hyperparameter_tuning "
+                             "section (defaults to configs/model_specs.yaml).")
+    parser.add_argument("--hpo-grid-C", "--hpo_grid_C", dest="hpo_grid_C",
+                        type=float, nargs="+", default=None,
+                        help="Override the C search grid, e.g. --hpo-grid-C 0.01 0.1 1 10.")
+    parser.add_argument("--hpo-class-weight", "--hpo_class_weight",
+                        dest="hpo_class_weight", nargs="+", default=None,
+                        help="Override the class_weight grid, e.g. "
+                             "--hpo-class-weight none balanced.")
     return parser
 
 
@@ -378,11 +449,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     and the package CLI. Returns 0 on success."""
     args = build_parser().parse_args(argv)
 
+    # ── Resolve hyperparameter-tuning config (shared by both families) ──
+    from .hyperparameter_tuning import load_hpo_config
+    hpo_cfg = load_hpo_config(
+        enabled_override=True if getattr(args, "tune_hyperparams", False) else None,
+        objective_override=getattr(args, "hpo_objective", None),
+        c_grid=getattr(args, "hpo_grid_C", None),
+        class_weight_grid=getattr(args, "hpo_class_weight", None),
+        config_path=getattr(args, "hpo_config", None),
+    )
+    tune_on = bool(hpo_cfg["enabled"])
+
     # ── Alternative model family: delegate to the panel-logit module ──
     # The per-asset logic below is unchanged; panel_logit is purely additive.
     if getattr(args, "model_type", "per_asset") == "panel_logit":
         from .panel_logit import _run_panel
-        return _run_panel(args)
+        return _run_panel(args, hpo_cfg=hpo_cfg)
 
     # ── Smoke defaults ──────────────────────────────────────────
     if args.smoke:
@@ -419,6 +501,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "C":               args.C,
                 "restart":         args.restart,
                 "force":           args.force,
+                "tune_hyperparams": tune_on,
+                "hpo_objective":   hpo_cfg["objective"] if tune_on else "(off)",
+                "hpo_C_grid":      hpo_cfg["search_space"].get("C") if tune_on else "(off)",
+                "hpo_class_weight_grid": (
+                    [("none" if c is None else c)
+                     for c in hpo_cfg["search_space"].get("class_weight", [])]
+                    if tune_on else "(off)"),
+                "hpo_validation_fraction": (
+                    hpo_cfg["validation_fraction"] if tune_on else "(off)"),
             },
         )
     except Exception:  # noqa: BLE001 — logging is best-effort
@@ -466,7 +557,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             wanted = set(args.coins)
             tickers = [t for t in tickers if t in wanted]
         print(f"  Tickers: {len(tickers)} — {', '.join(tickers)}")
-        print(f"  Model: LogisticRegression(L2, C={args.C})")
+        if tune_on:
+            print(f"  Model: LogisticRegression(L2) + grid-search HPO "
+                  f"(objective={hpo_cfg['objective']}, "
+                  f"C grid={hpo_cfg['search_space'].get('C')})")
+        else:
+            print(f"  Model: LogisticRegression(L2, C={args.C})")
         print(f"  Initial train split: {INIT_TRAIN_FRAC:.0%}")
 
         hz_dir = os.path.join(SIGNAL_DIR, hz)
@@ -566,24 +662,28 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             for tk in tickers:
                 df_t = df_all[df_all["ticker"] == tk]
-                sig = run_walk_forward(df_t, feature_cols, C=args.C)
+                sig = run_walk_forward(df_t, feature_cols, C=args.C,
+                                       tune_hyperparams=tune_on, hpo_config=hpo_cfg)
                 if not sig.empty:
                     all_signals.append(sig)
 
             elapsed = time.time() - t0
 
             if all_signals:
+                from .hyperparameter_tuning import summarize_hpo_columns
                 signals = pd.concat(all_signals, ignore_index=True)
                 signals["set_id"] = set_id
                 signals["sentiment_model"] = sent_model
                 signals["horizon"] = hz
                 signals.to_parquet(out_path, index=False, engine="pyarrow")
 
+                hpo_summary = summarize_hpo_columns(signals)
                 m = compute_metrics(signals, "pooled")
                 m.update({"horizon": hz, "set_id": set_id,
                           "sentiment_model": sent_model, "label": label,
                           "category": category,
                           "n_tickers": len(all_signals)})
+                m.update(hpo_summary)
                 all_metrics.append(m)
 
                 for tk, grp in signals.groupby("ticker"):
@@ -591,6 +691,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     mt.update({"horizon": hz, "set_id": set_id,
                                "sentiment_model": sent_model, "label": label,
                                "category": category, "n_tickers": 1})
+                    mt.update(summarize_hpo_columns(grp))
                     all_metrics.append(mt)
 
                 print(f"→ acc={m['accuracy']:.4f}, "

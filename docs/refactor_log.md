@@ -103,6 +103,36 @@ No other lines in the root scripts were modified.
    read. When any output is regenerated from the new package, write
    `row_id` directly.
 
+## Hyperparameter tuning (conservative, leakage-safe; opt-in)
+
+Added `src/thesis_pipeline/modeling/hyperparameter_tuning.py` — a single grid
+search shared by all three families (`per_asset`, `panel_logit/pooled`,
+`panel_logit/ticker_fixed_effects`). It is **nested inside the walk-forward
+training window**: at every step the current training window is split
+*chronologically* (most-recent `validation_fraction` = validation), candidates
+are scored on the validation block, and the best params are re-fit on the full
+window before predicting the test point. The test point / timestamp is never
+used for tuning or fitting — no lookahead leakage. Per-asset splits by row
+order; panel splits along **unique timestamps** so whole cross-sections stay
+together. Ticker dummies for inner-train / validation / final fit are rebuilt
+leakage-safely, exactly mirroring the untuned panel design matrix.
+
+Objectives: `brier_score` (default, since probabilities feed thresholds and the
+backtest), `log_loss`, `accuracy`. Search space and toggles live in
+`configs/model_specs.yaml :: hyperparameter_tuning` (default `enabled: false`).
+Grid search is deliberate — the space is tiny and a deterministic, exhaustive
+sweep is reproducible (no RNG).
+
+**Backward compatibility:** with tuning disabled the modelling behaviour is
+byte-for-byte identical to the pinned `C=1.0` estimator and no `hpo_*` columns
+are written. When enabled (`--tune-hyperparams`), signal parquets gain
+`hpo_enabled, hpo_objective, best_C, best_class_weight, hpo_score, hpo_status`
+and `metrics_summary.csv` gains `hpo_enabled, hpo_objective, best_C_median,
+best_C_mode, best_class_weight_mode, hpo_status_counts`. Insufficient-data and
+fit-failure paths fall back to the default hyperparameters with a recorded
+`hpo_status`. New CLI flags on `run-models`: `--tune-hyperparams`,
+`--hpo-objective`, `--hpo-config`, `--hpo-grid-C`, `--hpo-class-weight`.
+
 ## Things explicitly **not** changed
 
 - Target construction (`Create_Price_Features.py`).

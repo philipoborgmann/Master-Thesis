@@ -183,6 +183,16 @@ def cmd_run_models(args: argparse.Namespace) -> int:
         argv += ["--model-type", args.model_type]
     if getattr(args, "panel_mode", None):
         argv += ["--panel-mode", args.panel_mode]
+    if getattr(args, "tune_hyperparams", False):
+        argv.append("--tune-hyperparams")
+    if getattr(args, "hpo_objective", None):
+        argv += ["--hpo-objective", args.hpo_objective]
+    if getattr(args, "hpo_config", None):
+        argv += ["--hpo-config", args.hpo_config]
+    if getattr(args, "hpo_grid_C", None):
+        argv += ["--hpo-grid-C", *(str(c) for c in args.hpo_grid_C)]
+    if getattr(args, "hpo_class_weight", None):
+        argv += ["--hpo-class-weight", *(str(c) for c in args.hpo_class_weight)]
     if args.smoke:
         argv.append("--smoke")
     if args.dry_run:
@@ -366,6 +376,20 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Panel variant (only with --model-type panel_logit).")
     sp.add_argument("--restart", action="store_true",
                     help="Ignore cached signal parquets and rerun every set.")
+    sp.add_argument("--tune-hyperparams", dest="tune_hyperparams",
+                    action="store_true",
+                    help="Enable conservative, leakage-safe grid-search HPO "
+                         "inside each walk-forward training window.")
+    sp.add_argument("--hpo-objective", dest="hpo_objective", default=None,
+                    choices=["brier_score", "log_loss", "accuracy"],
+                    help="HPO selection metric (default: model_specs.yaml).")
+    sp.add_argument("--hpo-config", dest="hpo_config", default=None,
+                    help="Path to a YAML with a hyperparameter_tuning section.")
+    sp.add_argument("--hpo-grid-C", dest="hpo_grid_C", type=float, nargs="+",
+                    default=None, help="Override the C search grid.")
+    sp.add_argument("--hpo-class-weight", dest="hpo_class_weight", nargs="+",
+                    default=None, help="Override the class_weight grid "
+                                       "(e.g. none balanced).")
     _add_common(sp)
     sp.set_defaults(func=cmd_run_models)
 

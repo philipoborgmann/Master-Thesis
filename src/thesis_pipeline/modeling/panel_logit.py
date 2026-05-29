@@ -126,11 +126,25 @@ def run_panel_walk_forward(df: pd.DataFrame,
                            panel_mode: str = "pooled",
                            init_train_frac: float = INIT_TRAIN_FRAC,
                            min_init_timestamps: int = MIN_INIT_TIMESTAMPS,
-                           min_train_obs: int = MIN_TRAIN_OBS) -> pd.DataFrame:
+                           min_train_obs: int = MIN_TRAIN_OBS,
+                           tune_hyperparams: bool = False,
+                           hpo_config: dict | None = None) -> pd.DataFrame:
     """Expanding-window pooled panel logit over all coins.
 
     Returns a signal frame with columns:
     ``timestamp, ticker, target, prediction, probability``.
+
+    Hyperparameter tuning (``tune_hyperparams=True``)
+    -------------------------------------------------
+    When enabled, the fixed ``C`` is ignored. For each test timestamp ``τ`` the
+    training panel ``timestamp < τ`` is split chronologically along its
+    **unique timestamps** into inner-train / validation (never along raw
+    observation rows), the regularisation strength / class weight are grid
+    searched, and the best model is re-fit on the full training panel before
+    predicting every coin at ``τ``. For ``ticker_fixed_effects`` the dummies
+    are rebuilt leakage-safely for inner-train, validation and the final fit
+    exactly as the untuned panel design matrix does. ``τ`` is never used for
+    tuning or fitting. Tuned rows carry ``hpo_*`` provenance columns.
     """
     if panel_mode not in PANEL_MODES:
         raise ValueError(f"Unknown panel_mode {panel_mode!r}; expected one of {PANEL_MODES}")
@@ -140,6 +154,14 @@ def run_panel_walk_forward(df: pd.DataFrame,
     n_ts = len(unique_ts)
     if n_ts == 0:
         return pd.DataFrame()
+
+    if tune_hyperparams:
+        from .hyperparameter_tuning import (
+            PANEL, hpo_row_columns, predict_proba, tune_logistic_hyperparams,
+        )
+        hpo_config = hpo_config or {}
+        objective = hpo_config.get("objective", "brier_score")
+        search_space = hpo_config.get("search_space", {})
 
     init_idx = max(int(n_ts * init_train_frac), min_init_timestamps)
     results: list[dict] = []
@@ -157,6 +179,31 @@ def run_panel_walk_forward(df: pd.DataFrame,
                 or test_df.empty):
             continue
 
+        test_df = test_df.reset_index(drop=True)
+
+        if tune_hyperparams:
+            res = tune_logistic_hyperparams(
+                train_df, feature_cols,
+                family=PANEL, objective=objective,
+                search_space=search_space, hpo_cfg=hpo_config,
+                panel_mode=panel_mode,
+            )
+            proba = predict_proba(res["artifacts"], test_df, feature_cols,
+                                  family=PANEL, panel_mode=panel_mode)
+            preds = (proba >= 0.5).astype(int)
+            hpo_cols = hpo_row_columns(objective, res)
+            for j in range(len(test_df)):
+                row = {
+                    "timestamp":   test_df.loc[j, "timestamp"],
+                    "ticker":      test_df.loc[j, "ticker"],
+                    "target":      int(test_df.loc[j, "target"]),
+                    "prediction":  int(preds[j]),
+                    "probability": float(proba[j]),
+                }
+                row.update(hpo_cols)
+                results.append(row)
+            continue
+
         X_tr, y_tr, X_te = build_panel_design_matrix(
             train_df, test_df, feature_cols, panel_mode,
         )
@@ -167,7 +214,6 @@ def run_panel_walk_forward(df: pd.DataFrame,
         preds = model.predict(X_te).astype(int)
         proba = model.predict_proba(X_te)[:, 1]
 
-        test_df = test_df.reset_index(drop=True)
         for j in range(len(test_df)):
             results.append({
                 "timestamp":   test_df.loc[j, "timestamp"],
@@ -186,14 +232,18 @@ def run_panel_model_for_feature_set(df_all: pd.DataFrame,
                                     feature_cols: list[str],
                                     tickers: Sequence[str] | None,
                                     C: float = DEFAULT_C,
-                                    panel_mode: str = "pooled") -> pd.DataFrame:
+                                    panel_mode: str = "pooled",
+                                    tune_hyperparams: bool = False,
+                                    hpo_config: dict | None = None) -> pd.DataFrame:
     """Filter to ``tickers`` (if given) and run the panel walk-forward."""
     df = df_all
     if tickers:
         df = df[df["ticker"].isin(set(tickers))]
     if df.empty:
         return pd.DataFrame()
-    return run_panel_walk_forward(df, feature_cols, C=C, panel_mode=panel_mode)
+    return run_panel_walk_forward(df, feature_cols, C=C, panel_mode=panel_mode,
+                                  tune_hyperparams=tune_hyperparams,
+                                  hpo_config=hpo_config)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -232,15 +282,44 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--panel-mode", "--panel_mode", dest="panel_mode",
                         default="pooled", choices=list(PANEL_MODES))
     parser.add_argument("--C", type=float, default=DEFAULT_C)
+    parser.add_argument("--tune-hyperparams", "--tune_hyperparams",
+                        dest="tune_hyperparams", action="store_true",
+                        help="Enable nested grid-search HPO inside each "
+                             "panel training window.")
+    parser.add_argument("--hpo-objective", "--hpo_objective",
+                        dest="hpo_objective", default=None,
+                        choices=["brier_score", "log_loss", "accuracy"])
+    parser.add_argument("--hpo-config", "--hpo_config", dest="hpo_config",
+                        default=None)
+    parser.add_argument("--hpo-grid-C", "--hpo_grid_C", dest="hpo_grid_C",
+                        type=float, nargs="+", default=None)
+    parser.add_argument("--hpo-class-weight", "--hpo_class_weight",
+                        dest="hpo_class_weight", nargs="+", default=None)
     parser.add_argument("--dry-run", "--dry_run", dest="dry_run", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--restart", action="store_true")
     return parser
 
 
-def _run_panel(args: argparse.Namespace) -> int:
-    """Shared body used by both :func:`main` and the run-models delegation."""
+def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
+    """Shared body used by both :func:`main` and the run-models delegation.
+
+    ``hpo_cfg`` is the resolved hyperparameter-tuning config. When ``None``
+    (standalone ``python -m ...panel_logit`` invocation) it is resolved here
+    from the CLI flags + ``configs/model_specs.yaml``.
+    """
     panel_mode = getattr(args, "panel_mode", "pooled") or "pooled"
+
+    if hpo_cfg is None:
+        from .hyperparameter_tuning import load_hpo_config
+        hpo_cfg = load_hpo_config(
+            enabled_override=True if getattr(args, "tune_hyperparams", False) else None,
+            objective_override=getattr(args, "hpo_objective", None),
+            c_grid=getattr(args, "hpo_grid_C", None),
+            class_weight_grid=getattr(args, "hpo_class_weight", None),
+            config_path=getattr(args, "hpo_config", None),
+        )
+    tune_on = bool(hpo_cfg["enabled"])
 
     if getattr(args, "dry_run", False):
         try:
@@ -259,6 +338,15 @@ def _run_panel(args: argparse.Namespace) -> int:
                     "set_id":     args.set_id or "(all)",
                     "coins":      list(args.coins) if args.coins else "(all)",
                     "C":          args.C,
+                    "tune_hyperparams": tune_on,
+                    "hpo_objective":   hpo_cfg["objective"] if tune_on else "(off)",
+                    "hpo_C_grid":      hpo_cfg["search_space"].get("C") if tune_on else "(off)",
+                    "hpo_class_weight_grid": (
+                        [("none" if c is None else c)
+                         for c in hpo_cfg["search_space"].get("class_weight", [])]
+                        if tune_on else "(off)"),
+                    "hpo_validation_fraction": (
+                        hpo_cfg["validation_fraction"] if tune_on else "(off)"),
                 },
             )
         except Exception:  # noqa: BLE001
@@ -352,6 +440,7 @@ def _run_panel(args: argparse.Namespace) -> int:
             t0 = time.time()
             signals = run_panel_model_for_feature_set(
                 df_all, feature_cols, tickers, C=args.C, panel_mode=panel_mode,
+                tune_hyperparams=tune_on, hpo_config=hpo_cfg,
             )
             elapsed = time.time() - t0
 
@@ -372,12 +461,15 @@ def _run_panel(args: argparse.Namespace) -> int:
             signals["panel_mode"]      = panel_mode
             signals.to_parquet(out_path, index=False, engine="pyarrow")
 
+            from .hyperparameter_tuning import summarize_hpo_columns
+            hpo_summary = summarize_hpo_columns(signals)
             m = compute_metrics(signals, "pooled")
             m.update({"horizon": hz, "set_id": set_id,
                       "sentiment_model": sent_model, "label": label,
                       "category": category,
                       "n_tickers": signals["ticker"].nunique(),
                       "model_type": MODEL_TYPE, "panel_mode": panel_mode})
+            m.update(hpo_summary)
             all_metrics.append(m)
             for tk, grp in signals.groupby("ticker"):
                 mt = compute_metrics(grp, tk)
@@ -385,6 +477,7 @@ def _run_panel(args: argparse.Namespace) -> int:
                            "sentiment_model": sent_model, "label": label,
                            "category": category, "n_tickers": 1,
                            "model_type": MODEL_TYPE, "panel_mode": panel_mode})
+                mt.update(summarize_hpo_columns(grp))
                 all_metrics.append(mt)
             print(f"→ acc={m['accuracy']:.4f}, f1={m['f1']:.4f}, "
                   f"brier={m.get('brier_score', np.nan):.4f}, "
