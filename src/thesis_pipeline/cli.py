@@ -32,6 +32,51 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
                         help="Allow overwriting full production outputs in non-smoke runs.")
 
 
+def _add_run_models_args(parser: argparse.ArgumentParser) -> None:
+    """Add the run-models argument surface.
+
+    Single source of truth for the ``run-models`` subcommand so the CLI can
+    never drift out of sync with ``modeling.run_models.build_parser``. Every
+    flag accepts both the dashed and underscored spelling (matching the
+    underlying model parsers), so e.g. ``--sentiment-model`` and
+    ``--sentiment_model`` are both recognised and bound to ``sentiment_model``.
+    """
+    parser.add_argument("--horizon", default=None)
+    parser.add_argument("--set-id", "--set_id", dest="set_id", default=None)
+    parser.add_argument("--coins", "--coin", "--ticker",
+                        dest="coins", nargs="*")
+    parser.add_argument("--sentiment-model", "--sentiment_model",
+                        dest="sentiment_model", default=None,
+                        choices=[None, "vader", "finbert", "cryptobert"])
+    parser.add_argument("--model-type", "--model_type", dest="model_type",
+                        default="per_asset",
+                        choices=["per_asset", "panel_logit"],
+                        help="per_asset (default) or panel_logit.")
+    parser.add_argument("--panel-mode", "--panel_mode", dest="panel_mode",
+                        default="pooled",
+                        choices=["pooled", "ticker_fixed_effects"],
+                        help="Panel variant (only with --model-type panel_logit).")
+    parser.add_argument("--restart", action="store_true",
+                        help="Ignore cached signal parquets and rerun every set.")
+    parser.add_argument("--tune-hyperparams", "--tune_hyperparams",
+                        dest="tune_hyperparams", action="store_true",
+                        help="Enable conservative, leakage-safe grid-search HPO "
+                             "inside each walk-forward training window.")
+    parser.add_argument("--hpo-objective", "--hpo_objective",
+                        dest="hpo_objective", default=None,
+                        choices=["brier_score", "log_loss", "accuracy"],
+                        help="HPO selection metric (default: model_specs.yaml).")
+    parser.add_argument("--hpo-config", "--hpo_config", dest="hpo_config",
+                        default=None,
+                        help="Path to a YAML with a hyperparameter_tuning section.")
+    parser.add_argument("--hpo-grid-C", "--hpo_grid_C", dest="hpo_grid_C",
+                        type=float, nargs="+", default=None,
+                        help="Override the C search grid.")
+    parser.add_argument("--hpo-class-weight", "--hpo_class_weight",
+                        dest="hpo_class_weight", nargs="+", default=None,
+                        help="Override the class_weight grid (e.g. none balanced).")
+
+
 # ---------------------------------------------------------------------------
 # Helper: log a stage plan and short-circuit on --dry-run.
 #
@@ -363,33 +408,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # run-models
     sp = sub.add_parser("run-models", help="Run walk-forward models.")
-    sp.add_argument("--horizon", default=None)
-    sp.add_argument("--set-id", dest="set_id", default=None)
-    sp.add_argument("--coins", nargs="*")
-    sp.add_argument("--sentiment-model", dest="sentiment_model", default=None,
-                    choices=[None, "vader", "finbert", "cryptobert"])
-    sp.add_argument("--model-type", dest="model_type", default="per_asset",
-                    choices=["per_asset", "panel_logit"],
-                    help="per_asset (default) or panel_logit.")
-    sp.add_argument("--panel-mode", dest="panel_mode", default="pooled",
-                    choices=["pooled", "ticker_fixed_effects"],
-                    help="Panel variant (only with --model-type panel_logit).")
-    sp.add_argument("--restart", action="store_true",
-                    help="Ignore cached signal parquets and rerun every set.")
-    sp.add_argument("--tune-hyperparams", dest="tune_hyperparams",
-                    action="store_true",
-                    help="Enable conservative, leakage-safe grid-search HPO "
-                         "inside each walk-forward training window.")
-    sp.add_argument("--hpo-objective", dest="hpo_objective", default=None,
-                    choices=["brier_score", "log_loss", "accuracy"],
-                    help="HPO selection metric (default: model_specs.yaml).")
-    sp.add_argument("--hpo-config", dest="hpo_config", default=None,
-                    help="Path to a YAML with a hyperparameter_tuning section.")
-    sp.add_argument("--hpo-grid-C", dest="hpo_grid_C", type=float, nargs="+",
-                    default=None, help="Override the C search grid.")
-    sp.add_argument("--hpo-class-weight", dest="hpo_class_weight", nargs="+",
-                    default=None, help="Override the class_weight grid "
-                                       "(e.g. none balanced).")
+    _add_run_models_args(sp)
     _add_common(sp)
     sp.set_defaults(func=cmd_run_models)
 
