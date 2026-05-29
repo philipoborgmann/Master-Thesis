@@ -44,6 +44,33 @@ output_columns:
   - set_id
   - sentiment_model    # null/empty for benchmark and economic sets
 
-# Hyperparameter search: intentionally none. The thesis pins C=1.0 and
-# random_state=42 to keep the walk-forward identical across runs.
-hyperparameter_tuning: false
+# Hyperparameter tuning. Conservative, leakage-safe grid search nested inside
+# each walk-forward training window (see
+# src/thesis_pipeline/modeling/hyperparameter_tuning.py).
+#
+# Default `enabled: false` so existing results stay reproducible — when
+# disabled the modelling behaviour is byte-for-byte identical to the pinned
+# C=1.0 estimator. `--tune-hyperparams` overrides `enabled` at runtime.
+#
+# Objectives: brier_score (default), log_loss, accuracy.
+#   brier_score → minimize, log_loss → minimize, accuracy → maximize.
+# Brier is the default because the predicted probabilities are reused for
+# threshold analysis and the economic backtest, so calibration matters.
+hyperparameter_tuning:
+  enabled: false
+  method: grid
+  objective: brier_score
+  validation_fraction: 0.2     # most-recent 20% of the train window = validation
+  min_train_obs: 60            # fall back to defaults below this inner-train size
+  min_validation_obs: 20       # fall back to defaults below this validation size
+  refit_on_full_train: true    # refit best params on the full window before predicting
+
+  search_space:
+    C:
+      - 0.01
+      - 0.1
+      - 1.0
+      - 10.0
+    class_weight:
+      - null
+      - balanced
