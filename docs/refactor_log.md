@@ -195,6 +195,37 @@ runs never share a checkpoint directory.
   both `run(...)` wrappers. `metrics_summary.csv` gains `checkpoint_enabled`,
   `resumed_from_checkpoint`, `n_checkpoints_loaded`, `n_checkpoints_written`.
 
+## Stationarity & descriptive statistics on the full final feature set
+
+New shared helper `src/thesis_pipeline/features/final_feature_utils.py`:
+loads `Data/Final/features_{horizon}.parquet`, resolves the modelling feature
+universe from `feature_sets.xlsx` (with `{model}` expansion to vader / finbert
+/ cryptobert), classifies features into `price / volatility / volume /
+market_cap / sentiment / other`, finds matching `*_post_count` columns, and
+detects structurally-empty sentiment rows (neutral value with zero posts).
+Falls back to numeric columns when the registry is unavailable.
+
+`src/thesis_pipeline/sentiment/stationarity.py` gained a `--source {final,
+sentiment}` switch (default `final`). Under `--source final` the full
+modelling feature universe is tested for all three horizons and the results
+land as CSVs under `Data/Features/stationarity_final/`:
+`stationarity_final_records.csv`, `..._summary.csv`,
+`..._panel_cips.csv`, `..._fold_stability.csv`,
+`..._feature_resolution.csv`. The legacy sentiment-only behaviour is reachable
+via `--source sentiment`.
+
+New `src/thesis_pipeline/diagnostics/descriptive_final_features.py` (CLI:
+`descriptive-final-features`) writes six long-form CSVs under
+`Outputs/deskriptiv/final_feature_sets/`: per (horizon × ticker × feature),
+per (horizon × feature), per (horizon × ticker), per-horizon overview,
+pairwise Pearson/Spearman correlations, and a registry-resolution log. The
+helper module is shared with stationarity so the two stages can never report a
+different feature universe.
+
+`configs/paths.yaml` gains `descriptive_final_root` and
+`stationarity_final_root`; the CLI gains `descriptive-final-features` and
+threads `--source` (plus `--no-panel`) into the stationarity subcommand.
+
 ## Things explicitly **not** changed
 
 - Target construction (`Create_Price_Features.py`).
