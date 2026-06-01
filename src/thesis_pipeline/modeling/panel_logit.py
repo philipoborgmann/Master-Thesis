@@ -52,8 +52,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
 from .run_models import (
-    DEFAULT_C, FEATURE_CONFIG, HORIZONS, INIT_TRAIN_FRAC, SIGNAL_DIR,
-    compute_metrics, load_features, load_feature_sets,
+    CHECKPOINT_DIR, DEFAULT_C, FEATURE_CONFIG, HORIZONS, INIT_TRAIN_FRAC,
+    SIGNAL_DIR, compute_metrics, load_features, load_feature_sets,
 )
 
 MODEL_TYPE = "panel_logit"
@@ -128,7 +128,8 @@ def run_panel_walk_forward(df: pd.DataFrame,
                            min_init_timestamps: int = MIN_INIT_TIMESTAMPS,
                            min_train_obs: int = MIN_TRAIN_OBS,
                            tune_hyperparams: bool = False,
-                           hpo_config: dict | None = None) -> pd.DataFrame:
+                           hpo_config: dict | None = None,
+                           checkpoint_context: dict | None = None) -> pd.DataFrame:
     """Expanding-window pooled panel logit over all coins.
 
     Returns a signal frame with columns:
@@ -145,6 +146,15 @@ def run_panel_walk_forward(df: pd.DataFrame,
     are rebuilt leakage-safely for inner-train, validation and the final fit
     exactly as the untuned panel design matrix does. ``τ`` is never used for
     tuning or fitting. Tuned rows carry ``hpo_*`` provenance columns.
+
+    Checkpointing (``checkpoint_context`` not ``None`` and ``enabled``)
+    ------------------------------------------------------------------
+    The ordered test timestamps are split into **storage chunks** of
+    ``chunk_size`` consecutive ``τ``. Each chunk is computed, persisted
+    atomically (``chunks/chunk_NNNN.parquet``) and, on resume, reloaded instead
+    of recomputed. A chunk is purely a *storage* partition: every ``τ`` still
+    trains on all rows with ``timestamp < τ``, so chunking changes nothing about
+    the predictions and introduces no leakage.
     """
     if panel_mode not in PANEL_MODES:
         raise ValueError(f"Unknown panel_mode {panel_mode!r}; expected one of {PANEL_MODES}")
@@ -164,21 +174,23 @@ def run_panel_walk_forward(df: pd.DataFrame,
         search_space = hpo_config.get("search_space", {})
 
     init_idx = max(int(n_ts * init_train_frac), min_init_timestamps)
-    results: list[dict] = []
 
-    for i in range(init_idx, n_ts):
+    def _predict_one_timestamp(i: int) -> list[dict]:
+        """Predictions for the single test timestamp ``unique_ts[i]``.
+
+        Train = rows with ``timestamp < τ``; test = rows with ``timestamp == τ``.
+        Independent of any chunking — identical whether or not checkpointing is
+        on.
+        """
         tau = unique_ts[i]
         train_df = df[df["timestamp"] < tau]
         test_df  = df[df["timestamp"] == tau]
-
-        # Drop rows with NaN features / target.
         train_df = train_df.dropna(subset=feature_cols + ["target"])
         test_df  = test_df.dropna(subset=feature_cols + ["target"])
         if (len(train_df) < min_train_obs
                 or train_df["target"].nunique() < 2
                 or test_df.empty):
-            continue
-
+            return []
         test_df = test_df.reset_index(drop=True)
 
         if tune_hyperparams:
@@ -192,6 +204,7 @@ def run_panel_walk_forward(df: pd.DataFrame,
                                   family=PANEL, panel_mode=panel_mode)
             preds = (proba >= 0.5).astype(int)
             hpo_cols = hpo_row_columns(objective, res)
+            rows = []
             for j in range(len(test_df)):
                 row = {
                     "timestamp":   test_df.loc[j, "timestamp"],
@@ -201,8 +214,8 @@ def run_panel_walk_forward(df: pd.DataFrame,
                     "probability": float(proba[j]),
                 }
                 row.update(hpo_cols)
-                results.append(row)
-            continue
+                rows.append(row)
+            return rows
 
         X_tr, y_tr, X_te = build_panel_design_matrix(
             train_df, test_df, feature_cols, panel_mode,
@@ -213,19 +226,62 @@ def run_panel_walk_forward(df: pd.DataFrame,
         model.fit(X_tr, y_tr)
         preds = model.predict(X_te).astype(int)
         proba = model.predict_proba(X_te)[:, 1]
+        return [{
+            "timestamp":   test_df.loc[j, "timestamp"],
+            "ticker":      test_df.loc[j, "ticker"],
+            "target":      int(test_df.loc[j, "target"]),
+            "prediction":  int(preds[j]),
+            "probability": float(proba[j]),
+        } for j in range(len(test_df))]
 
-        for j in range(len(test_df)):
-            results.append({
-                "timestamp":   test_df.loc[j, "timestamp"],
-                "ticker":      test_df.loc[j, "ticker"],
-                "target":      int(test_df.loc[j, "target"]),
-                "prediction":  int(preds[j]),
-                "probability": float(proba[j]),
-            })
+    test_indices = list(range(init_idx, n_ts))
+    ckpt_on = bool(checkpoint_context and checkpoint_context.get("enabled"))
 
-    if not results:
+    # ── Plain (non-checkpointed) path: behaviour unchanged ──────
+    if not ckpt_on:
+        results: list[dict] = []
+        for i in test_indices:
+            results.extend(_predict_one_timestamp(i))
+        return pd.DataFrame(results) if results else pd.DataFrame()
+
+    # ── Checkpointed path: persist one parquet per timestamp chunk ──
+    from . import checkpointing as ckpt
+    root      = checkpoint_context["root"]
+    resume    = bool(checkpoint_context.get("resume", True))
+    chunk_size = int(checkpoint_context.get("chunk_size", ckpt.DEFAULT_CHUNK_SIZE))
+    chunks = ckpt.chunk_indices(test_indices, chunk_size)
+
+    manifest = ckpt.load_manifest(root)
+    manifest["total_chunks"] = len(chunks)
+    manifest["status"] = "running"
+    ckpt.write_manifest(root, manifest)
+
+    frames: list[pd.DataFrame] = []
+    for chunk_id, idx_group in enumerate(chunks):
+        cp_path = ckpt.chunk_checkpoint_path(root, chunk_id)
+        if resume and cp_path.exists():
+            cached = ckpt.load_checkpoint(cp_path)
+            if cached is not None:
+                if not cached.empty:
+                    frames.append(cached)
+                print(f"     chunk_{chunk_id:04d} → CACHED CHECKPOINT")
+                continue
+        chunk_rows: list[dict] = []
+        for i in idx_group:
+            chunk_rows.extend(_predict_one_timestamp(i))
+        chunk_df = (pd.DataFrame(chunk_rows) if chunk_rows
+                    else pd.DataFrame(columns=list(ckpt.CORE_COLUMNS)))
+        ckpt.save_checkpoint_atomic(chunk_df, cp_path)
+        if not chunk_df.empty:
+            frames.append(chunk_df)
+        manifest["completed_chunks"] = ckpt.list_completed_chunks(root)
+        ckpt.write_manifest(root, manifest)
+        print(f"     chunk_{chunk_id:04d} → computed + checkpointed")
+
+    if not frames:
         return pd.DataFrame()
-    return pd.DataFrame(results)
+    out = pd.concat(frames, ignore_index=True)
+    return out.sort_values(["timestamp", "ticker"]).reset_index(drop=True)
 
 
 def run_panel_model_for_feature_set(df_all: pd.DataFrame,
@@ -234,7 +290,8 @@ def run_panel_model_for_feature_set(df_all: pd.DataFrame,
                                     C: float = DEFAULT_C,
                                     panel_mode: str = "pooled",
                                     tune_hyperparams: bool = False,
-                                    hpo_config: dict | None = None) -> pd.DataFrame:
+                                    hpo_config: dict | None = None,
+                                    checkpoint_context: dict | None = None) -> pd.DataFrame:
     """Filter to ``tickers`` (if given) and run the panel walk-forward."""
     df = df_all
     if tickers:
@@ -243,7 +300,8 @@ def run_panel_model_for_feature_set(df_all: pd.DataFrame,
         return pd.DataFrame()
     return run_panel_walk_forward(df, feature_cols, C=C, panel_mode=panel_mode,
                                   tune_hyperparams=tune_hyperparams,
-                                  hpo_config=hpo_config)
+                                  hpo_config=hpo_config,
+                                  checkpoint_context=checkpoint_context)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -304,6 +362,22 @@ def build_parser() -> argparse.ArgumentParser:
                         type=float, nargs="+", default=None)
     parser.add_argument("--hpo-class-weight", "--hpo_class_weight",
                         dest="hpo_class_weight", nargs="+", default=None)
+    parser.add_argument("--checkpoint", dest="checkpoint",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Write per-chunk checkpoints so a crashed panel run "
+                             "can resume (default: on).")
+    parser.add_argument("--resume", dest="resume",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Reuse existing chunk checkpoints (default: on).")
+    parser.add_argument("--checkpoint-dir", "--checkpoint_dir",
+                        dest="checkpoint_dir", default=CHECKPOINT_DIR,
+                        help="Root directory for model checkpoints.")
+    parser.add_argument("--checkpoint-chunk-size", "--checkpoint_chunk_size",
+                        dest="checkpoint_chunk_size", type=int, default=20,
+                        help="Panel test timestamps per checkpoint chunk.")
+    parser.add_argument("--clear-checkpoints", "--clear_checkpoints",
+                        dest="clear_checkpoints", action="store_true",
+                        help="Delete this run's checkpoint directory before start.")
     parser.add_argument("--dry-run", "--dry_run", dest="dry_run", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--restart", action="store_true")
@@ -330,6 +404,14 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
         )
     tune_on = bool(hpo_cfg["enabled"])
     hpo_variant = hpo_variant_label(tune_on, hpo_cfg["objective"])
+
+    # ── Checkpointing config ────────────────────────────────────
+    from . import checkpointing as ckpt
+    ckpt_on    = bool(getattr(args, "checkpoint", True))
+    resume     = bool(getattr(args, "resume", True))
+    ckpt_dir   = getattr(args, "checkpoint_dir", CHECKPOINT_DIR) or CHECKPOINT_DIR
+    chunk_size = int(getattr(args, "checkpoint_chunk_size", 20) or 20)
+    clear_ckpt = bool(getattr(args, "clear_checkpoints", False))
 
     if getattr(args, "dry_run", False):
         try:
@@ -365,6 +447,18 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                         if tune_on else "(off)"),
                     "hpo_validation_fraction": (
                         hpo_cfg["validation_fraction"] if tune_on else "(off)"),
+                    "checkpoint_enabled":    ckpt_on,
+                    "resume":                resume,
+                    "checkpoint_dir":        ckpt_dir,
+                    "checkpoint_chunk_size": chunk_size,
+                    "clear_checkpoints":     clear_ckpt,
+                    "run_checkpoint_path": (
+                        str(ckpt.checkpoint_root(
+                            ckpt_dir, args.horizon or "<horizon>",
+                            panel_output_name(args.set_id or "<set_id>",
+                                              args.sentiment_model or "-",
+                                              panel_mode, hpo_variant)))
+                        if ckpt_on else "(off)"),
                 },
             )
         except Exception:  # noqa: BLE001
@@ -442,12 +536,12 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                 except Exception:
                     pass
 
-            print(f"\n  ── {out_name} ({label}) ", end="", flush=True)
+            print(f"\n  ── {out_name} ({label}) ")
 
             feature_cols = [f.strip() for f in feat_str.split(",")]
             missing = [f for f in feature_cols if f not in df_all.columns]
             if missing:
-                print(f"→ SKIP (missing: {missing[:3]})")
+                print(f"  → SKIP (missing: {missing[:3]})")
                 all_metrics.append({
                     "horizon": hz, "set_id": set_id, "sentiment_model": sent_model,
                     "label": label, "category": category, "ticker": "pooled",
@@ -457,12 +551,33 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                 })
                 continue
 
+            # ── Checkpoint setup (per-run chunk directory) ────
+            root = ckpt.checkpoint_root(ckpt_dir, hz, out_name)
+            checkpoint_context = None
+            if ckpt_on:
+                if clear_ckpt:
+                    ckpt.clear_run_checkpoints(root)
+                ckpt.init_manifest(root, base={
+                    "horizon": hz, "set_id": set_id, "sentiment_model": sent_model,
+                    "model_type": MODEL_TYPE, "panel_mode": panel_mode,
+                    "hpo_variant": hpo_variant if tune_on else "fixed",
+                    "hpo_objective": hpo_cfg["objective"] if tune_on else "-",
+                    "feature_cols": feature_cols,
+                })
+                checkpoint_context = {"enabled": True, "resume": resume,
+                                      "root": root, "chunk_size": chunk_size}
+
             t0 = time.time()
             signals = run_panel_model_for_feature_set(
                 df_all, feature_cols, tickers, C=args.C, panel_mode=panel_mode,
                 tune_hyperparams=tune_on, hpo_config=hpo_cfg,
+                checkpoint_context=checkpoint_context,
             )
             elapsed = time.time() - t0
+            if ckpt_on:
+                mf = ckpt.load_manifest(root)
+                mf["status"] = "complete"
+                ckpt.write_manifest(root, mf)
 
             if signals.empty:
                 print(f"→ no signals ({elapsed:.1f}s)")
@@ -496,6 +611,12 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                       "n_tickers": signals["ticker"].nunique(),
                       "model_type": MODEL_TYPE, "panel_mode": panel_mode})
             m.update(hpo_summary)
+            if ckpt_on:
+                n_chunks = len(ckpt.list_completed_chunks(root))
+                m.update({"checkpoint_enabled": True,
+                          "n_checkpoints_written": n_chunks})
+            else:
+                m["checkpoint_enabled"] = False
             all_metrics.append(m)
             for tk, grp in signals.groupby("ticker"):
                 mt = compute_metrics(grp, tk)
@@ -505,7 +626,7 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                            "model_type": MODEL_TYPE, "panel_mode": panel_mode})
                 mt.update(summarize_hpo_columns(grp))
                 all_metrics.append(mt)
-            print(f"→ acc={m['accuracy']:.4f}, f1={m['f1']:.4f}, "
+            print(f"  → acc={m['accuracy']:.4f}, f1={m['f1']:.4f}, "
                   f"brier={m.get('brier_score', np.nan):.4f}, "
                   f"n={m['n_obs']}, {elapsed:.1f}s")
 
@@ -543,7 +664,12 @@ def run(*, horizon: str | None = None, set_id: str | None = None,
         hpo_objective: str | None = None,
         hpo_config: str | None = None,
         hpo_grid_C: Sequence[float] | None = None,
-        hpo_class_weight: Sequence[str] | None = None) -> int:
+        hpo_class_weight: Sequence[str] | None = None,
+        checkpoint: bool = True,
+        resume: bool = True,
+        checkpoint_dir: str | None = None,
+        checkpoint_chunk_size: int | None = None,
+        clear_checkpoints: bool = False) -> int:
     """Programmatic entry point mirroring :func:`main`."""
     argv: list[str] = []
     if horizon:
@@ -570,6 +696,16 @@ def run(*, horizon: str | None = None, set_id: str | None = None,
         argv += ["--hpo-grid-C", *(str(c) for c in hpo_grid_C)]
     if hpo_class_weight:
         argv += ["--hpo-class-weight", *(str(c) for c in hpo_class_weight)]
+    if not checkpoint:
+        argv.append("--no-checkpoint")
+    if not resume:
+        argv.append("--no-resume")
+    if checkpoint_dir:
+        argv += ["--checkpoint-dir", checkpoint_dir]
+    if checkpoint_chunk_size is not None:
+        argv += ["--checkpoint-chunk-size", str(checkpoint_chunk_size)]
+    if clear_checkpoints:
+        argv.append("--clear-checkpoints")
     if dry_run:
         argv.append("--dry-run")
     if force:

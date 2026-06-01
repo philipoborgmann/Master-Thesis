@@ -572,15 +572,28 @@ def test_series(series: pd.Series, run_long_memory_default: bool = False) -> dic
 
 
 def test_horizon(df: pd.DataFrame, horizon: str,
-                 tickers: list | None = None) -> list[dict]:
+                 tickers: list | None = None,
+                 feature_cols: list[str] | None = None,
+                 include_descriptive: bool = False) -> list[dict]:
     """
     Iterates over (ticker x feature) and runs the full battery.
     Bai-Perron is run only on daily data, top tickers, on title_score_mean
     columns (the natural break-detection target).
+
+    ``feature_cols`` overrides the (legacy, sentiment-only) auto-detection so
+    callers can hand in any feature universe — e.g. the resolved final
+    modelling features under ``--source final``. When
+    ``include_descriptive`` is True, the per-row record carries
+    ``feature_group / n_missing / share_missing / median / min / max``
+    (used by ``stationarity_final_records.csv``).
     """
-    feature_cols = _get_feature_columns(df)
+    if feature_cols is None:
+        feature_cols = _get_feature_columns(df)
     if tickers is None:
         tickers = sorted(df["ticker"].unique())
+
+    if include_descriptive:
+        from ..features.final_feature_utils import classify_feature_group
 
     records = []
     total = len(tickers) * len(feature_cols)
@@ -600,18 +613,28 @@ def test_horizon(df: pd.DataFrame, horizon: str,
                 elapsed = time.time() - t0
                 logger.info("  %s: %d/%d (%.1fs elapsed)", horizon, done, total, elapsed)
 
+            if feat not in sub.columns:
+                continue
             series = sub[feat]
+            clean = series.dropna()
+            n_clean = int(len(clean))
 
             base = {
                 "horizon": horizon,
                 "ticker":  ticker,
                 "feature": feat,
                 "post_count_total": post_count_total,
-                "mean":    float(series.dropna().mean()) if series.dropna().size else np.nan,
-                "std":     float(series.dropna().std())  if series.dropna().size else np.nan,
+                "mean":    float(clean.mean()) if n_clean else np.nan,
+                "std":     float(clean.std())  if n_clean else np.nan,
             }
+            if include_descriptive:
+                base["feature_group"] = classify_feature_group(feat)
+                base["n_missing"]     = int(series.isna().sum())
+                base["share_missing"] = float(series.isna().mean()) if len(series) else np.nan
+                base["median"]        = float(clean.median()) if n_clean else np.nan
+                base["min"]           = float(clean.min())    if n_clean else np.nan
+                base["max"]           = float(clean.max())    if n_clean else np.nan
 
-            n_clean = series.dropna().size
             if n_clean < min(MIN_N["adf"], MIN_N["dfgls"]):
                 base.update({"joint_class": "n/a", "n_obs": int(n_clean)})
                 records.append(base)
@@ -678,12 +701,14 @@ def apply_fdr(records: pd.DataFrame, pval_cols: list[str], alpha: float = ALPHA)
 # 12. PANEL TESTS — one CIPS per feature per horizon
 # ──────────────────────────────────────────────────────────────────────
 
-def run_all_panels(df: pd.DataFrame, horizon: str) -> list[dict]:
+def run_all_panels(df: pd.DataFrame, horizon: str,
+                   feature_cols: list[str] | None = None) -> list[dict]:
     """
     For each feature column, build a (timestamp x ticker) panel and run CIPS
     in both 'c' and 'ct' specifications.
     """
-    feature_cols = _get_feature_columns(df)
+    if feature_cols is None:
+        feature_cols = _get_feature_columns(df)
     out = []
     for feat in feature_cols:
         wide = (df.pivot_table(index="timestamp", columns="ticker", values=feat,
@@ -740,11 +765,13 @@ def fold_stability(series: pd.Series, n_splits: int = 5) -> list[dict]:
 
 
 def run_all_fold_stability(df: pd.DataFrame, horizon: str,
-                           tickers: list[str] | None = None) -> list[dict]:
+                           tickers: list[str] | None = None,
+                           feature_cols: list[str] | None = None) -> list[dict]:
     """Daily horizon only (the only one with enough fold size)."""
     if horizon != "1d":
         return []
-    feature_cols = _get_feature_columns(df)
+    if feature_cols is None:
+        feature_cols = _get_feature_columns(df)
     if tickers is None:
         tickers = TOP_TICKERS
     out = []
@@ -1111,13 +1138,24 @@ def save_excel(records_df: pd.DataFrame, panel_df: pd.DataFrame,
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Stationarity v2 (DF-GLS, PP, ADF, KPSS, GPH, CIPS, KS-CV)")
+    parser.add_argument("--source", choices=["final", "sentiment"], default="final",
+                        help="Feature source: 'final' (Data/Final/features_{h}.parquet, "
+                             "default) tests the full modelling universe; 'sentiment' "
+                             "is the legacy sentiment-features-only behaviour.")
+    parser.add_argument("--final-features", "--final_features",
+                        dest="final_features", action="store_true",
+                        help="Convenience alias for '--source final'.")
     parser.add_argument("--feature_dir", type=str, default=FEATURE_DIR)
     parser.add_argument("--ticker",   type=str, default=None, help="restrict to one ticker")
     parser.add_argument("--horizon",  type=str, default=None, choices=["1h", "6h", "1d"])
-    parser.add_argument("--no_panel", action="store_true", help="skip CIPS panel tests")
-    parser.add_argument("--no_plots", action="store_true")
+    parser.add_argument("--no_panel", "--no-panel", dest="no_panel",
+                        action="store_true", help="skip CIPS panel tests")
+    parser.add_argument("--no_plots", "--no-plots", dest="no_plots",
+                        action="store_true")
     parser.add_argument("--debug",    action="store_true")
     args = parser.parse_args(argv)
+    if getattr(args, "final_features", False):
+        args.source = "final"
 
     setup_logging(level=logging.DEBUG if args.debug else logging.INFO)
 
@@ -1125,7 +1163,10 @@ def main(argv=None):
     import statsmodels, arch
     logger.info("statsmodels=%s  arch=%s  ruptures=%s", statsmodels.__version__, arch.__version__, rpt.__version__)
 
-    # validate inputs
+    if args.source == "final":
+        return _run_final(args)
+
+    # ── Legacy: sentiment-only stationarity (Data/Features/sentiment_*) ──
     for hz, fname in HORIZONS.items():
         path = os.path.join(args.feature_dir, fname)
         if not os.path.isfile(path):
@@ -1191,6 +1232,180 @@ def main(argv=None):
                                tickers=[args.ticker] if args.ticker else TOP_TICKERS)
 
     logger.info("DONE")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 18. FINAL-FEATURE STATIONARITY (covers the entire modelling universe)
+# ──────────────────────────────────────────────────────────────────────
+
+def _run_final(args) -> int:
+    """Drive the stationarity battery against the **final modelling features**.
+
+    Reads ``Data/Final/features_{horizon}.parquet``, resolves the modelling
+    feature universe via :mod:`thesis_pipeline.features.final_feature_utils`
+    (with a numeric-column fallback when the registry is unavailable), runs the
+    same test battery as the legacy sentiment path, and writes one CSV per
+    deliverable under ``Data/Features/stationarity_final/``.
+    """
+    from ..features.feature_registry import load_feature_sets
+    from ..features.final_feature_utils import (
+        classify_feature_group, load_final_features, resolve_final_feature_columns,
+    )
+
+    out_dir = os.path.join(FEATURE_DIR, "stationarity_final")
+    os.makedirs(out_dir, exist_ok=True)
+    records_csv    = os.path.join(out_dir, "stationarity_final_records.csv")
+    summary_csv    = os.path.join(out_dir, "stationarity_final_summary.csv")
+    panel_csv      = os.path.join(out_dir, "stationarity_final_panel_cips.csv")
+    fold_csv       = os.path.join(out_dir, "stationarity_final_fold_stability.csv")
+    resolution_csv = os.path.join(out_dir, "stationarity_final_feature_resolution.csv")
+
+    try:
+        feature_sets = load_feature_sets() or {}
+    except Exception as exc:  # noqa: BLE001 — registry is best-effort
+        logger.warning("could not load feature_sets registry (%s) — numeric fallback", exc)
+        feature_sets = {}
+
+    horizons_to_test = [args.horizon] if args.horizon else ["1h", "6h", "1d"]
+
+    all_records: list[dict] = []
+    panel_recs:  list[dict] = []
+    fold_recs:   list[dict] = []
+    resolutions: list[dict] = []
+
+    for hz in horizons_to_test:
+        logger.info("=" * 60)
+        logger.info("HORIZON: %s  (source=final)", hz)
+        logger.info("=" * 60)
+        try:
+            df = load_final_features(hz)
+        except FileNotFoundError as exc:
+            logger.error(str(exc)); continue
+        logger.info("loaded %d rows, %d tickers from %s",
+                    len(df), df["ticker"].nunique(),
+                    f"Data/Final/features_{hz}.parquet")
+
+        feature_cols, hz_resolution = resolve_final_feature_columns(df, feature_sets)
+        for row in hz_resolution:
+            row["horizon"] = hz
+            row.setdefault("used_in_descriptive_statistics", False)
+        resolutions.extend(hz_resolution)
+        logger.info("resolved %d modelling features for %s", len(feature_cols), hz)
+
+        tickers = [args.ticker] if args.ticker else None
+        all_records.extend(test_horizon(df, hz, tickers=tickers,
+                                        feature_cols=feature_cols,
+                                        include_descriptive=True))
+
+        if not args.no_panel:
+            logger.info("running CIPS panel for %s ...", hz)
+            panel_recs.extend(run_all_panels(df, hz, feature_cols=feature_cols))
+
+        fold_recs.extend(run_all_fold_stability(df, hz, feature_cols=feature_cols))
+
+    rec_df    = pd.DataFrame(all_records)
+    panel_df  = pd.DataFrame(panel_recs)
+    fold_df   = pd.DataFrame(fold_recs)
+    res_df    = pd.DataFrame(resolutions)
+
+    # ── BH/FDR on the usual p-value blocks ────────────────────
+    if not rec_df.empty:
+        pval_cols = ["dfgls_c_pval", "dfgls_ct_pval", "pp_c_pval",
+                     "adf_c_pval", "kpss_c_pval"]
+        rec_df = apply_fdr(rec_df, pval_cols=pval_cols, alpha=ALPHA)
+
+        # Ensure descriptive columns + half-life alias exist for every row.
+        if "feature_group" not in rec_df.columns:
+            rec_df["feature_group"] = rec_df["feature"].map(classify_feature_group)
+        rec_df["half_life"] = rec_df.get("ar1_halflife")
+
+    # ── Records CSV ───────────────────────────────────────────
+    records_columns = [
+        "horizon", "ticker", "feature", "feature_group",
+        "n_obs", "n_missing", "share_missing",
+        "mean", "std", "median", "min", "max",
+        "adf_c_stat", "adf_c_pval", "adf_c_pval_bh", "adf_c_reject",
+        "adf_ct_stat", "adf_ct_pval", "adf_ct_reject",
+        "kpss_c_stat", "kpss_c_pval", "kpss_c_pval_bh", "kpss_c_reject",
+        "kpss_ct_stat", "kpss_ct_pval", "kpss_ct_reject",
+        "dfgls_c_stat", "dfgls_c_pval", "dfgls_c_pval_bh", "dfgls_c_reject",
+        "dfgls_ct_stat", "dfgls_ct_pval", "dfgls_ct_pval_bh", "dfgls_ct_reject",
+        "pp_c_stat", "pp_c_pval", "pp_c_pval_bh", "pp_c_reject",
+        "pp_ct_stat", "pp_ct_pval", "pp_ct_reject",
+        "ar1_rho", "ar1_se", "half_life", "ar1_halflife",
+        "gph_d", "gph_se", "gph_pval_d0", "gph_m",
+        "joint_class",
+    ]
+    if rec_df.empty:
+        pd.DataFrame(columns=records_columns).to_csv(records_csv, index=False)
+    else:
+        for col in records_columns:
+            if col not in rec_df.columns:
+                rec_df[col] = pd.NA
+        ordered = records_columns + [c for c in rec_df.columns if c not in records_columns]
+        rec_df[ordered].to_csv(records_csv, index=False)
+    logger.info("records → %s", records_csv)
+
+    # ── Summary CSV (counts by horizon × feature_group × joint_class) ──
+    summary_cols = ["horizon", "feature_group", "joint_class", "count", "pct"]
+    if rec_df.empty:
+        pd.DataFrame(columns=summary_cols).to_csv(summary_csv, index=False)
+    else:
+        grp = (rec_df
+               .groupby(["horizon", "feature_group", "joint_class"], dropna=False)
+               .size().reset_index(name="count"))
+        totals = grp.groupby("horizon")["count"].transform("sum").replace(0, np.nan)
+        grp["pct"] = (grp["count"] / totals * 100.0).round(4)
+        grp.to_csv(summary_csv, index=False)
+    logger.info("summary → %s", summary_csv)
+
+    # ── Panel CIPS CSV (always written, even when empty) ──────
+    panel_cols = ["horizon", "feature", "trend", "cips_stat", "n_sections",
+                  "n_obs", "cips_5pct_cv", "cips_reject"]
+    if panel_df.empty:
+        pd.DataFrame(columns=panel_cols).to_csv(panel_csv, index=False)
+    else:
+        for col in panel_cols:
+            if col not in panel_df.columns:
+                panel_df[col] = pd.NA
+        panel_df[panel_cols].to_csv(panel_csv, index=False)
+    logger.info("panel CIPS → %s", panel_csv)
+
+    # ── Fold-stability CSV ────────────────────────────────────
+    fold_cols = ["horizon", "ticker", "feature", "split", "n_train", "n_val",
+                 "ks_stat", "ks_pval", "cvm_stat", "cvm_pval"]
+    if fold_df.empty:
+        pd.DataFrame(columns=fold_cols).to_csv(fold_csv, index=False)
+    else:
+        for col in fold_cols:
+            if col not in fold_df.columns:
+                fold_df[col] = pd.NA
+        fold_df[fold_cols].to_csv(fold_csv, index=False)
+    logger.info("fold stability → %s", fold_csv)
+
+    # ── Feature-resolution CSV ────────────────────────────────
+    res_cols = ["horizon", "set_id", "category", "label", "sentiment_model",
+                "requested_feature", "resolved_feature",
+                "exists_in_final_data", "reason_if_missing"]
+    if res_df.empty:
+        pd.DataFrame(columns=res_cols).to_csv(resolution_csv, index=False)
+    else:
+        for col in res_cols:
+            if col not in res_df.columns:
+                res_df[col] = ""
+        res_df[res_cols].to_csv(resolution_csv, index=False)
+    logger.info("resolution → %s", resolution_csv)
+
+    if not args.no_plots and not rec_df.empty:
+        plot_dir = os.path.join(out_dir, "plots")
+        try:
+            os.makedirs(plot_dir, exist_ok=True)
+            plot_test_stat_distributions(rec_df, plot_dir)
+        except Exception as exc:  # noqa: BLE001 — plotting is best-effort
+            logger.warning("plotting failed: %s", exc)
+
+    logger.info("DONE (source=final, %d records)", 0 if rec_df.empty else len(rec_df))
+    return 0
 
 
 if __name__ == "__main__":

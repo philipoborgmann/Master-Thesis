@@ -75,6 +75,26 @@ def _add_run_models_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hpo-class-weight", "--hpo_class_weight",
                         dest="hpo_class_weight", nargs="+", default=None,
                         help="Override the class_weight grid (e.g. none balanced).")
+    # ── Checkpointing / resume ──────────────────────────────────
+    parser.add_argument("--checkpoint", dest="checkpoint",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Write per-ticker / per-chunk checkpoints so a "
+                             "crashed run can resume (default: on; --no-checkpoint "
+                             "restores the old behaviour).")
+    parser.add_argument("--resume", dest="resume",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Reuse existing checkpoints instead of recomputing "
+                             "(default: on).")
+    parser.add_argument("--checkpoint-dir", "--checkpoint_dir",
+                        dest="checkpoint_dir", default="Outputs/Checkpoints/Models",
+                        help="Root directory for model checkpoints.")
+    parser.add_argument("--checkpoint-chunk-size", "--checkpoint_chunk_size",
+                        dest="checkpoint_chunk_size", type=int, default=20,
+                        help="Number of panel test timestamps per checkpoint chunk.")
+    parser.add_argument("--clear-checkpoints", "--clear_checkpoints",
+                        dest="clear_checkpoints", action="store_true",
+                        help="Delete this run's checkpoint directory before "
+                             "starting (does not happen automatically on --restart).")
 
 
 # ---------------------------------------------------------------------------
@@ -185,13 +205,41 @@ def cmd_stationarity(args: argparse.Namespace) -> int:
         return rc
     from .sentiment import stationarity as _m
     argv: list[str] = []
+    source = getattr(args, "source", None)
+    if getattr(args, "final_features", False):
+        source = "final"
+    if source:
+        argv += ["--source", source]
     if args.horizon:
         argv += ["--horizon", args.horizon]
     if args.coins:
-        for c in args.coins:
-            argv += ["--ticker", c]
+        # The module only supports a single --ticker; forward the first.
+        argv += ["--ticker", args.coins[0]]
     if getattr(args, "no_plots", False):
         argv.append("--no_plots")
+    if getattr(args, "no_panel", False):
+        argv.append("--no_panel")
+    return _m.main(argv)
+
+
+def cmd_descriptive_final_features(args: argparse.Namespace) -> int:
+    rc = _stage_dry_run("descriptive_final_features", args)
+    if rc is not None:
+        return rc
+    from .diagnostics import descriptive_final_features as _m
+    argv: list[str] = []
+    if getattr(args, "horizon", None):
+        argv += ["--horizon", args.horizon]
+    if getattr(args, "output_dir", None):
+        argv += ["--output-dir", args.output_dir]
+    if getattr(args, "min_pairwise_n", None) is not None:
+        argv += ["--min-pairwise-n", str(args.min_pairwise_n)]
+    if getattr(args, "smoke", False):
+        argv.append("--smoke")
+    if getattr(args, "dry_run", False):
+        argv.append("--dry-run")
+    if getattr(args, "force", False):
+        argv.append("--force")
     return _m.main(argv)
 
 
@@ -238,6 +286,19 @@ def cmd_run_models(args: argparse.Namespace) -> int:
         argv += ["--hpo-grid-C", *(str(c) for c in args.hpo_grid_C)]
     if getattr(args, "hpo_class_weight", None):
         argv += ["--hpo-class-weight", *(str(c) for c in args.hpo_class_weight)]
+    # Checkpointing — forward only when diverging from the model defaults
+    # (checkpoint=True, resume=True) so run-stage / run-pipeline (which don't
+    # define these flags) keep the default behaviour.
+    if getattr(args, "checkpoint", True) is False:
+        argv.append("--no-checkpoint")
+    if getattr(args, "resume", True) is False:
+        argv.append("--no-resume")
+    if getattr(args, "checkpoint_dir", None):
+        argv += ["--checkpoint-dir", args.checkpoint_dir]
+    if getattr(args, "checkpoint_chunk_size", None) is not None:
+        argv += ["--checkpoint-chunk-size", str(args.checkpoint_chunk_size)]
+    if getattr(args, "clear_checkpoints", False):
+        argv.append("--clear-checkpoints")
     if args.smoke:
         argv.append("--smoke")
     if args.dry_run:
@@ -323,6 +384,7 @@ def _dispatch_stage(stage: str, args: argparse.Namespace) -> int:
         "evaluate_signals":          cmd_evaluate_signals,
         "diagnostics":               cmd_diagnostics,
         "reports":                   cmd_diagnostics,
+        "descriptive_final_features": cmd_descriptive_final_features,
     }
     if stage not in table:
         raise SystemExit(f"Unknown stage: {stage}")
@@ -393,12 +455,36 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_create_sentiment_features)
 
     # stationarity
-    sp = sub.add_parser("stationarity", help="Run stationarity tests on sentiment features.")
+    sp = sub.add_parser("stationarity",
+                        help="Run stationarity tests on the final modelling "
+                             "features (default) or the legacy sentiment-only "
+                             "features (--source sentiment).")
+    sp.add_argument("--source", choices=["final", "sentiment"], default="final",
+                    help="Feature source: 'final' (Data/Final/features_{h}.parquet, "
+                         "default) or 'sentiment' (legacy).")
+    sp.add_argument("--final-features", "--final_features",
+                    dest="final_features", action="store_true",
+                    help="Alias for --source final.")
     sp.add_argument("--horizon", default=None)
     sp.add_argument("--coins", nargs="*")
     sp.add_argument("--no-plots", dest="no_plots", action="store_true")
+    sp.add_argument("--no-panel", dest="no_panel", action="store_true",
+                    help="Skip the CIPS panel tests.")
     _add_common(sp)
     sp.set_defaults(func=cmd_stationarity)
+
+    # descriptive-final-features
+    sp = sub.add_parser("descriptive-final-features",
+                        help="Extensive descriptive statistics for the final "
+                             "modelling feature sets.")
+    sp.add_argument("--horizon", default=None, choices=["1h", "6h", "1d"])
+    sp.add_argument("--output-dir", dest="output_dir", default=None,
+                    help="Override Outputs/deskriptiv/final_feature_sets/.")
+    sp.add_argument("--min-pairwise-n", dest="min_pairwise_n", type=int,
+                    default=None,
+                    help="Drop correlation pairs below this overlap count.")
+    _add_common(sp)
+    sp.set_defaults(func=cmd_descriptive_final_features)
 
     # merge-features
     sp = sub.add_parser("merge-features", help="Merge price + sentiment features.")
