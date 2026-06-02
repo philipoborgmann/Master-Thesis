@@ -76,6 +76,33 @@ def load_sentiment_features(horizon: str, feature_dir: str = FEATURE_DIR) -> pd.
 # FILL MISSING SENTIMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
+def sentiment_neutral_columns(sentiment_cols: list[str]) -> list[str]:
+    """Return the subset of ``sentiment_cols`` that get neutral-filled.
+
+    Scope is intentionally narrow — only sentiment / attention columns:
+
+    * ``*_mean`` / ``*_weighted_mean`` / ``*_median``  → 0.0
+    * ``*_bullishness_ratio``                          → 0.5
+    * ``*_std``                                        → 0.0  (only when fill is
+      explicitly requested; the default ``fill_missing_sentiment`` keeps these
+      NaN as before)
+    * ``post_count`` / ``*_post_count``                → 0
+
+    Non-sentiment columns (price, volatility, volume, market_cap, target,
+    timestamp, ticker) are never returned here, regardless of which flag the
+    caller passes.
+    """
+    keep = []
+    for col in sentiment_cols:
+        if col == "post_count" or col.endswith("_post_count"):
+            keep.append(col)
+        elif "bullishness_ratio" in col:
+            keep.append(col)
+        elif any(col.endswith(s) for s in ("_mean", "_weighted_mean", "_median", "_std")):
+            keep.append(col)
+    return keep
+
+
 def fill_missing_sentiment(df: pd.DataFrame,
                            sentiment_cols: list[str]) -> pd.DataFrame:
     """Fill NaN sentiment after a left join from price onto sentiment.
@@ -105,8 +132,26 @@ def fill_missing_sentiment(df: pd.DataFrame,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def merge_horizon(horizon: str, included_tickers: list[str],
-                  feature_dir: str = FEATURE_DIR) -> tuple:
+                  feature_dir: str = FEATURE_DIR,
+                  *,
+                  apply_coverage_filter: bool = True,
+                  neutral_fill_sentiment: bool = True) -> tuple:
     """Merge price and sentiment features for one horizon.
+
+    Parameters
+    ----------
+    apply_coverage_filter
+        When ``True`` (default — current behaviour) the merged universe is
+        restricted to ``included_tickers``. When ``False``, the coverage
+        filter is bypassed and every ticker present in **either** the price or
+        sentiment file is kept; tickers that exist in price but not sentiment
+        end up with NaN sentiment which is only filled when
+        ``neutral_fill_sentiment`` is also ``True``.
+    neutral_fill_sentiment
+        Controls whether :func:`fill_missing_sentiment` runs on the merged
+        frame. Default ``True`` to preserve the historical pipeline output;
+        set ``False`` to keep NaN sentiment rows (useful when an analyst wants
+        to inspect coverage gaps directly).
 
     Returns ``(merged_df, report_dict)``.
     """
@@ -118,7 +163,15 @@ def merge_horizon(horizon: str, included_tickers: list[str],
 
     price_tickers = set(df_price["ticker"].unique())
     sent_tickers  = set(df_sent["ticker"].unique())
-    valid_tickers = sorted(set(included_tickers) & price_tickers & sent_tickers)
+    if apply_coverage_filter:
+        valid_tickers = sorted(set(included_tickers) & price_tickers & sent_tickers)
+        n_dropped_low_coverage = len(price_tickers) - len(valid_tickers)
+    else:
+        # Keep every ticker that has price data; sentiment is left-merged
+        # afterwards so its absence shows up as NaN (and is only filled when
+        # the neutral-fill flag is set).
+        valid_tickers = sorted(price_tickers)
+        n_dropped_low_coverage = 0
 
     if not valid_tickers:
         return pd.DataFrame(), {
@@ -146,7 +199,18 @@ def merge_horizon(horizon: str, included_tickers: list[str],
     has_sent = merged[sent_only_cols[0]].notna().sum() if sent_only_cols else 0
     missing_sent = n_price - has_sent
 
-    merged = fill_missing_sentiment(merged, sent_only_cols)
+    # Track how many NaNs we actually fill — useful for diagnostic logging.
+    fill_targets = sentiment_neutral_columns(sent_only_cols)
+    n_sentiment_nans_filled = 0
+    columns_filled: list[str] = []
+    if neutral_fill_sentiment:
+        before_nan = (merged[fill_targets].isna().sum().sum()
+                      if fill_targets else 0)
+        merged = fill_missing_sentiment(merged, sent_only_cols)
+        after_nan = (merged[fill_targets].isna().sum().sum()
+                     if fill_targets else 0)
+        n_sentiment_nans_filled = int(before_nan - after_nan)
+        columns_filled = [c for c in fill_targets if c in merged.columns]
     merged = merged.sort_values(["ticker", "timestamp"]).reset_index(drop=True)
 
     report = {
@@ -160,6 +224,11 @@ def merge_horizon(horizon: str, included_tickers: list[str],
         "n_sent_filled": missing_sent,
         "sent_fill_pct": round(missing_sent / n_price * 100, 1) if n_price > 0 else 0,
         "n_features": len(merged.columns),
+        "apply_coverage_filter":       bool(apply_coverage_filter),
+        "neutral_fill_sentiment":      bool(neutral_fill_sentiment),
+        "n_tickers_dropped_low_coverage": int(n_dropped_low_coverage),
+        "n_sentiment_nans_filled":     int(n_sentiment_nans_filled),
+        "neutral_filled_columns":      ";".join(sorted(columns_filled)),
     }
 
     return merged, report
@@ -185,6 +254,22 @@ def build_parser() -> argparse.ArgumentParser:
                         dest="coverage_csv", type=str, default=COVERAGE_CSV)
     parser.add_argument("--horizon", default=None,
                         help="Restrict to a single horizon. Default: all of 1h/6h/1d.")
+    parser.add_argument("--no-sentiment-coverage-filter",
+                        "--no_sentiment_coverage_filter",
+                        dest="no_sentiment_coverage_filter",
+                        action="store_true",
+                        help="Skip the per-horizon sentiment-coverage filter so "
+                             "low-coverage tickers are kept (useful for panel "
+                             "models). Default: filter is applied (legacy behaviour).")
+    parser.add_argument("--neutral-fill-missing-sentiment",
+                        "--neutral_fill_missing_sentiment",
+                        dest="neutral_fill_missing_sentiment",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Fill NaN sentiment / attention columns with their "
+                             "neutral values (default: on — current behaviour). "
+                             "Use --no-neutral-fill-missing-sentiment to leave "
+                             "NaN values in place. Non-sentiment columns are "
+                             "never touched.")
     parser.add_argument("--smoke", action="store_true",
                         help="Smoke mode: horizon=1d if not specified.")
     parser.add_argument("--dry-run", "--dry_run", dest="dry_run", action="store_true",
@@ -234,17 +319,34 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     horizons = [args.horizon] if args.horizon else HORIZONS
     reports: list[dict] = []
+    apply_filter = not bool(getattr(args, "no_sentiment_coverage_filter", False))
+    neutral_fill = bool(getattr(args, "neutral_fill_missing_sentiment", True))
 
     for hz in horizons:
         print(f"\n{'=' * 60}")
         print(f"  HORIZON: {hz}")
+        print(f"  apply_coverage_filter={apply_filter}  "
+              f"neutral_fill_sentiment={neutral_fill}")
         print(f"{'=' * 60}")
 
         included = get_included_tickers(COVERAGE_CSV, hz, args.coverage_threshold)
-        print(f"  Tickers with >={args.coverage_threshold}% coverage: {len(included)}")
+        if apply_filter:
+            print(f"  Tickers with >={args.coverage_threshold}% coverage: {len(included)}")
+        else:
+            print(f"  Coverage filter DISABLED — retaining every ticker that has "
+                  f"price data (was: {len(included)} above {args.coverage_threshold}% "
+                  f"coverage).")
         print(f"    {', '.join(included)}")
 
-        merged, report = merge_horizon(hz, included, feature_dir=FEATURE_DIR)
+        merged, report = merge_horizon(
+            hz, included, feature_dir=FEATURE_DIR,
+            apply_coverage_filter=apply_filter,
+            neutral_fill_sentiment=neutral_fill,
+        )
+        if not merged.empty:
+            print(f"  retained tickers: {report['n_tickers']}  "
+                  f"(dropped by coverage filter: {report['n_tickers_dropped_low_coverage']}) "
+                  f"sentiment NaNs filled: {report['n_sentiment_nans_filled']}")
         reports.append(report)
 
         if merged.empty:

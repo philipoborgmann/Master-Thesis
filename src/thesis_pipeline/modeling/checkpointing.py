@@ -141,6 +141,14 @@ def init_manifest(root: str | Path, *, base: dict) -> dict:
             manifest[key] = base[key]
         elif key in existing:
             manifest[key] = existing[key]
+    # Pass through any caller-supplied identity keys that aren't already in
+    # the canonical schema (e.g. ``train_window_mode``, ``rolling_window_*``,
+    # ``benchmark``). Without this, downstream incompatibility guards that
+    # diff caller intent against the persisted manifest would always fire on
+    # the second run because the new keys would silently disappear.
+    for k, v in base.items():
+        if k not in manifest:
+            manifest[k] = v
     write_manifest(root, manifest)
     return manifest
 

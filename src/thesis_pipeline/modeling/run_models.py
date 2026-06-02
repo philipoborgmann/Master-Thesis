@@ -456,6 +456,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clear-checkpoints", "--clear_checkpoints",
                         dest="clear_checkpoints", action="store_true",
                         help="Delete this run's checkpoint directory before start.")
+    # Manual rolling-window controls (panel-logit only); structural breaks are
+    # diagnostic and never automatically set the rolling window length.
+    parser.add_argument("--train-window", "--train_window",
+                        dest="train_window", default="expanding",
+                        choices=["expanding", "rolling_fixed"],
+                        help="Panel training window (default: expanding).")
+    parser.add_argument("--rolling-window-timestamps", "--rolling_window_timestamps",
+                        dest="rolling_window_timestamps", type=int, default=None,
+                        help="Manual number of pre-tau unique timestamps.")
+    parser.add_argument("--rolling-window-days", "--rolling_window_days",
+                        dest="rolling_window_days", type=float, default=None,
+                        help="Manual day-distance rolling window.")
     return parser
 
 

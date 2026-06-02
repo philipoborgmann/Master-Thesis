@@ -129,7 +129,10 @@ def run_panel_walk_forward(df: pd.DataFrame,
                            min_train_obs: int = MIN_TRAIN_OBS,
                            tune_hyperparams: bool = False,
                            hpo_config: dict | None = None,
-                           checkpoint_context: dict | None = None) -> pd.DataFrame:
+                           checkpoint_context: dict | None = None,
+                           train_window_mode: str = "expanding",
+                           rolling_window_timestamps: int | None = None,
+                           rolling_window_days: float | None = None) -> pd.DataFrame:
     """Expanding-window pooled panel logit over all coins.
 
     Returns a signal frame with columns:
@@ -175,16 +178,25 @@ def run_panel_walk_forward(df: pd.DataFrame,
 
     init_idx = max(int(n_ts * init_train_frac), min_init_timestamps)
 
+    from .windowing import select_panel_train_window
+
     def _predict_one_timestamp(i: int) -> list[dict]:
         """Predictions for the single test timestamp ``unique_ts[i]``.
 
-        Train = rows with ``timestamp < τ``; test = rows with ``timestamp == τ``.
+        The training slice is chosen by :func:`select_panel_train_window` —
+        ``expanding`` (all rows with ``timestamp < τ``, the historical
+        behaviour) or ``rolling_fixed`` with a manually specified window
+        length. The test slice always equals rows with ``timestamp == τ``.
         Independent of any chunking — identical whether or not checkpointing is
         on.
         """
         tau = unique_ts[i]
-        train_df = df[df["timestamp"] < tau]
-        test_df  = df[df["timestamp"] == tau]
+        train_df, test_df, window_meta = select_panel_train_window(
+            df, tau,
+            train_window_mode=train_window_mode,
+            rolling_window_timestamps=rolling_window_timestamps,
+            rolling_window_days=rolling_window_days,
+        )
         train_df = train_df.dropna(subset=feature_cols + ["target"])
         test_df  = test_df.dropna(subset=feature_cols + ["target"])
         if (len(train_df) < min_train_obs
@@ -192,6 +204,14 @@ def run_panel_walk_forward(df: pd.DataFrame,
                 or test_df.empty):
             return []
         test_df = test_df.reset_index(drop=True)
+
+        # Window-provenance columns attached to every output row.
+        window_cols = {
+            "train_window_mode":     window_meta["train_window_mode"],
+            "train_window_timestamps": window_meta["train_window_timestamps"],
+            "train_start_timestamp": window_meta["train_start_timestamp"],
+            "train_end_timestamp":   window_meta["train_end_timestamp"],
+        }
 
         if tune_hyperparams:
             res = tune_logistic_hyperparams(
@@ -214,6 +234,7 @@ def run_panel_walk_forward(df: pd.DataFrame,
                     "probability": float(proba[j]),
                 }
                 row.update(hpo_cols)
+                row.update(window_cols)
                 rows.append(row)
             return rows
 
@@ -232,6 +253,7 @@ def run_panel_walk_forward(df: pd.DataFrame,
             "target":      int(test_df.loc[j, "target"]),
             "prediction":  int(preds[j]),
             "probability": float(proba[j]),
+            **window_cols,
         } for j in range(len(test_df))]
 
     test_indices = list(range(init_idx, n_ts))
@@ -284,6 +306,78 @@ def run_panel_walk_forward(df: pd.DataFrame,
     return out.sort_values(["timestamp", "ticker"]).reset_index(drop=True)
 
 
+def run_panel_rolling_probability(df: pd.DataFrame,
+                                  *,
+                                  panel_mode: str = "pooled",
+                                  init_train_frac: float = INIT_TRAIN_FRAC,
+                                  min_init_timestamps: int = MIN_INIT_TIMESTAMPS,
+                                  min_train_obs: int = MIN_TRAIN_OBS,
+                                  train_window_mode: str = "expanding",
+                                  rolling_window_timestamps: int | None = None,
+                                  rolling_window_days: float | None = None
+                                  ) -> pd.DataFrame:
+    """Panel-compatible benchmark: ticker-rolling probability with pooled fallback.
+
+    For each test timestamp ``τ``:
+
+    * The training slice is chosen by the manual window selector — the same
+      one the logistic models use.
+    * The benchmark probability for ticker ``i`` is the empirical mean of
+      ``target`` for that ticker inside the training window. If the ticker has
+      no usable observations in that window, fall back to the **pooled** mean
+      across all tickers in the same window.
+    * ``prediction = 1`` if ``p_hat >= 0.5`` else ``0``.
+
+    Output schema matches the logistic panel signals; an additional
+    ``benchmark_model`` column tags each row.
+    """
+    from .windowing import select_panel_train_window
+
+    df = df.sort_values(["timestamp", "ticker"]).reset_index(drop=True)
+    unique_ts = np.sort(df["timestamp"].unique())
+    n_ts = len(unique_ts)
+    if n_ts == 0:
+        return pd.DataFrame()
+    init_idx = max(int(n_ts * init_train_frac), min_init_timestamps)
+
+    rows: list[dict] = []
+    for i in range(init_idx, n_ts):
+        tau = unique_ts[i]
+        train_df, test_df, window_meta = select_panel_train_window(
+            df, tau,
+            train_window_mode=train_window_mode,
+            rolling_window_timestamps=rolling_window_timestamps,
+            rolling_window_days=rolling_window_days,
+        )
+        train_df = train_df.dropna(subset=["target"])
+        test_df  = test_df.dropna(subset=["target"])
+        if len(train_df) < min_train_obs or test_df.empty:
+            continue
+        pooled = float(train_df["target"].astype(float).mean())
+        per_ticker = (train_df.groupby("ticker")["target"].mean()
+                              .astype(float).to_dict())
+        for _, r in test_df.iterrows():
+            tk = r["ticker"]
+            p_hat = per_ticker.get(tk)
+            if p_hat is None or not np.isfinite(p_hat):
+                p_hat = pooled
+            rows.append({
+                "timestamp":         r["timestamp"],
+                "ticker":            tk,
+                "target":            int(r["target"]),
+                "prediction":        int(p_hat >= 0.5),
+                "probability":       float(p_hat),
+                "benchmark_model":   "ticker_rolling_probability_with_pooled_fallback",
+                "train_window_mode": window_meta["train_window_mode"],
+                "train_window_timestamps": window_meta["train_window_timestamps"],
+                "train_start_timestamp":   window_meta["train_start_timestamp"],
+                "train_end_timestamp":     window_meta["train_end_timestamp"],
+            })
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(["timestamp", "ticker"]).reset_index(drop=True)
+
+
 def run_panel_model_for_feature_set(df_all: pd.DataFrame,
                                     feature_cols: list[str],
                                     tickers: Sequence[str] | None,
@@ -291,7 +385,11 @@ def run_panel_model_for_feature_set(df_all: pd.DataFrame,
                                     panel_mode: str = "pooled",
                                     tune_hyperparams: bool = False,
                                     hpo_config: dict | None = None,
-                                    checkpoint_context: dict | None = None) -> pd.DataFrame:
+                                    checkpoint_context: dict | None = None,
+                                    train_window_mode: str = "expanding",
+                                    rolling_window_timestamps: int | None = None,
+                                    rolling_window_days: float | None = None
+                                    ) -> pd.DataFrame:
     """Filter to ``tickers`` (if given) and run the panel walk-forward."""
     df = df_all
     if tickers:
@@ -301,7 +399,10 @@ def run_panel_model_for_feature_set(df_all: pd.DataFrame,
     return run_panel_walk_forward(df, feature_cols, C=C, panel_mode=panel_mode,
                                   tune_hyperparams=tune_hyperparams,
                                   hpo_config=hpo_config,
-                                  checkpoint_context=checkpoint_context)
+                                  checkpoint_context=checkpoint_context,
+                                  train_window_mode=train_window_mode,
+                                  rolling_window_timestamps=rolling_window_timestamps,
+                                  rolling_window_days=rolling_window_days)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -313,11 +414,15 @@ def _mode_suffix(panel_mode: str) -> str:
 
 
 def panel_output_name(set_id: str, sentiment_model: str, panel_mode: str,
-                      hpo_variant: str = "fixed") -> str:
-    """``{set_id}[_{sentiment_model}]_{panel_pooled|panel_ticker_fe}[_{hpo_variant}]``.
+                      hpo_variant: str = "fixed",
+                      window_suffix: str = "") -> str:
+    """``{set_id}[_{sentiment_model}]_{panel_pooled|panel_ticker_fe}[_{hpo_variant}][_rw{N}]``.
 
     A tuned run appends the HPO variant (e.g. ``..._panel_pooled_hpo_brier``)
-    so tuned and fixed-C panel signals never share a filename.
+    so tuned and fixed-C panel signals never share a filename. A rolling-window
+    run appends ``_rw{N}`` (or ``_rw{D}d``) — see
+    :func:`thesis_pipeline.modeling.windowing.window_suffix`. Expanding runs
+    keep the historical filenames unchanged.
     """
     suffix = _mode_suffix(panel_mode)
     if sentiment_model and str(sentiment_model) not in ("-", "nan"):
@@ -326,6 +431,8 @@ def panel_output_name(set_id: str, sentiment_model: str, panel_mode: str,
         base = f"{set_id}_{suffix}"
     if hpo_variant and hpo_variant not in ("fixed", "-"):
         base = f"{base}_{hpo_variant}"
+    if window_suffix:
+        base = f"{base}{window_suffix}"
     return base
 
 
@@ -378,6 +485,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clear-checkpoints", "--clear_checkpoints",
                         dest="clear_checkpoints", action="store_true",
                         help="Delete this run's checkpoint directory before start.")
+    parser.add_argument("--train-window", "--train_window",
+                        dest="train_window", default="expanding",
+                        choices=["expanding", "rolling_fixed"],
+                        help="Panel training window (default: expanding).")
+    parser.add_argument("--rolling-window-timestamps", "--rolling_window_timestamps",
+                        dest="rolling_window_timestamps", type=int, default=None,
+                        help="Manual number of pre-tau unique timestamps for "
+                             "rolling_fixed (no automatic default).")
+    parser.add_argument("--rolling-window-days", "--rolling_window_days",
+                        dest="rolling_window_days", type=float, default=None,
+                        help="Manual day-distance window for rolling_fixed.")
     parser.add_argument("--dry-run", "--dry_run", dest="dry_run", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--restart", action="store_true")
@@ -392,6 +510,21 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
     from the CLI flags + ``configs/model_specs.yaml``.
     """
     panel_mode = getattr(args, "panel_mode", "pooled") or "pooled"
+    from .windowing import window_suffix as _window_suffix
+    train_window_mode = getattr(args, "train_window", "expanding") or "expanding"
+    rolling_window_timestamps = getattr(args, "rolling_window_timestamps", None)
+    rolling_window_days = getattr(args, "rolling_window_days", None)
+    if train_window_mode == "rolling_fixed" and (
+        rolling_window_timestamps is None and rolling_window_days is None
+    ):
+        # Fail fast with a clear message — there is no automatic break-informed
+        # default window. Structural breaks are diagnostic only.
+        print("  [ERROR] --train-window rolling_fixed requires "
+              "--rolling-window-timestamps or --rolling-window-days "
+              "(no automatic default).")
+        return 2
+    win_suffix = _window_suffix(train_window_mode, rolling_window_timestamps,
+                                rolling_window_days)
 
     from .hyperparameter_tuning import hpo_variant_label, load_hpo_config
     if hpo_cfg is None:
@@ -425,7 +558,7 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
             if args.set_id:
                 out_name_example = (
                     f"Outputs/Signals/{args.horizon or '<horizon>'}/"
-                    f"{panel_output_name(args.set_id, args.sentiment_model or '-', panel_mode, hpo_variant)}.parquet"
+                    f"{panel_output_name(args.set_id, args.sentiment_model or '-', panel_mode, hpo_variant, win_suffix)}.parquet"
                 )
             log_stage_header(
                 "run_models", mode="dry-run", inputs=inputs, outputs=[],
@@ -447,6 +580,9 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                         if tune_on else "(off)"),
                     "hpo_validation_fraction": (
                         hpo_cfg["validation_fraction"] if tune_on else "(off)"),
+                    "train_window_mode":         train_window_mode,
+                    "rolling_window_timestamps": rolling_window_timestamps,
+                    "rolling_window_days":       rolling_window_days,
                     "checkpoint_enabled":    ckpt_on,
                     "resume":                resume,
                     "checkpoint_dir":        ckpt_dir,
@@ -509,13 +645,18 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
             if not (sent_model and str(sent_model) not in ("-", "nan")):
                 sent_model = "-"
 
-            out_name = panel_output_name(set_id, sent_model, panel_mode, hpo_variant)
+            out_name = panel_output_name(set_id, sent_model, panel_mode,
+                                         hpo_variant, win_suffix)
             out_path = os.path.join(hz_dir, f"{out_name}.parquet")
 
-            # Benchmark sentinel is not a panel-logit model.
-            if feat_str.strip() in _BENCHMARK_SENTINELS:
+            # Panel-compatible benchmark: ticker-rolling probability with pooled
+            # fallback. Honours the same training-window mode as the logistic
+            # models so the comparison stays apples-to-apples; the per-row
+            # ``benchmark_model`` column tags the rule used.
+            is_benchmark = feat_str.strip() in _BENCHMARK_SENTINELS
+            if is_benchmark and tune_on:
                 print(f"\n  ── {out_name} ({label}) → SKIP "
-                      f"(benchmark sentinel not supported for panel_logit)")
+                      f"(rolling-probability benchmark is not tuned)")
                 continue
 
             if os.path.isfile(out_path) and not args.restart:
@@ -538,41 +679,73 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
 
             print(f"\n  ── {out_name} ({label}) ")
 
-            feature_cols = [f.strip() for f in feat_str.split(",")]
-            missing = [f for f in feature_cols if f not in df_all.columns]
-            if missing:
-                print(f"  → SKIP (missing: {missing[:3]})")
-                all_metrics.append({
-                    "horizon": hz, "set_id": set_id, "sentiment_model": sent_model,
-                    "label": label, "category": category, "ticker": "pooled",
-                    "accuracy": np.nan, "n_obs": 0, "n_tickers": 0,
-                    "model_type": MODEL_TYPE, "panel_mode": panel_mode,
-                    "status": f"missing: {missing[:3]}",
-                })
-                continue
+            if is_benchmark:
+                feature_cols = []  # rolling probability uses no features
+            else:
+                feature_cols = [f.strip() for f in feat_str.split(",")]
+                missing = [f for f in feature_cols if f not in df_all.columns]
+                if missing:
+                    print(f"  → SKIP (missing: {missing[:3]})")
+                    all_metrics.append({
+                        "horizon": hz, "set_id": set_id, "sentiment_model": sent_model,
+                        "label": label, "category": category, "ticker": "pooled",
+                        "accuracy": np.nan, "n_obs": 0, "n_tickers": 0,
+                        "model_type": MODEL_TYPE, "panel_mode": panel_mode,
+                        "status": f"missing: {missing[:3]}",
+                    })
+                    continue
 
             # ── Checkpoint setup (per-run chunk directory) ────
             root = ckpt.checkpoint_root(ckpt_dir, hz, out_name)
             checkpoint_context = None
+            manifest_base = {
+                "horizon": hz, "set_id": set_id, "sentiment_model": sent_model,
+                "model_type": MODEL_TYPE, "panel_mode": panel_mode,
+                "hpo_variant": hpo_variant if tune_on else "fixed",
+                "hpo_objective": hpo_cfg["objective"] if tune_on else "-",
+                "feature_cols": feature_cols,
+                "train_window_mode":         train_window_mode,
+                "rolling_window_timestamps": rolling_window_timestamps,
+                "rolling_window_days":       rolling_window_days,
+                "benchmark":                 bool(is_benchmark),
+            }
             if ckpt_on:
+                # Refuse to reuse checkpoints when the run's window mode,
+                # rolling-window size, feature list, HPO objective, panel mode
+                # or panel-mode/benchmark identity differs.
+                existing = ckpt.load_manifest(root)
+                guard_keys = ("train_window_mode", "rolling_window_timestamps",
+                              "rolling_window_days", "feature_cols",
+                              "hpo_objective", "panel_mode", "benchmark")
+                if existing and any(existing.get(k) != manifest_base.get(k)
+                                    for k in guard_keys):
+                    print("  [INFO] Existing checkpoint manifest is incompatible "
+                          "(window/feature/hpo/panel-mode changed) — clearing.")
+                    ckpt.clear_run_checkpoints(root)
                 if clear_ckpt:
                     ckpt.clear_run_checkpoints(root)
-                ckpt.init_manifest(root, base={
-                    "horizon": hz, "set_id": set_id, "sentiment_model": sent_model,
-                    "model_type": MODEL_TYPE, "panel_mode": panel_mode,
-                    "hpo_variant": hpo_variant if tune_on else "fixed",
-                    "hpo_objective": hpo_cfg["objective"] if tune_on else "-",
-                    "feature_cols": feature_cols,
-                })
+                ckpt.init_manifest(root, base=manifest_base)
                 checkpoint_context = {"enabled": True, "resume": resume,
                                       "root": root, "chunk_size": chunk_size}
 
             t0 = time.time()
-            signals = run_panel_model_for_feature_set(
-                df_all, feature_cols, tickers, C=args.C, panel_mode=panel_mode,
-                tune_hyperparams=tune_on, hpo_config=hpo_cfg,
-                checkpoint_context=checkpoint_context,
-            )
+            if is_benchmark:
+                df_used = df_all[df_all["ticker"].isin(set(tickers))] if tickers else df_all
+                signals = run_panel_rolling_probability(
+                    df_used, panel_mode=panel_mode,
+                    train_window_mode=train_window_mode,
+                    rolling_window_timestamps=rolling_window_timestamps,
+                    rolling_window_days=rolling_window_days,
+                )
+            else:
+                signals = run_panel_model_for_feature_set(
+                    df_all, feature_cols, tickers, C=args.C, panel_mode=panel_mode,
+                    tune_hyperparams=tune_on, hpo_config=hpo_cfg,
+                    checkpoint_context=checkpoint_context,
+                    train_window_mode=train_window_mode,
+                    rolling_window_timestamps=rolling_window_timestamps,
+                    rolling_window_days=rolling_window_days,
+                )
             elapsed = time.time() - t0
             if ckpt_on:
                 mf = ckpt.load_manifest(root)
@@ -669,7 +842,10 @@ def run(*, horizon: str | None = None, set_id: str | None = None,
         resume: bool = True,
         checkpoint_dir: str | None = None,
         checkpoint_chunk_size: int | None = None,
-        clear_checkpoints: bool = False) -> int:
+        clear_checkpoints: bool = False,
+        train_window: str = "expanding",
+        rolling_window_timestamps: int | None = None,
+        rolling_window_days: float | None = None) -> int:
     """Programmatic entry point mirroring :func:`main`."""
     argv: list[str] = []
     if horizon:
@@ -706,6 +882,12 @@ def run(*, horizon: str | None = None, set_id: str | None = None,
         argv += ["--checkpoint-chunk-size", str(checkpoint_chunk_size)]
     if clear_checkpoints:
         argv.append("--clear-checkpoints")
+    if train_window:
+        argv += ["--train-window", train_window]
+    if rolling_window_timestamps is not None:
+        argv += ["--rolling-window-timestamps", str(rolling_window_timestamps)]
+    if rolling_window_days is not None:
+        argv += ["--rolling-window-days", str(rolling_window_days)]
     if dry_run:
         argv.append("--dry-run")
     if force:
