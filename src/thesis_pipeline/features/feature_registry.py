@@ -29,10 +29,24 @@ def load_feature_sets_yaml() -> Dict[str, dict]:
 
 
 def load_feature_sets_xlsx() -> Dict[str, dict] | None:
-    """Load ``feature_sets.xlsx`` if available. Returns None otherwise.
+    """Load ``feature_sets.xlsx`` if available. Returns ``None`` otherwise.
 
-    Mirrors the loader in Run_Models.py (normalises header variants:
-    ``feature_columns`` ↔ ``features``).
+    Header handling is intentionally kept in lock-step with
+    :func:`thesis_pipeline.modeling.run_models.load_feature_sets` so the
+    registry and the modelling loader can never disagree on which column holds
+    the comma-separated feature list:
+
+      1. Every header is normalised to snake_case by stripping, lower-casing
+         and replacing any run of non-alphanumerics with a single ``_``. After
+         this pass ``"Set ID"`` → ``"set_id"``,
+         ``"Feature Columns (comma-separated)"`` → ``"feature_columns_comma_separated"``
+         and ``"# Features"`` → ``"features"``.
+      2. The feature-list column is chosen by explicit priority:
+         ``feature_columns_comma_separated`` ≻ ``feature_columns`` ≻
+         ``features``. When a higher-priority header is present, any
+         pre-existing ``features`` column (e.g. the integer ``# Features``
+         count that just normalised to that name) is dropped first so the
+         rename actually wins.
     """
     path = resolve_path("feature_sets_xlsx")
     if not Path(path).exists():
@@ -45,11 +59,24 @@ def load_feature_sets_xlsx() -> Dict[str, dict] | None:
         df = pd.read_excel(path, sheet_name="feature_sets")
     except Exception:  # noqa: BLE001 — be tolerant; the script handles details
         return None
-    # Header normalisation matching Run_Models.py
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    if "features" not in df.columns and "feature_columns" in df.columns:
-        df = df.rename(columns={"feature_columns": "features"})
+
+    # Normalise display headers to snake_case (matches run_models.load_feature_sets).
+    df.columns = (df.columns.astype(str)
+                  .str.strip()
+                  .str.lower()
+                  .str.replace(r"[^a-z0-9]+", "_", regex=True)
+                  .str.strip("_"))
+
+    # Pick the feature-list column by priority and drop the loser ``features``.
+    for preferred in ("feature_columns_comma_separated", "feature_columns"):
+        if preferred in df.columns:
+            if "features" in df.columns and preferred != "features":
+                df = df.drop(columns=["features"])
+            df = df.rename(columns={preferred: "features"})
+            break
+
     sets: Dict[str, dict] = {}
+    has_sentiment_col = "sentiment_model" in df.columns
     for _, row in df.iterrows():
         set_id = str(row.get("set_id") or "").strip()
         if not set_id:
@@ -61,7 +88,7 @@ def load_feature_sets_xlsx() -> Dict[str, dict] | None:
             "category": str(row.get("category", "") or ""),
             "label":    str(row.get("label", "") or ""),
             "sentiment_model": (str(row.get("sentiment_model")) or None)
-                if "sentiment_model" in df.columns else None,
+                if has_sentiment_col else None,
         }
     return sets
 
