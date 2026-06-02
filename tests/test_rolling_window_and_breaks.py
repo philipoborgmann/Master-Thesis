@@ -364,6 +364,88 @@ def test_no_neutral_fill_leaves_missing_sentiment_nan(merge_repo):
     assert sol["realized_vol_14"].notna().all()
 
 
+def test_neutral_fill_sets_sentiment_std_to_zero(merge_repo):
+    """*_std sentiment columns must be filled with 0.0 so panel_logit's
+    dropna(subset=feature_cols + ['target']) does not silently drop rich
+    rows for low-coverage tickers when neutral fill is enabled.
+    """
+    rc = fm.main(["--horizon", "1d", "--no-sentiment-coverage-filter"])
+    assert rc == 0
+    merged = pd.read_parquet(merge_repo / "Data" / "Final" / "features_1d.parquet")
+    sol = merged[merged["ticker"] == "SOL"]
+    # SOL had no sentiment rows — *_std must now be 0.0, not NaN.
+    assert sol["vader_title_score_std"].notna().all()
+    assert (sol["vader_title_score_std"] == 0.0).all()
+    # And the BTC/ETH rows that did have real std values stay unchanged.
+    btc = merged[merged["ticker"] == "BTC"]["vader_title_score_std"]
+    assert btc.notna().all()
+    assert (btc > 0).any()
+
+
+def test_no_neutral_fill_leaves_sentiment_std_nan(merge_repo):
+    rc = fm.main(["--horizon", "1d", "--no-sentiment-coverage-filter",
+                  "--no-neutral-fill-missing-sentiment"])
+    assert rc == 0
+    merged = pd.read_parquet(merge_repo / "Data" / "Final" / "features_1d.parquet")
+    sol = merged[merged["ticker"] == "SOL"]
+    assert sol["vader_title_score_std"].isna().all()
+
+
+def test_fill_missing_sentiment_fills_each_column_kind_correctly():
+    """Spot-check every neutral-fill branch in one go on a synthetic frame
+    so a future edit can't quietly regress one of them.
+    """
+    df = pd.DataFrame({
+        "ticker":                       ["BTC", "BTC"],
+        "post_count":                   [np.nan, 3],
+        "vader_post_count":             [np.nan, 7],
+        "vader_title_score_mean":       [np.nan, 0.42],
+        "vader_combined_weighted_mean": [np.nan, 0.10],
+        "vader_title_score_median":     [np.nan, 0.05],
+        "vader_title_score_std":        [np.nan, 0.20],
+        "vader_combined_score_std":     [np.nan, 0.30],
+        "cryptobert_bullishness_ratio": [np.nan, 0.60],
+        # Non-sentiment columns the function must NEVER touch.
+        "log_return_t":                 [np.nan, 0.01],
+        "realized_vol_14":              [np.nan, 0.02],
+        "target":                       [np.nan, 1.0],
+    })
+    sent_cols = [c for c in df.columns
+                 if c not in ("ticker", "log_return_t", "realized_vol_14",
+                              "target")]
+    out = fm.fill_missing_sentiment(df.copy(), sent_cols)
+    # post_count → 0
+    assert (out["post_count"] == [0, 3]).all()
+    assert (out["vader_post_count"] == [0, 7]).all()
+    # mean / weighted_mean / median → 0.0
+    assert out["vader_title_score_mean"].iat[0] == 0.0
+    assert out["vader_combined_weighted_mean"].iat[0] == 0.0
+    assert out["vader_title_score_median"].iat[0] == 0.0
+    # std → 0.0 (the change under test)
+    assert out["vader_title_score_std"].iat[0] == 0.0
+    assert out["vader_combined_score_std"].iat[0] == 0.0
+    # bullishness_ratio → 0.5
+    assert out["cryptobert_bullishness_ratio"].iat[0] == 0.5
+    # Non-sentiment columns stay NaN.
+    assert pd.isna(out["log_return_t"].iat[0])
+    assert pd.isna(out["realized_vol_14"].iat[0])
+    assert pd.isna(out["target"].iat[0])
+    # And real values are preserved on the non-NaN rows.
+    assert out["vader_title_score_std"].iat[1] == 0.20
+
+
+def test_non_sentiment_std_like_columns_are_not_filled():
+    """``realized_vol_14`` looks std-ish in spirit but is NOT a sentiment
+    column, so ``sentiment_neutral_columns`` must keep it out of scope.
+    """
+    cols = ["realized_vol_14", "vader_title_score_std", "cryptobert_combined_score_std",
+            "log_return_t", "target", "timestamp", "ticker"]
+    fill_targets = set(fm.sentiment_neutral_columns(cols))
+    assert {"vader_title_score_std", "cryptobert_combined_score_std"} <= fill_targets
+    assert "realized_vol_14" not in fill_targets
+    assert fill_targets.isdisjoint({"log_return_t", "target", "timestamp", "ticker"})
+
+
 def test_neutral_fill_targets_only_sentiment_attention_columns():
     cols = ["vader_title_score_mean", "vader_bullishness_ratio",
             "vader_title_score_std", "post_count", "log_return_t",

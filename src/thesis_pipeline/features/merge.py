@@ -34,7 +34,7 @@ COVERAGE_THRESHOLD = 85.0
 # Sentiment columns that represent scores (filled with 0 for missing slots)
 # vs. std columns (left as NaN) vs. count columns (filled with 0)
 SCORE_FILL = 0.0     # neutral sentiment
-STD_FILL   = np.nan  # unknown dispersion — NaN is honest
+STD_FILL   = 0.0     # no posts → no observed dispersion (neutral fill)
 COUNT_FILL = 0       # no posts = 0 count
 
 
@@ -83,9 +83,9 @@ def sentiment_neutral_columns(sentiment_cols: list[str]) -> list[str]:
 
     * ``*_mean`` / ``*_weighted_mean`` / ``*_median``  → 0.0
     * ``*_bullishness_ratio``                          → 0.5
-    * ``*_std``                                        → 0.0  (only when fill is
-      explicitly requested; the default ``fill_missing_sentiment`` keeps these
-      NaN as before)
+    * ``*_std``                                        → 0.0 (no posts → no
+      observed dispersion; included here so the merge report counts these as
+      filled)
     * ``post_count`` / ``*_post_count``                → 0
 
     Non-sentiment columns (price, volatility, volume, market_cap, target,
@@ -105,18 +105,25 @@ def sentiment_neutral_columns(sentiment_cols: list[str]) -> list[str]:
 
 def fill_missing_sentiment(df: pd.DataFrame,
                            sentiment_cols: list[str]) -> pd.DataFrame:
-    """Fill NaN sentiment after a left join from price onto sentiment.
+    """Fill NaN sentiment / attention columns with their neutral values.
 
-    * Score columns (*_mean / *_weighted_mean / *_median) → 0  (neutral signal)
-    * Std columns (*_std)                                 → NaN (honest unknown)
-    * Bullishness ratio                                   → 0.5 (neutral)
-    * post_count                                          → 0
+    Only sentiment / attention columns are touched — never price, return,
+    volatility, volume, market_cap, target, timestamp or ticker columns.
+
+    * Score columns (``*_mean`` / ``*_weighted_mean`` / ``*_median``)
+                                                          → 0.0 (neutral signal)
+    * Std columns (``*_std``)                              → 0.0 (no posts →
+      no observed dispersion; encodes "no sentiment information" rather than
+      leaving NaN, which would cascade into downstream ``dropna`` calls and
+      silently drop rich rows in panel_logit)
+    * Bullishness ratio (``*_bullishness_ratio``)         → 0.5 (neutral)
+    * post_count / ``*_post_count``                       → 0
     """
     for col in sentiment_cols:
-        if col == "post_count":
+        if col == "post_count" or col.endswith("_post_count"):
             df[col] = df[col].fillna(COUNT_FILL)
         elif col.endswith("_std"):
-            pass  # leave NaN — unknown dispersion is honest
+            df[col] = df[col].fillna(0.0)
         elif "bullishness_ratio" in col:
             df[col] = df[col].fillna(0.5)
         elif any(col.endswith(s) for s in ("_mean", "_weighted_mean", "_median")):
