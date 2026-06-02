@@ -219,19 +219,26 @@ def test_full_pipeline_panel_ticker_fe(panel_repo):
 
 
 # ---------------------------------------------------------------------------
-# 7. B1 sentinel must not crash
+# 7. B1 is now run as a panel rolling-probability benchmark (no longer skipped)
 # ---------------------------------------------------------------------------
 
-def test_panel_b1_sentinel_skipped(panel_repo):
+def test_panel_b1_runs_as_rolling_probability_benchmark(panel_repo):
     rc = run_models_main([
         "--horizon", "1d", "--set-id", "B1",
         "--model-type", "panel_logit", "--panel-mode", "pooled",
         "--restart",
     ])
     assert rc == 0
-    # No panel output is produced for the benchmark sentinel.
+    # The panel rolling-probability benchmark now produces a signal file with
+    # the same naming scheme as the logistic models.
     out = panel_repo / "Outputs" / "Signals" / "1d" / "B1_panel_pooled.parquet"
-    assert not out.exists()
+    assert out.exists()
+    sdf = pd.read_parquet(out)
+    assert not sdf.empty
+    assert (sdf["benchmark_model"]
+            == "ticker_rolling_probability_with_pooled_fallback").all()
+    assert ((sdf["probability"] >= 0) & (sdf["probability"] <= 1)).all()
+    assert (sdf["model_type"] == "panel_logit").all()
 
 
 # ---------------------------------------------------------------------------

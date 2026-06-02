@@ -95,6 +95,21 @@ def _add_run_models_args(parser: argparse.ArgumentParser) -> None:
                         dest="clear_checkpoints", action="store_true",
                         help="Delete this run's checkpoint directory before "
                              "starting (does not happen automatically on --restart).")
+    parser.add_argument("--train-window", "--train_window",
+                        dest="train_window", default="expanding",
+                        choices=["expanding", "rolling_fixed"],
+                        help="Panel training window (default: expanding). "
+                             "rolling_fixed requires --rolling-window-timestamps "
+                             "or --rolling-window-days; structural-break "
+                             "diagnostics never set this automatically.")
+    parser.add_argument("--rolling-window-timestamps", "--rolling_window_timestamps",
+                        dest="rolling_window_timestamps", type=int, default=None,
+                        help="Manual number of pre-tau unique timestamps to "
+                             "include in the rolling training window.")
+    parser.add_argument("--rolling-window-days", "--rolling_window_days",
+                        dest="rolling_window_days", type=float, default=None,
+                        help="Manual day-distance rolling window (alternative "
+                             "to --rolling-window-timestamps).")
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +237,31 @@ def cmd_stationarity(args: argparse.Namespace) -> int:
     return _m.main(argv)
 
 
+def cmd_structural_breaks(args: argparse.Namespace) -> int:
+    rc = _stage_dry_run("structural_breaks", args)
+    if rc is not None:
+        return rc
+    from .diagnostics import structural_breaks as _m
+    argv: list[str] = []
+    if getattr(args, "horizon", None):
+        argv += ["--horizon", args.horizon]
+    if getattr(args, "features", None):
+        argv += ["--features", *list(args.features)]
+    if getattr(args, "include_market_cap", False):
+        argv.append("--include-market-cap")
+    if getattr(args, "max_breaks", None) is not None:
+        argv += ["--max-breaks", str(args.max_breaks)]
+    if getattr(args, "min_segment_frac", None) is not None:
+        argv += ["--min-segment-frac", str(args.min_segment_frac)]
+    if getattr(args, "n_bkps", None) is not None:
+        argv += ["--n-bkps", str(args.n_bkps)]
+    if getattr(args, "output_dir", None):
+        argv += ["--output-dir", args.output_dir]
+    if getattr(args, "dry_run", False):
+        argv.append("--dry-run")
+    return _m.main(argv)
+
+
 def cmd_descriptive_final_features(args: argparse.Namespace) -> int:
     rc = _stage_dry_run("descriptive_final_features", args)
     if rc is not None:
@@ -248,6 +288,12 @@ def cmd_merge_features(args: argparse.Namespace) -> int:
     argv: list[str] = []
     if args.horizon:
         argv += ["--horizon", args.horizon]
+    if getattr(args, "no_sentiment_coverage_filter", False):
+        argv.append("--no-sentiment-coverage-filter")
+    # ``neutral_fill_missing_sentiment`` defaults to True; only forward when
+    # the caller explicitly turned it off so the legacy CLI surface stays clean.
+    if getattr(args, "neutral_fill_missing_sentiment", True) is False:
+        argv.append("--no-neutral-fill-missing-sentiment")
     if args.smoke:
         argv.append("--smoke")
     if args.dry_run:
@@ -299,6 +345,12 @@ def cmd_run_models(args: argparse.Namespace) -> int:
         argv += ["--checkpoint-chunk-size", str(args.checkpoint_chunk_size)]
     if getattr(args, "clear_checkpoints", False):
         argv.append("--clear-checkpoints")
+    if getattr(args, "train_window", None):
+        argv += ["--train-window", args.train_window]
+    if getattr(args, "rolling_window_timestamps", None) is not None:
+        argv += ["--rolling-window-timestamps", str(args.rolling_window_timestamps)]
+    if getattr(args, "rolling_window_days", None) is not None:
+        argv += ["--rolling-window-days", str(args.rolling_window_days)]
     if args.smoke:
         argv.append("--smoke")
     if args.dry_run:
@@ -385,6 +437,7 @@ def _dispatch_stage(stage: str, args: argparse.Namespace) -> int:
         "diagnostics":               cmd_diagnostics,
         "reports":                   cmd_diagnostics,
         "descriptive_final_features": cmd_descriptive_final_features,
+        "structural_breaks":          cmd_structural_breaks,
     }
     if stage not in table:
         raise SystemExit(f"Unknown stage: {stage}")
@@ -473,6 +526,26 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(sp)
     sp.set_defaults(func=cmd_stationarity)
 
+    # structural-breaks (diagnostic only — never feeds modelling)
+    sp = sub.add_parser("structural-breaks",
+                        help="Bai-Perron-style structural-break diagnostics "
+                             "for the final modelling features. Diagnostic "
+                             "only — does NOT set rolling-window sizes.")
+    sp.add_argument("--horizon", default=None, choices=["1h", "6h", "1d"])
+    sp.add_argument("--features", nargs="*", default=None,
+                    help="Override the default diagnostic basket.")
+    sp.add_argument("--include-market-cap", dest="include_market_cap",
+                    action="store_true",
+                    help="Include market_cap_t in the default basket.")
+    sp.add_argument("--max-breaks", dest="max_breaks", type=int, default=None)
+    sp.add_argument("--min-segment-frac", dest="min_segment_frac", type=float,
+                    default=None)
+    sp.add_argument("--n-bkps", dest="n_bkps", type=int, default=None,
+                    help="Fix the number of breaks; skips BIC selection.")
+    sp.add_argument("--output-dir", dest="output_dir", default=None)
+    _add_common(sp)
+    sp.set_defaults(func=cmd_structural_breaks)
+
     # descriptive-final-features
     sp = sub.add_parser("descriptive-final-features",
                         help="Extensive descriptive statistics for the final "
@@ -489,6 +562,15 @@ def build_parser() -> argparse.ArgumentParser:
     # merge-features
     sp = sub.add_parser("merge-features", help="Merge price + sentiment features.")
     sp.add_argument("--horizon", default=None)
+    sp.add_argument("--no-sentiment-coverage-filter",
+                    dest="no_sentiment_coverage_filter", action="store_true",
+                    help="Keep tickers below the per-horizon sentiment coverage "
+                         "threshold (useful for panel models).")
+    sp.add_argument("--neutral-fill-missing-sentiment",
+                    dest="neutral_fill_missing_sentiment",
+                    action=argparse.BooleanOptionalAction, default=True,
+                    help="Fill NaN sentiment/attention columns with neutral "
+                         "values (default: on, current behaviour).")
     _add_common(sp)
     sp.set_defaults(func=cmd_merge_features)
 
