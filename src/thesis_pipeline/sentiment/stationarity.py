@@ -1238,21 +1238,48 @@ def main(argv=None):
 # 18. FINAL-FEATURE STATIONARITY (covers the entire modelling universe)
 # ──────────────────────────────────────────────────────────────────────
 
+def _detect_registry_source() -> str:
+    """Best-effort tag for the resolution CSV: which feature_sets file won."""
+    try:
+        from pathlib import Path
+        from ..config import resolve_path
+        p = resolve_path("feature_sets_xlsx")
+        if Path(p).exists():
+            return "feature_sets.xlsx"
+    except Exception:  # noqa: BLE001 — best effort
+        pass
+    return "feature_sets.yaml"
+
+
+def _resolve_stationarity_final_root() -> str:
+    """Output root for the final-feature stationarity stage.
+
+    Uses ``configs/paths.yaml :: stationarity_final_root`` when present, with
+    a safe default at ``Data/Features/stationarity_final``.
+    """
+    try:
+        from ..config import resolve_path
+        return str(resolve_path("stationarity_final_root"))
+    except Exception:  # noqa: BLE001 — fall back when the key is absent
+        return os.path.join(FEATURE_DIR, "stationarity_final")
+
+
 def _run_final(args) -> int:
     """Drive the stationarity battery against the **final modelling features**.
 
     Reads ``Data/Final/features_{horizon}.parquet``, resolves the modelling
     feature universe via :mod:`thesis_pipeline.features.final_feature_utils`
-    (with a numeric-column fallback when the registry is unavailable), runs the
-    same test battery as the legacy sentiment path, and writes one CSV per
-    deliverable under ``Data/Features/stationarity_final/``.
+    (which itself uses the corrected
+    :func:`thesis_pipeline.features.feature_registry.load_feature_sets`), runs
+    the same test battery as the legacy sentiment path, and writes one CSV per
+    deliverable under the configured ``stationarity_final_root``.
     """
     from ..features.feature_registry import load_feature_sets
     from ..features.final_feature_utils import (
         classify_feature_group, load_final_features, resolve_final_feature_columns,
     )
 
-    out_dir = os.path.join(FEATURE_DIR, "stationarity_final")
+    out_dir = _resolve_stationarity_final_root()
     os.makedirs(out_dir, exist_ok=True)
     records_csv    = os.path.join(out_dir, "stationarity_final_records.csv")
     summary_csv    = os.path.join(out_dir, "stationarity_final_summary.csv")
@@ -1262,9 +1289,11 @@ def _run_final(args) -> int:
 
     try:
         feature_sets = load_feature_sets() or {}
+        registry_source = _detect_registry_source()
     except Exception as exc:  # noqa: BLE001 — registry is best-effort
         logger.warning("could not load feature_sets registry (%s) — numeric fallback", exc)
         feature_sets = {}
+        registry_source = "feature_sets.yaml"
 
     horizons_to_test = [args.horizon] if args.horizon else ["1h", "6h", "1d"]
 
@@ -1275,7 +1304,7 @@ def _run_final(args) -> int:
 
     for hz in horizons_to_test:
         logger.info("=" * 60)
-        logger.info("HORIZON: %s  (source=final)", hz)
+        logger.info("HORIZON: %s  (source=final, registry=%s)", hz, registry_source)
         logger.info("=" * 60)
         try:
             df = load_final_features(hz)
@@ -1286,11 +1315,26 @@ def _run_final(args) -> int:
                     f"Data/Final/features_{hz}.parquet")
 
         feature_cols, hz_resolution = resolve_final_feature_columns(df, feature_sets)
+        # The resolution log gets a horizon stamp, a feature-group classification
+        # (so downstream readers can pivot without re-classifying), and the
+        # registry-source tag. ``used_in_stationarity`` is filled in *after* the
+        # records are built so it reflects what actually made it into the
+        # records frame (not just what was resolved).
         for row in hz_resolution:
             row["horizon"] = hz
+            row["feature_group"] = classify_feature_group(row.get("resolved_feature", ""))
+            row["registry_source"] = (
+                "numeric_fallback"
+                if row.get("set_id") == "__numeric_fallback__"
+                else registry_source
+            )
             row.setdefault("used_in_descriptive_statistics", False)
         resolutions.extend(hz_resolution)
-        logger.info("resolved %d modelling features for %s", len(feature_cols), hz)
+        logger.info("resolved %d modelling features for %s (incl. %d sentiment)",
+                    len(feature_cols),
+                    hz,
+                    sum(1 for f in feature_cols
+                        if classify_feature_group(f) == "sentiment"))
 
         tickers = [args.ticker] if args.ticker else None
         all_records.extend(test_horizon(df, hz, tickers=tickers,
@@ -1306,7 +1350,6 @@ def _run_final(args) -> int:
     rec_df    = pd.DataFrame(all_records)
     panel_df  = pd.DataFrame(panel_recs)
     fold_df   = pd.DataFrame(fold_recs)
-    res_df    = pd.DataFrame(resolutions)
 
     # ── BH/FDR on the usual p-value blocks ────────────────────
     if not rec_df.empty:
@@ -1318,6 +1361,16 @@ def _run_final(args) -> int:
         if "feature_group" not in rec_df.columns:
             rec_df["feature_group"] = rec_df["feature"].map(classify_feature_group)
         rec_df["half_life"] = rec_df.get("ar1_halflife")
+
+    # ── Fill ``used_in_stationarity`` on the resolution log ───
+    appeared: set[tuple[str, str]] = set()
+    if not rec_df.empty:
+        appeared = set(zip(rec_df["horizon"].astype(str),
+                            rec_df["feature"].astype(str)))
+    for row in resolutions:
+        key = (str(row.get("horizon", "")), str(row.get("resolved_feature", "")))
+        row["used_in_stationarity"] = key in appeared
+    res_df = pd.DataFrame(resolutions)
 
     # ── Records CSV ───────────────────────────────────────────
     records_columns = [
@@ -1346,17 +1399,22 @@ def _run_final(args) -> int:
         rec_df[ordered].to_csv(records_csv, index=False)
     logger.info("records → %s", records_csv)
 
-    # ── Summary CSV (counts by horizon × feature_group × joint_class) ──
-    summary_cols = ["horizon", "feature_group", "joint_class", "count", "pct"]
+    # ── Summary CSV (counts + dual percentages) ───────────────
+    summary_cols = ["horizon", "feature_group", "joint_class", "count",
+                    "pct_within_horizon", "pct_within_feature_group"]
     if rec_df.empty:
         pd.DataFrame(columns=summary_cols).to_csv(summary_csv, index=False)
     else:
         grp = (rec_df
                .groupby(["horizon", "feature_group", "joint_class"], dropna=False)
                .size().reset_index(name="count"))
-        totals = grp.groupby("horizon")["count"].transform("sum").replace(0, np.nan)
-        grp["pct"] = (grp["count"] / totals * 100.0).round(4)
-        grp.to_csv(summary_csv, index=False)
+        horizon_total = (grp.groupby("horizon")["count"].transform("sum")
+                            .replace(0, np.nan))
+        group_total = (grp.groupby(["horizon", "feature_group"])["count"]
+                          .transform("sum").replace(0, np.nan))
+        grp["pct_within_horizon"]      = (grp["count"] / horizon_total * 100.0).round(4)
+        grp["pct_within_feature_group"] = (grp["count"] / group_total   * 100.0).round(4)
+        grp[summary_cols].to_csv(summary_csv, index=False)
     logger.info("summary → %s", summary_csv)
 
     # ── Panel CIPS CSV (always written, even when empty) ──────
@@ -1383,10 +1441,11 @@ def _run_final(args) -> int:
         fold_df[fold_cols].to_csv(fold_csv, index=False)
     logger.info("fold stability → %s", fold_csv)
 
-    # ── Feature-resolution CSV ────────────────────────────────
+    # ── Feature-resolution CSV (per-row provenance) ───────────
     res_cols = ["horizon", "set_id", "category", "label", "sentiment_model",
                 "requested_feature", "resolved_feature",
-                "exists_in_final_data", "reason_if_missing"]
+                "exists_in_final_data", "used_in_stationarity",
+                "feature_group", "registry_source", "reason_if_missing"]
     if res_df.empty:
         pd.DataFrame(columns=res_cols).to_csv(resolution_csv, index=False)
     else:
