@@ -411,7 +411,8 @@ def write_csv_outputs(out_dir: Path, *,
                       economic_threshold: pd.DataFrame | None = None,
                       economic_by_ticker: pd.DataFrame | None = None,
                       regime_mcnemar: pd.DataFrame | None = None,
-                      regime_mcnemar_summary: pd.DataFrame | None = None
+                      regime_mcnemar_summary: pd.DataFrame | None = None,
+                      incremental_sentiment: pd.DataFrame | None = None,
                       ) -> dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
@@ -434,6 +435,8 @@ def write_csv_outputs(out_dir: Path, *,
     _emit("economic_by_ticker",  economic_by_ticker,  "economic_performance_by_ticker.csv")
     _emit("regime_mcnemar",         regime_mcnemar,         "regime_mcnemar_tests.csv")
     _emit("regime_mcnemar_summary", regime_mcnemar_summary, "regime_mcnemar_summary.csv")
+    _emit("incremental_sentiment_value", incremental_sentiment,
+          "incremental_sentiment_value.csv")
     return paths
 
 
@@ -452,7 +455,8 @@ def write_excel_report(out_path: Path, *,
                        economic_threshold: pd.DataFrame | None = None,
                        economic_by_ticker: pd.DataFrame | None = None,
                        regime_mcnemar: pd.DataFrame | None = None,
-                       regime_mcnemar_summary: pd.DataFrame | None = None) -> Path:
+                       regime_mcnemar_summary: pd.DataFrame | None = None,
+                       incremental_sentiment: pd.DataFrame | None = None) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _write_all(target: Path) -> None:
@@ -479,6 +483,9 @@ def write_excel_report(out_path: Path, *,
                 _write_sheet(writer, "regime_mcnemar_tests",      regime_mcnemar)
             if regime_mcnemar_summary is not None:
                 _write_sheet(writer, "regime_mcnemar_summary",    regime_mcnemar_summary)
+            if incremental_sentiment is not None:
+                _write_sheet(writer, "incremental_sentiment_value",
+                             incremental_sentiment)
             _write_sheet(writer, "leaderboard",                   leaderboard)
             _write_sheet(writer, "summary",                       summary)
 
@@ -510,7 +517,8 @@ def print_console_summary(*,
                           regime_interaction: pd.DataFrame | None = None,
                           economic: pd.DataFrame | None = None,
                           economic_threshold: pd.DataFrame | None = None,
-                          regime_mcnemar: pd.DataFrame | None = None) -> None:
+                          regime_mcnemar: pd.DataFrame | None = None,
+                          incremental_sentiment: pd.DataFrame | None = None) -> None:
     print("\n" + "=" * 72)
     print(" SIGNAL EVALUATION SUMMARY")
     print("=" * 72)
@@ -728,4 +736,31 @@ def print_console_summary(*,
                 print(f"    top benchmark regime: {r['set_id']}{tag} vs "
                       f"{r['benchmark']}, {_regime_label(r)}, "
                       f"c-b={int(r['_ni']):+d}, q={r.get('q_value_bh', float('nan')):.4f}")
+
+    # ── Incremental sentiment value vs matched economic benchmark ──
+    # One line per (horizon × combined model × scorer), sorted by
+    # accuracy_lift descending within each horizon. Missing-benchmark rows are
+    # listed at the bottom of the horizon with their status tag.
+    if incremental_sentiment is not None and not incremental_sentiment.empty:
+        print("\n  Incremental sentiment value vs matched economic benchmark:")
+        for hz, hz_grp in incremental_sentiment.groupby("horizon", sort=True):
+            print(f"   [{hz}]")
+            ok = (hz_grp[hz_grp["status"].astype(str) == "ok"]
+                  .sort_values("accuracy_lift", ascending=False))
+            for _, r in ok.iterrows():
+                sm = r.get("sentiment_model", "-")
+                tag = f"/{sm}" if sm and sm != "-" else ""
+                lift = float(r.get("accuracy_lift", float("nan")))
+                p = float(r.get("mcnemar_p_value", float("nan")))
+                n = int(r.get("n_matched", 0))
+                flag = str(r.get("interpretation_flag", ""))
+                star = "*" if "significant" in flag else " "
+                print(f"     {star} {r['set_id']}{tag} vs {r['benchmark_set_id']}: "
+                      f"acc_lift={lift:+.4f}, p={p:.4f}, n={n}, {flag}")
+            missing = hz_grp[hz_grp["status"].astype(str) != "ok"]
+            for _, r in missing.iterrows():
+                sm = r.get("sentiment_model", "-")
+                tag = f"/{sm}" if sm and sm != "-" else ""
+                print(f"       {r['set_id']}{tag} vs {r['benchmark_set_id']}: "
+                      f"status={r['status']}")
     print()
