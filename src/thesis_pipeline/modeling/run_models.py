@@ -565,6 +565,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     and the package CLI. Returns 0 on success."""
     args = build_parser().parse_args(argv)
 
+    # ── Legacy-ID guard (2026 family-structure refactor) ─────────────
+    # E* (economic) and the multi-source S4–S7 / C4–C6 IDs no longer exist:
+    # see ``thesis_pipeline.features.feature_registry.REMOVED_SET_IDS`` and
+    # the migration table in ``docs/refactor_log.md``. Detect the request up
+    # front so the user gets a clear, actionable error rather than the silent
+    # "Feature-set config is empty after filtering" log.
+    if args.set_id:
+        from ..features.feature_registry import REMOVED_SET_IDS as _REMOVED
+        if args.set_id in _REMOVED:
+            replacement = _REMOVED[args.set_id]
+            raise SystemExit(
+                f"[run-models] set_id {args.set_id!r} was removed in the 2026 "
+                f"family-structure refactor. Use {replacement!r} instead. "
+                f"See docs/refactor_log.md for the full migration table."
+            )
+
     # ── Resolve hyperparameter-tuning config (shared by both families) ──
     from .hyperparameter_tuning import hpo_variant_label, load_hpo_config
     hpo_cfg = load_hpo_config(

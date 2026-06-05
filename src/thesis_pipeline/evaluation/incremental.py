@@ -35,13 +35,23 @@ from .significance import SIGNIFICANCE_ALPHA, mcnemar_continuity_corrected
 # Mapping
 # ---------------------------------------------------------------------------
 
+#: Matched economic-only benchmark for every combined / multi feature set.
+#:
+#: The combined family pairs sentiment LEVEL with the historically-used
+#: benchmark (preserved across the 2026 refactor):
+#:
+#: * Level 1 (Title Mean)            → B4 Momentum + Volatility
+#: * Level 2 (Title + Bullishness)   → B6 Full Economic
+#: * Level 3 (Rich Sentiment)        → B6 Full Economic
+#:
+#: The multi-source family follows the same level→benchmark mapping.
 MATCHED_ECONOMIC_BENCHMARK: dict[str, str] = {
-    "C1": "E2",
-    "C2": "E4",
-    "C3": "E4",
-    "C4": "E2",
-    "C5": "E2",
-    "C6": "E4",
+    "C1": "B4",
+    "C2": "B6",
+    "C3": "B6",
+    "M1": "B4",
+    "M2": "B6",
+    "M3": "B6",
 }
 
 

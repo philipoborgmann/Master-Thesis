@@ -226,6 +226,61 @@ different feature universe.
 `stationarity_final_root`; the CLI gains `descriptive-final-features` and
 threads `--source` (plus `--no-panel`) into the stationarity subcommand.
 
+## 2026 family-structure refactor
+
+`feature_sets.xlsx` has been regenerated to expose a clean four-family
+hierarchy aligned with the thesis research questions. The underlying model
+logic is unchanged — this is purely a relabelling + restructuring layer.
+
+### Family layout (27 rows total)
+
+* **Benchmarks (6)** – `B1` Historical Majority, `B2` Single Lag Return,
+  `B3` Momentum, `B4` Momentum + Volatility, `B5` Momentum + Volume,
+  `B6` Full Economic.
+* **Pure sentiment, per scorer (9)** – `SV1/SV2/SV3` (vader),
+  `SF1/SF2/SF3` (finbert), `SC1/SC2/SC3` (cryptobert) at three complexity
+  levels (Title Mean → Title + Bullishness → Rich Sentiment).
+* **Combined (9)** – `C1/C2/C3` × {vader, finbert, cryptobert}. The
+  level→benchmark pairing follows the historical thesis design:
+  `C1 = SVk/SFk/SCk(1) + B4`, `C2 = …(2) + B6`, `C3 = …(3) + B6`.
+  Same composition as the legacy `C1/C2/C3` sets (results unchanged).
+* **Multi-source (3)** – `M1/M2/M3` combine all three scorers at the
+  matching sentiment level with the same matched benchmark.
+
+### Migration table
+
+The old `E*`, `S4`–`S7` and `C4`–`C6` IDs no longer exist. Requesting any of
+them from `run-models` raises a controlled `SystemExit` pointing at the
+replacement:
+
+| Removed | Replacement |
+|---------|-------------|
+| `E1` | `B3` |
+| `E2` | `B4` |
+| `E3` | `B5` |
+| `E4` | `B6` |
+| `S1` | `SV1` / `SF1` / `SC1` |
+| `S2` | `SV2` / `SF2` / `SC2` |
+| `S3` | `SV3` / `SF3` / `SC3` |
+| `S4` / `S5` | `M1` |
+| `S6` | `M2` |
+| `S7` | `M3` |
+| `C4` / `C5` | `M1` |
+| `C6` | `M3` |
+
+No silent aliases — the guard lives in
+`thesis_pipeline.modeling.run_models.main` and is keyed off
+`feature_registry.REMOVED_SET_IDS`.
+
+### Evaluation impact
+
+* `evaluation.incremental.MATCHED_ECONOMIC_BENCHMARK` now maps
+  `{C1: B4, C2: B6, C3: B6, M1: B4, M2: B6, M3: B6}`.
+* `evaluation.significance.ELIGIBLE_CATEGORIES` accepts the new
+  per-scorer categories (`sentiment_vader`, `sentiment_finbert`,
+  `sentiment_cryptobert`, plus `multi`) in addition to the legacy
+  `sentiment` / `combined` strings.
+
 ## Things explicitly **not** changed
 
 - Target construction (`Create_Price_Features.py`).

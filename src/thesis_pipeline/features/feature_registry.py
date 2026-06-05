@@ -16,11 +16,33 @@ from ..config import load_config, resolve_path
 
 
 SET_ID_PATTERN = (
-    "B1", "B2",
-    "E1", "E2", "E3", "E4",
-    "S1", "S2", "S3", "S4", "S5", "S6", "S7",
-    "C1", "C2", "C3", "C4", "C5",
+    "B1", "B2", "B3", "B4", "B5", "B6",
+    "SV1", "SV2", "SV3",
+    "SF1", "SF2", "SF3",
+    "SC1", "SC2", "SC3",
+    "C1", "C2", "C3",
+    "M1", "M2", "M3",
 )
+
+# Set-IDs removed during the 2026 family-structure refactor. Looking these up
+# raises a clear migration error rather than silently returning an empty
+# config (see CLI guard in :mod:`thesis_pipeline.modeling.run_models`).
+REMOVED_SET_IDS: dict[str, str] = {
+    "E1": "B3",   # Momentum
+    "E2": "B4",   # Momentum + Volatility
+    "E3": "B5",   # Momentum + Volume
+    "E4": "B6",   # Full Economic
+    "S1": "SV1/SF1/SC1",
+    "S2": "SV2/SF2/SC2",
+    "S3": "SV3/SF3/SC3",
+    "S4": "M1",
+    "S5": "M1",
+    "S6": "M2",
+    "S7": "M3",
+    "C4": "M1",
+    "C5": "M1",
+    "C6": "M3",
+}
 
 
 def load_feature_sets_yaml() -> Dict[str, dict]:

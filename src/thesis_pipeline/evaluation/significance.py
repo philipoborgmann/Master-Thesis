@@ -27,7 +27,16 @@ from ..logging_utils import get_logger
 from .metrics import GROUP_KEYS, FRONT_META, _front_order, ensure_group_columns
 
 DEFAULT_BENCHMARKS: tuple[str, ...] = ("B1", "B2")
-ELIGIBLE_CATEGORIES = ("sentiment", "combined")
+# Categories eligible for benchmark comparisons (McNemar, threshold-lift,
+# economic-lift). Updated for the 2026 family-structure refactor: pure
+# sentiment is now split per scorer (``sentiment_vader``,
+# ``sentiment_finbert``, ``sentiment_cryptobert``) and multi-source signals
+# carry the ``multi`` category. The legacy ``"sentiment"`` literal is kept so
+# any in-flight signal frames still pass through the eligibility filter.
+ELIGIBLE_CATEGORIES = (
+    "sentiment", "sentiment_vader", "sentiment_finbert", "sentiment_cryptobert",
+    "combined", "multi",
+)
 SIGNIFICANCE_ALPHA = 0.05
 
 # Back-compat: some external callers still reference this name.
