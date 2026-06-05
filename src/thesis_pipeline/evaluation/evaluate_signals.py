@@ -44,6 +44,7 @@ from .economic import (
     summarize_high_low_backtest,
     summarize_high_low_threshold_backtest,
 )
+from .incremental import incremental_sentiment_value_table
 from .reporting import (
     build_leaderboard, build_summary,
     print_console_summary, write_csv_outputs, write_excel_report,
@@ -374,6 +375,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 economic_df, bcfg.get("benchmark_ids", ["B1", "B2"]),
             )
 
+    # ── 8b. Incremental sentiment value vs matched economic benchmark ──
+    def _warn_missing_bench(horizon, set_id, sm, bench_set_id):
+        logger.warning("evaluate-signals: combined %s/%s (%s) has no matched %s "
+                       "economic benchmark in the same family — emitting "
+                       "missing_benchmark row.", set_id, sm, horizon, bench_set_id)
+    incremental_df = incremental_sentiment_value_table(
+        signals, warn_missing=_warn_missing_bench,
+    )
+
     # ── 9. Leaderboard + thesis-style summary ───────────────────
     leaderboard = build_leaderboard(pooled)
     summary     = build_summary(
@@ -440,6 +450,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         regime_mcnemar_df = regime_mcnemar_df.sort_values(
             ["regime_type", "horizon", *fam, "set_id", "sentiment_model", "benchmark"]
         ).reset_index(drop=True)
+    if not incremental_df.empty:
+        incremental_df = incremental_df.sort_values(
+            ["horizon", *fam, "set_id", "sentiment_model"],
+        ).reset_index(drop=True)
 
     # ── 11. Write outputs ───────────────────────────────────────
     csv_paths = write_csv_outputs(
@@ -456,6 +470,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         regime_mcnemar=(regime_mcnemar_df if not args.no_regime_mcnemar else None),
         regime_mcnemar_summary=(regime_mcnemar_summary_df
                                 if not args.no_regime_mcnemar else None),
+        incremental_sentiment=incremental_df,
     )
     xlsx = write_excel_report(
         xlsx_path,
@@ -472,6 +487,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         regime_mcnemar=(regime_mcnemar_df if not args.no_regime_mcnemar else None),
         regime_mcnemar_summary=(regime_mcnemar_summary_df
                                 if not args.no_regime_mcnemar else None),
+        incremental_sentiment=incremental_df,
     )
     logger.info("evaluate-signals: wrote Excel report %s", xlsx)
     for label, path in csv_paths.items():
@@ -484,6 +500,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         market_cap=mcap_df, regime_interaction=interaction_df,
         economic=economic_df, economic_threshold=economic_thr_df,
         regime_mcnemar=regime_mcnemar_df,
+        incremental_sentiment=incremental_df,
     )
     return 0
 
