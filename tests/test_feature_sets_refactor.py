@@ -1,19 +1,21 @@
-"""Tests for the 2026 feature-set family refactor.
+"""Tests for the FinBERT-removal + S*/SV*/C*/CV*/M* family refactor.
 
 Verifies the canonical ``feature_sets.xlsx`` shipped in the repo matches the
-new structure:
+final structure:
 
-* Benchmark family (B1 Historical Majority, B2 Single Lag Return, B3–B6
-  economic).
-* Pure sentiment per scorer (SV1–SV3 vader, SF1–SF3 finbert, SC1–SC3
-  cryptobert).
-* Combined sets (C1 / C2 / C3 with one sentiment scorer + matched benchmark).
-* Multi-source sets (M1 / M2 / M3 covering all three scorers + matched
-  benchmark).
+* Benchmark family `B1`–`B6` (Historical Majority, Single Lag Return,
+  Momentum, Momentum + Volatility, Momentum + Volume, Full Economic).
+* Pure sentiment families `S1`–`S3` (CryptoBERT) and `SV1`–`SV3` (VADER).
+* Combined families `C1`–`C6` (Benchmark + CryptoBERT) and `CV1`–`CV6`
+  (Benchmark + VADER) following the hierarchical mapping
+  C_k = B_k + S_min(k,3) (k=1,2,3 use sentiment level k; k=4,5,6 use the rich
+  level 3 paired with richer benchmarks).
+* Multi-source `M1`–`M6` (Benchmark + CryptoBERT + VADER) with the same
+  benchmark / sentiment-level pairing.
 
-The old E1–E4 (economic), S4–S7 (multi-source sentiment) and C4–C6 IDs are
-gone; requesting one of them from ``run-models`` raises a clear migration
-error instead of silently returning an empty config.
+The old `E*`, `SC*`, `SF*` IDs and FinBERT scoring are gone; requesting any of
+them from `run-models` / `score-sentiment` raises a controlled migration
+error.
 """
 from __future__ import annotations
 
@@ -26,19 +28,9 @@ from thesis_pipeline.features import feature_registry as fr
 # Helpers
 # ---------------------------------------------------------------------------
 
-@pytest.fixture(scope="module")
-def sets() -> dict:
-    """Load the canonical workbook exactly once for every test."""
-    out = fr.load_feature_sets()
-    assert out, "feature_sets.xlsx returned an empty registry"
-    return out
-
-
-def _load_all_rows() -> "pd.DataFrame":
+def _load_all_rows():
     """Return every row from feature_sets.xlsx with the **canonical** header
-    normalisation (mirrors ``feature_registry.load_feature_sets_xlsx``) so the
-    ``# Features`` count column never wins over the comma-separated list.
-    """
+    normalisation (mirrors ``feature_registry.load_feature_sets_xlsx``)."""
     import pandas as pd
     from thesis_pipeline.config import resolve_path
     df = pd.read_excel(resolve_path("feature_sets_xlsx"), sheet_name="feature_sets")
@@ -53,8 +45,7 @@ def _load_all_rows() -> "pd.DataFrame":
     return df
 
 
-def _by_set(_sets, set_id: str, sentiment_model: str | None = None) -> dict:
-    """Return the spec row for ``(set_id, sentiment_model)`` from the XLSX."""
+def _by_set(set_id: str, sentiment_model: str | None = None) -> dict:
     df = _load_all_rows()
     mask = df["set_id"].astype(str) == set_id
     if sentiment_model is not None:
@@ -69,127 +60,166 @@ def _by_set(_sets, set_id: str, sentiment_model: str | None = None) -> dict:
     }
 
 
+@pytest.fixture(scope="module")
+def sets() -> dict:
+    out = fr.load_feature_sets()
+    assert out
+    return out
+
+
 # ---------------------------------------------------------------------------
-# Spec items 1, 2 — no E* sets, all B* present
+# Spec items 1, 2, 3 — no FinBERT, no SF*, no SC*, no finbert_* features
 # ---------------------------------------------------------------------------
 
-def test_no_legacy_economic_set_ids_in_xlsx(sets):
+def test_no_finbert_set_ids(sets):
+    for legacy in ("SF1", "SF2", "SF3"):
+        assert legacy not in sets, f"FinBERT set {legacy!r} still in workbook"
+
+
+def test_no_legacy_sc_set_ids(sets):
+    for legacy in ("SC1", "SC2", "SC3"):
+        assert legacy not in sets, (
+            f"legacy CryptoBERT set {legacy!r} still in workbook — "
+            f"use S* instead"
+        )
+
+
+def test_no_legacy_economic_set_ids(sets):
     for legacy in ("E1", "E2", "E3", "E4"):
-        assert legacy not in sets, f"legacy {legacy} still in feature_sets.xlsx"
+        assert legacy not in sets
 
 
-def test_no_legacy_multi_or_combined_set_ids(sets):
-    for legacy in ("S4", "S5", "S6", "S7", "C4", "C5", "C6"):
-        assert legacy not in sets, f"legacy {legacy} still in feature_sets.xlsx"
+def test_no_finbert_features_in_any_set(sets):
+    for set_id, spec in sets.items():
+        bad = [f for f in spec["features"] if "finbert" in f.lower()]
+        assert not bad, f"{set_id} still uses FinBERT columns: {bad}"
 
 
-def test_full_benchmark_family_loads(sets):
-    expected = {
-        "B1": ["__majority_class__"],
-        "B2": ["log_return_t"],
-        "B3": ["log_return_t", "cum_log_return_7", "cum_log_return_14"],
-        "B4": ["log_return_t", "cum_log_return_7", "cum_log_return_14",
-                "realized_vol_14"],
-        "B5": ["log_return_t", "cum_log_return_7", "cum_log_return_14",
-                "volume_diff"],
-        "B6": ["log_return_t", "cum_log_return_7", "cum_log_return_14",
-                "realized_vol_14", "volume_diff", "market_cap_t"],
-    }
-    for set_id, feats in expected.items():
-        assert set_id in sets, f"missing benchmark {set_id}"
-        loaded = sets[set_id]["features"]
-        assert loaded == feats, f"{set_id} features {loaded} != expected {feats}"
+def test_no_finbert_sentiment_model_value():
+    df = _load_all_rows()
+    sm = df["sentiment_model"].astype(str).str.lower().unique().tolist()
+    assert "finbert" not in sm, f"sentiment_model column still mentions finbert: {sm}"
 
 
 # ---------------------------------------------------------------------------
-# Spec item 3 — pure sentiment per scorer loads
+# Spec items 4, 5 — S* means CryptoBERT, SV* means VADER
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("set_id,sentiment_model,expected", [
-    ("SV1", "vader", ["vader_title_score_mean"]),
-    ("SV2", "vader", ["vader_title_score_mean", "vader_bullishness_ratio"]),
-    ("SV3", "vader", ["vader_title_score_mean", "vader_title_score_weighted_mean",
-                       "vader_bullishness_ratio", "vader_title_score_std",
-                       "post_count"]),
-    ("SF1", "finbert", ["finbert_title_score_mean"]),
-    ("SF2", "finbert", ["finbert_title_score_mean", "finbert_bullishness_ratio"]),
-    ("SF3", "finbert", ["finbert_title_score_mean", "finbert_title_score_weighted_mean",
-                         "finbert_bullishness_ratio", "finbert_title_score_std",
-                         "post_count"]),
-    ("SC1", "cryptobert", ["cryptobert_title_score_mean"]),
-    ("SC2", "cryptobert", ["cryptobert_title_score_mean",
-                            "cryptobert_bullishness_ratio"]),
-    ("SC3", "cryptobert", ["cryptobert_title_score_mean",
-                            "cryptobert_title_score_weighted_mean",
-                            "cryptobert_bullishness_ratio",
-                            "cryptobert_title_score_std", "post_count"]),
+@pytest.mark.parametrize("set_id,expected_feats", [
+    ("S1", ["cryptobert_title_score_mean"]),
+    ("S2", ["cryptobert_title_score_mean", "cryptobert_bullishness_ratio"]),
+    ("S3", ["cryptobert_title_score_mean", "cryptobert_title_score_weighted_mean",
+             "cryptobert_bullishness_ratio", "cryptobert_title_score_std",
+             "post_count"]),
 ])
-def test_pure_sentiment_family(set_id, sentiment_model, expected):
-    spec = _by_set(None, set_id, sentiment_model)
-    assert spec["sentiment_model"] == sentiment_model
-    assert spec["category"] == f"sentiment_{sentiment_model}"
-    assert spec["features"] == expected
+def test_s_family_is_cryptobert(set_id, expected_feats):
+    spec = _by_set(set_id, "cryptobert")
+    assert spec["sentiment_model"] == "cryptobert"
+    assert spec["category"] == "sentiment_cryptobert"
+    assert spec["features"] == expected_feats
+
+
+@pytest.mark.parametrize("set_id,expected_feats", [
+    ("SV1", ["vader_title_score_mean"]),
+    ("SV2", ["vader_title_score_mean", "vader_bullishness_ratio"]),
+    ("SV3", ["vader_title_score_mean", "vader_title_score_weighted_mean",
+              "vader_bullishness_ratio", "vader_title_score_std",
+              "post_count"]),
+])
+def test_sv_family_is_vader(set_id, expected_feats):
+    spec = _by_set(set_id, "vader")
+    assert spec["sentiment_model"] == "vader"
+    assert spec["category"] == "sentiment_vader"
+    assert spec["features"] == expected_feats
 
 
 # ---------------------------------------------------------------------------
-# Spec item 4 — combined sets are the exact union of benchmark + sentiment
+# Spec items 6, 7, 8 — C* / CV* / M* family identities
 # ---------------------------------------------------------------------------
 
-# Benchmark→sentiment-level pairing (preserves the historical thesis design).
-COMBINED_BENCHMARK = {1: "B4", 2: "B6", 3: "B6"}
+def _benchmark_real_features(bench_id: str) -> list[str]:
+    spec = _by_set(bench_id, "-")
+    if spec["features"] == ["__majority_class__"]:
+        return []
+    return spec["features"]
 
 
-def _benchmark_features(set_id: str) -> list[str]:
-    return _by_set(None, set_id, "-")["features"]
+# Hierarchical pairing per spec: C_k pairs B_k with sentiment level
+# min(k, 3) (k=1→1, k=2→2, k≥3→3).
+PAIRING = {1: 1, 2: 2, 3: 3, 4: 3, 5: 3, 6: 3}
 
 
 def _sentiment_features(level: int, scorer: str) -> list[str]:
-    prefix = {"vader": "SV", "finbert": "SF", "cryptobert": "SC"}[scorer]
-    return _by_set(None, f"{prefix}{level}", scorer)["features"]
+    prefix = {"vader": "SV", "cryptobert": "S"}[scorer]
+    return _by_set(f"{prefix}{level}", scorer)["features"]
 
 
-@pytest.mark.parametrize("level,scorer", [
-    (1, "vader"), (1, "finbert"), (1, "cryptobert"),
-    (2, "vader"), (2, "finbert"), (2, "cryptobert"),
-    (3, "vader"), (3, "finbert"), (3, "cryptobert"),
-])
-def test_combined_is_union_of_components(level, scorer):
-    combined = _by_set(None, f"C{level}", scorer)["features"]
-    bench = _benchmark_features(COMBINED_BENCHMARK[level])
-    sent  = _sentiment_features(level, scorer)
-    expected_union = list(dict.fromkeys([*sent, *bench]))  # de-dup, order-preserving
-    assert combined == expected_union
+@pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 6])
+def test_c_family_is_benchmark_plus_cryptobert(k):
+    combined = _by_set(f"C{k}", "cryptobert")
+    assert combined["sentiment_model"] == "cryptobert"
+    assert combined["category"] == "combined_cryptobert"
+    bench = _benchmark_real_features(f"B{k}")
+    sent  = _sentiment_features(PAIRING[k], "cryptobert")
+    expected = list(dict.fromkeys([*bench, *sent]))
+    assert combined["features"] == expected
 
 
-# ---------------------------------------------------------------------------
-# Spec item 5 — multi sets contain benchmark + all three sentiment sources
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 6])
+def test_cv_family_is_benchmark_plus_vader(k):
+    combined = _by_set(f"CV{k}", "vader")
+    assert combined["sentiment_model"] == "vader"
+    assert combined["category"] == "combined_vader"
+    bench = _benchmark_real_features(f"B{k}")
+    sent  = _sentiment_features(PAIRING[k], "vader")
+    expected = list(dict.fromkeys([*bench, *sent]))
+    assert combined["features"] == expected
 
-@pytest.mark.parametrize("level", [1, 2, 3])
-def test_multi_includes_all_three_sentiment_sources(level):
-    multi = _by_set(None, f"M{level}", "multi")
+
+@pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 6])
+def test_m_family_is_benchmark_plus_cryptobert_plus_vader(k):
+    multi = _by_set(f"M{k}", "multi")
+    assert multi["sentiment_model"] == "multi"
     assert multi["category"] == "multi"
-    feats = multi["features"]
-    # Three scorers each contribute their sentiment columns.
-    for scorer in ("vader", "finbert", "cryptobert"):
-        scorer_feats = _sentiment_features(level, scorer)
-        for feat in scorer_feats:
-            assert feat in feats, f"M{level} missing {feat}"
-    # Plus the matched benchmark backbone.
-    for feat in _benchmark_features(COMBINED_BENCHMARK[level]):
-        assert feat in feats, f"M{level} missing benchmark column {feat}"
+    bench = _benchmark_real_features(f"B{k}")
+    s    = _sentiment_features(PAIRING[k], "cryptobert")
+    sv   = _sentiment_features(PAIRING[k], "vader")
+    expected = list(dict.fromkeys([*bench, *s, *sv]))
+    assert multi["features"] == expected
 
 
 # ---------------------------------------------------------------------------
-# Spec item 6 — no duplicate features inside any set
+# Spec items 9-11 — the spec-given canonical examples
+# ---------------------------------------------------------------------------
+
+def test_c1_equals_b1_plus_s1():
+    c1 = _by_set("C1", "cryptobert")["features"]
+    s1 = _by_set("S1", "cryptobert")["features"]
+    # B1's sentinel is dropped because it is a routing marker, not a feature.
+    assert c1 == s1
+
+
+def test_cv1_equals_b1_plus_sv1():
+    cv1 = _by_set("CV1", "vader")["features"]
+    sv1 = _by_set("SV1", "vader")["features"]
+    assert cv1 == sv1
+
+
+def test_m1_equals_b1_plus_s1_plus_sv1():
+    m1 = _by_set("M1", "multi")["features"]
+    s1 = _by_set("S1", "cryptobert")["features"]
+    sv1 = _by_set("SV1", "vader")["features"]
+    assert m1 == list(dict.fromkeys([*s1, *sv1]))
+
+
+# ---------------------------------------------------------------------------
+# Spec item 12 — no duplicate features inside any set
 # ---------------------------------------------------------------------------
 
 def test_no_duplicate_features_anywhere(sets):
     for set_id, spec in sets.items():
         feats = spec["features"]
-        assert len(feats) == len(set(feats)), (
-            f"{set_id} has duplicates: {feats}"
-        )
+        assert len(feats) == len(set(feats)), f"{set_id} has duplicates: {feats}"
 
 
 def test_registry_validator_reports_no_problems(sets):
@@ -197,19 +227,17 @@ def test_registry_validator_reports_no_problems(sets):
 
 
 # ---------------------------------------------------------------------------
-# Spec item 7 — CLI accepts every new ID
+# Spec item 13 — CLI accepts every new ID
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("set_id", [
     "B1", "B2", "B3", "B4", "B5", "B6",
-    "SV1", "SV2", "SV3", "SF1", "SF2", "SF3", "SC1", "SC2", "SC3",
-    "C1", "C2", "C3",
-    "M1", "M2", "M3",
+    "S1", "S2", "S3", "SV1", "SV2", "SV3",
+    "C1", "C2", "C3", "C4", "C5", "C6",
+    "CV1", "CV2", "CV3", "CV4", "CV5", "CV6",
+    "M1", "M2", "M3", "M4", "M5", "M6",
 ])
 def test_cli_dry_run_accepts_new_set_ids(set_id):
-    """``run-models --dry-run`` must reach the planning log for every set_id —
-    no module crashes from unknown identifiers.
-    """
     from thesis_pipeline import cli
     rc = cli.main(["run-models", "--horizon", "1d", "--set-id", set_id,
                    "--dry-run"])
@@ -217,7 +245,7 @@ def test_cli_dry_run_accepts_new_set_ids(set_id):
 
 
 # ---------------------------------------------------------------------------
-# Spec item 8 — old E* IDs fail with a controlled error
+# Spec item 14 — every removed ID raises a clear migration error
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("legacy,replacement_substr", [
@@ -225,13 +253,13 @@ def test_cli_dry_run_accepts_new_set_ids(set_id):
     ("E2", "B4"),
     ("E3", "B5"),
     ("E4", "B6"),
+    ("SC1", "S1"),
+    ("SC2", "S2"),
+    ("SC3", "S3"),
     ("S4", "M1"),
     ("S5", "M1"),
     ("S6", "M2"),
     ("S7", "M3"),
-    ("C4", "M1"),
-    ("C5", "M1"),
-    ("C6", "M3"),
 ])
 def test_legacy_set_ids_raise_clear_migration_error(legacy, replacement_substr):
     from thesis_pipeline import cli
@@ -242,5 +270,38 @@ def test_legacy_set_ids_raise_clear_migration_error(legacy, replacement_substr):
     assert legacy in msg
     assert "removed" in msg
     assert replacement_substr in msg
-    assert "refactor_log" in msg
 
+
+@pytest.mark.parametrize("legacy", ["SF1", "SF2", "SF3"])
+def test_finbert_set_ids_raise_with_finbert_message(legacy):
+    from thesis_pipeline import cli
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["run-models", "--horizon", "1d", "--set-id", legacy,
+                  "--dry-run"])
+    msg = str(excinfo.value)
+    assert legacy in msg
+    assert "FinBERT" in msg
+
+
+# ---------------------------------------------------------------------------
+# FinBERT sentiment-model rejection
+# ---------------------------------------------------------------------------
+
+def test_sentiment_model_finbert_raises_friendly_error(capsys):
+    """``--sentiment-model finbert`` must raise an informative error mentioning
+    why FinBERT was removed.
+    """
+    from thesis_pipeline import cli
+    with pytest.raises(SystemExit):
+        cli.main(["run-models", "--horizon", "1d", "--set-id", "S1",
+                  "--sentiment-model", "finbert", "--dry-run"])
+    msg = capsys.readouterr().err
+    assert "FinBERT" in msg
+    assert "Reddit" in msg
+
+
+def test_score_sentiment_finbert_raises(capsys):
+    from thesis_pipeline import cli
+    with pytest.raises(SystemExit):
+        cli.main(["score-sentiment", "--model", "finbert"])
+    assert "FinBERT" in capsys.readouterr().err

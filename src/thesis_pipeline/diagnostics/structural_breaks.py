@@ -44,7 +44,6 @@ DEFAULT_DIAGNOSTIC_FEATURES: tuple[str, ...] = (
     "post_count",
     "cryptobert_title_score_mean",
     "vader_title_score_mean",
-    "finbert_title_score_mean",
     "cryptobert_bullishness_ratio",
 )
 

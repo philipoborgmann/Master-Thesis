@@ -42,19 +42,14 @@ from thesis_pipeline.features.final_feature_utils import (
 
 SENTIMENT_COLUMNS = [
     "vader_title_score_mean",
-    "finbert_title_score_mean",
     "cryptobert_title_score_mean",
     "vader_title_score_weighted_mean",
-    "finbert_title_score_weighted_mean",
     "cryptobert_title_score_weighted_mean",
     "vader_bullishness_ratio",
-    "finbert_bullishness_ratio",
     "cryptobert_bullishness_ratio",
     "vader_title_score_std",
-    "finbert_title_score_std",
     "cryptobert_title_score_std",
     "vader_post_count",
-    "finbert_post_count",
     "cryptobert_post_count",
     "post_count",
 ]
@@ -91,25 +86,24 @@ def _write_feature_sets_xlsx(path):
     headers = ["Set ID", "Category", "Sentiment Model", "Label",
                "# Features", "Feature Columns (comma-separated)", "Description"]
     rows = [
-        ["B1", "benchmark", "-",    "rolling probability", 0,
+        ["B1", "benchmark", "-", "rolling probability", 0,
          "__majority_class__", "no features"],
-        ["E4", "economic",  "-",    "log-return + cum",    3,
+        ["B6", "benchmark", "-", "log-return + cum",    3,
          "log_return_t,cum_log_return_7,cum_log_return_14", "price"],
-        ["S2", "sentiment", "vader", "vader title score",  1,
+        ["SV1", "sentiment_vader",      "vader",      "vader title score",  1,
          "vader_title_score_mean", "single sentiment"],
-        ["S3", "sentiment", "finbert", "finbert title score", 1,
-         "finbert_title_score_mean", "single sentiment"],
-        ["S4", "sentiment", "cryptobert", "cryptobert title score", 1,
+        ["S1",  "sentiment_cryptobert", "cryptobert", "cryptobert title score", 1,
          "cryptobert_title_score_mean", "single sentiment"],
-        ["S5", "sentiment", "-",    "weighted mean", 1,
+        # {model} placeholders are expanded by the loader to cryptobert / vader.
+        ["S_W", "sentiment_cryptobert", "-", "weighted mean", 1,
          "{model}_title_score_weighted_mean", "weighted across scorers"],
-        ["S6", "sentiment", "-",    "bullishness", 1,
+        ["S_B", "sentiment_cryptobert", "-", "bullishness", 1,
          "{model}_bullishness_ratio", "bullishness across scorers"],
-        ["S7", "sentiment", "-",    "title score std", 1,
+        ["S_S", "sentiment_cryptobert", "-", "title score std", 1,
          "{model}_title_score_std", "std across scorers"],
-        ["C2", "combined",  "vader", "combined vader", 2,
+        ["CV1", "combined_vader",      "vader",      "combined vader", 2,
          "log_return_t,vader_title_score_mean", "combined"],
-        ["C6", "combined",  "cryptobert", "combined cryptobert", 4,
+        ["C1",  "combined_cryptobert", "cryptobert", "combined cryptobert", 4,
          "log_return_t,realized_vol_14,cryptobert_title_score_mean,cryptobert_post_count",
          "full combined set"],
     ]
@@ -146,23 +140,23 @@ def test_registry_resolves_sentiment_and_economic_features(stationarity_repo):
     df = pd.read_parquet(stationarity_repo / "Data" / "Final" / "features_1d.parquet")
     feature_cols, resolution = resolve_final_feature_columns(df, feature_sets)
 
-    # Sentiment columns explicitly mentioned in the request must be in the universe.
+    # Sentiment columns explicitly mentioned in the request must be in the
+    # universe. FinBERT was removed from the pipeline; the placeholder
+    # expansion now only covers CryptoBERT + VADER.
     required_sentiment = {
         "vader_title_score_mean",
-        "finbert_title_score_mean",
         "cryptobert_title_score_mean",
         "vader_title_score_weighted_mean",
-        "finbert_title_score_weighted_mean",
         "cryptobert_title_score_weighted_mean",
         "vader_bullishness_ratio",
-        "finbert_bullishness_ratio",
         "cryptobert_bullishness_ratio",
         "vader_title_score_std",
-        "finbert_title_score_std",
         "cryptobert_title_score_std",
     }
     missing = required_sentiment - set(feature_cols)
     assert not missing, f"sentiment features dropped from universe: {sorted(missing)}"
+    # FinBERT columns must never be resolved any more.
+    assert not any("finbert" in c for c in feature_cols)
 
     # And economic features stay in.
     assert {"log_return_t", "cum_log_return_7", "realized_vol_14"} <= set(feature_cols)
@@ -214,8 +208,7 @@ def test_run_final_records_include_sentiment(stationarity_repo, stationarity_mod
 
     must_have = {
         "log_return_t",
-        "vader_title_score_mean", "finbert_title_score_mean",
-        "cryptobert_title_score_mean",
+        "vader_title_score_mean", "cryptobert_title_score_mean",
         "vader_title_score_weighted_mean",
         "vader_bullishness_ratio",
         "vader_title_score_std",
@@ -227,12 +220,14 @@ def test_run_final_records_include_sentiment(stationarity_repo, stationarity_mod
         f"to economic-only features. Got groups: "
         f"{records['feature_group'].value_counts().to_dict()}"
     )
-    # At least one sentiment row per scorer.
+    # At least one sentiment row per remaining scorer (CryptoBERT + VADER).
     sentiment_rows = records[records["feature_group"] == "sentiment"]
     assert not sentiment_rows.empty
-    assert {"vader", "finbert", "cryptobert"} <= {
+    assert {"vader", "cryptobert"} <= {
         f.split("_", 1)[0] for f in sentiment_rows["feature"].astype(str)
     }
+    # And no FinBERT rows.
+    assert not any("finbert" in str(f).lower() for f in sentiment_rows["feature"])
 
 
 def test_run_final_resolution_csv_has_new_columns(stationarity_repo,

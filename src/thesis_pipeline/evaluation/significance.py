@@ -28,14 +28,20 @@ from .metrics import GROUP_KEYS, FRONT_META, _front_order, ensure_group_columns
 
 DEFAULT_BENCHMARKS: tuple[str, ...] = ("B1", "B2")
 # Categories eligible for benchmark comparisons (McNemar, threshold-lift,
-# economic-lift). Updated for the 2026 family-structure refactor: pure
-# sentiment is now split per scorer (``sentiment_vader``,
-# ``sentiment_finbert``, ``sentiment_cryptobert``) and multi-source signals
-# carry the ``multi`` category. The legacy ``"sentiment"`` literal is kept so
-# any in-flight signal frames still pass through the eligibility filter.
+# economic-lift). After the family refactor + FinBERT removal:
+#
+# * ``sentiment_cryptobert`` (S*)        — pure CryptoBERT-only sentiment
+# * ``sentiment_vader``      (SV*)       — pure VADER-only sentiment
+# * ``combined_cryptobert``  (C*)        — Benchmark + CryptoBERT sentiment
+# * ``combined_vader``       (CV*)       — Benchmark + VADER sentiment
+# * ``multi``                (M*)        — Benchmark + CryptoBERT + VADER
+#
+# The legacy ``"sentiment"`` / ``"combined"`` literals are kept so any
+# in-flight signal frames produced before the refactor still pass through.
 ELIGIBLE_CATEGORIES = (
-    "sentiment", "sentiment_vader", "sentiment_finbert", "sentiment_cryptobert",
-    "combined", "multi",
+    "sentiment", "sentiment_cryptobert", "sentiment_vader",
+    "combined", "combined_cryptobert", "combined_vader",
+    "multi",
 )
 SIGNIFICANCE_ALPHA = 0.05
 

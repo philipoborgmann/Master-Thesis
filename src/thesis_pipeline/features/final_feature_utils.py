@@ -29,7 +29,7 @@ _PREDICTION_PREFIXES: tuple[str, ...] = ("prediction", "probability", "signal_")
 
 # The three sentiment scorers used in the thesis. Used to expand ``{model}``
 # placeholders in registered feature names.
-SENTIMENT_MODELS: tuple[str, ...] = ("vader", "finbert", "cryptobert")
+SENTIMENT_MODELS: tuple[str, ...] = ("cryptobert", "vader")
 SENTIMENT_PREFIXES: tuple[str, ...] = tuple(f"{m}_" for m in SENTIMENT_MODELS)
 _SENTIMENT_TOKENS: tuple[str, ...] = ("bullishness", "post_count")
 

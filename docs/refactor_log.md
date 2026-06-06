@@ -281,6 +281,85 @@ No silent aliases — the guard lives in
   `sentiment_cryptobert`, plus `multi`) in addition to the legacy
   `sentiment` / `combined` strings.
 
+## FinBERT removal + S*/SV*/C*/CV*/M* hierarchy
+
+### Why FinBERT was removed
+FinBERT is trained on financial-analyst and broker-research language. On
+Reddit / crypto sentiment data it produced near-constant predictions with
+no meaningful between-ticker variation, so it added cost without
+information for the panel-logit comparison. CryptoBERT is retained as the
+domain-specific transformer baseline and VADER as the transparent lexicon
+baseline.
+
+* All FinBERT references were removed from `feature_sets.xlsx`, the feature
+  registry, evaluation grouping (`ELIGIBLE_CATEGORIES`,
+  `MATCHED_ECONOMIC_BENCHMARK`), diagnostics
+  (`structural_breaks`, `descriptive_final_features`,
+  `final_feature_utils`), sentiment aggregation (`aggregate.MODELS` /
+  `DEFAULT_INPUTS`), `stationarity.MODELS`, `configs/pipeline.yaml`,
+  `configs/paths.yaml`, and tests.
+* The `score_finbert.py` source file is **kept on disk** as a frozen legacy
+  module — the spec was explicit that legacy on-disk artefacts must not be
+  deleted — but the CLI dispatch was removed.
+* `--sentiment-model finbert` and `score-sentiment --model finbert` raise a
+  clear `argparse` error that explains why FinBERT was dropped (no silent
+  alias; tests assert the rejection path).
+
+### Final feature-family naming
+
+| Family | Meaning | Count |
+|--------|---------|-------|
+| `B*`   | Benchmark models | 6 (`B1`–`B6`) |
+| `S*`   | CryptoBERT-only sentiment | 3 (`S1`–`S3`) |
+| `SV*`  | VADER-only sentiment | 3 (`SV1`–`SV3`) |
+| `C*`   | Benchmark + CryptoBERT sentiment | 6 (`C1`–`C6`) |
+| `CV*`  | Benchmark + VADER sentiment | 6 (`CV1`–`CV6`) |
+| `M*`   | Benchmark + CryptoBERT + VADER | 6 (`M1`–`M6`) |
+
+**Total:** 30 feature sets (was 27 before this revision; was 29 before the
+2026 family-structure refactor).
+
+### Migration table (post-FinBERT-removal)
+
+| Removed | Replacement |
+|---------|-------------|
+| `SC1` / `SC2` / `SC3` | `S1` / `S2` / `S3` |
+| `SF1` / `SF2` / `SF3` | removed (FinBERT dropped) |
+| `E1` / `E2` / `E3` / `E4` | `B3` / `B4` / `B5` / `B6` |
+| `S4` / `S5` | `M1` |
+| `S6` | `M2` |
+| `S7` | `M3` |
+
+Every legacy ID raises a controlled `SystemExit` from
+`run_models.main` pointing at the replacement (or, for FinBERT, at the
+removal rationale) — see `feature_registry.REMOVED_SET_IDS`.
+
+### Hierarchical combined logic (Variant B)
+
+Combined and multi-source sets pair benchmark complexity with sentiment
+level explicitly:
+
+```
+C1  = B1 + S1              CV1 = B1 + SV1              M1  = B1 + S1 + SV1
+C2  = B2 + S2              CV2 = B2 + SV2              M2  = B2 + S2 + SV2
+C3  = B3 + S3              CV3 = B3 + SV3              M3  = B3 + S3 + SV3
+C4  = B4 + S3              CV4 = B4 + SV3              M4  = B4 + S3 + SV3
+C5  = B5 + S3              CV5 = B5 + SV3              M5  = B5 + S3 + SV3
+C6  = B6 + S3              CV6 = B6 + SV3              M6  = B6 + S3 + SV3
+```
+
+`B1` carries the rolling-probability sentinel `__majority_class__`, which
+is a routing marker rather than a real predictor — when `B1` is the
+benchmark component of a combined / multi set, its contribution is the
+empty list, so `C1 = S1` and `M1 = S1 ∪ SV1` in feature terms.
+
+### Incremental sentiment-value mapping
+
+`evaluation.incremental.MATCHED_ECONOMIC_BENCHMARK` was rebuilt to mirror
+the new hierarchy: `C_k`, `CV_k`, `M_k` are compared against `B_k` (18
+entries). Old `E*` IDs were never reintroduced and `M_k → E_*` mappings
+were removed.
+
 ## Things explicitly **not** changed
 
 - Target construction (`Create_Price_Features.py`).

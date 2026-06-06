@@ -51,11 +51,10 @@ sentiment_combined:       "Data/Processed/Sentiment/sentiment_combined.csv"
 # ---------------------------------------------------------------------------
 transformed_root:             "Data/Transformed"
 sentiment_scored_vader:       "Data/Transformed/Sentiment_Scored_Vader.csv"
-sentiment_scored_finbert:     "Data/Transformed/Sentiment_Scored_Finbert.csv"
+# sentiment_scored_finbert / finbert_checkpoints: removed (FinBERT was
+# dropped from the pipeline — see docs/refactor_log.md).
 sentiment_scored_cryptobert:  "Data/Transformed/Sentiment_Scored_Cryptobert.csv"
 vader_checkpoints:            "Data/Transformed/.vader_checkpoints"
-finbert_checkpoints:          "Data/Transformed/.finbert_checkpoints"
-finbert_backup_checkpoints:   "Data/Transformed/.finbert_backup_checkpoints"
 cryptobert_checkpoints:       "Data/Transformed/.cryptobert_checkpoints"
 
 # ---------------------------------------------------------------------------

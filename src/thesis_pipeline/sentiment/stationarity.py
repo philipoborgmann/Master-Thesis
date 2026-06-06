@@ -103,7 +103,7 @@ SCORE_SUFFIXES = [
     "selftext_score_mean",
     "bullishness_ratio",
 ]
-MODELS = ["vader", "finbert", "cryptobert"]
+MODELS = ["vader", "cryptobert"]   # FinBERT removed
 TOP_TICKERS = ["BTC", "ETH", "DOGE", "ADA", "SOL", "XRP"]
 
 ALPHA = 0.05
@@ -900,7 +900,6 @@ def plot_rolling_stats(df_daily: pd.DataFrame, plot_dir: str,
 
     colors = {
         "vader": "#2196F3",
-        "finbert": "#4CAF50",
         "cryptobert": "#FF9800",
     }
 

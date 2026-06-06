@@ -228,7 +228,6 @@ def break_repo(tmp_path, monkeypatch):
             "post_count": rng.integers(0, 5, n),
             "vader_title_score_mean": rng.normal(0, 0.1, n),
             "cryptobert_title_score_mean": rng.normal(0, 0.1, n),
-            "finbert_title_score_mean": rng.normal(0, 0.1, n),
             "cryptobert_bullishness_ratio": rng.uniform(0.3, 0.7, n),
         }))
     pd.concat(rows, ignore_index=True).to_parquet(

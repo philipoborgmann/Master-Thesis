@@ -60,18 +60,9 @@ stages:
     smoke:
       max_rows: 5000
 
-  score_finbert:
-    script: "Sentiment_score_finbert.py"
-    module: "thesis_pipeline.sentiment.score_finbert"
-    inputs:
-      - sentiment_combined
-    outputs:
-      - sentiment_scored_finbert
-      - finbert_checkpoints
-    heavy: true
-    supports_smoke: true
-    smoke:
-      max_rows: 200
+  # score_finbert: removed (FinBERT was dropped from the pipeline because it
+  # is trained on financial / analyst language and produced no meaningful
+  # variation on Reddit/crypto sentiment data — see docs/refactor_log.md).
 
   score_cryptobert:
     script: "Sentiment_score_cryptobert.py"
@@ -91,7 +82,6 @@ stages:
     module: "thesis_pipeline.sentiment.aggregate"
     inputs:
       - sentiment_scored_vader
-      - sentiment_scored_finbert
       - sentiment_scored_cryptobert
     outputs:
       - sentiment_features_pattern
@@ -193,7 +183,6 @@ default_order:
   - create_price_features
   - load_sentiment
   - score_vader
-  - score_finbert
   - score_cryptobert
   - create_sentiment_features
   - stationarity

@@ -92,7 +92,8 @@ sets:
 
   # ---------------------------------------------------------------------------
   # Sentiment-only sets (S*) — applied separately for VADER, FinBERT, CryptoBERT
-  # The {model} placeholder is substituted to vader / finbert / cryptobert.
+  # The {model} placeholder is substituted to cryptobert / vader (FinBERT
+  # was removed — see docs/refactor_log.md).
   # TODO: confirm exact column list against feature_sets.xlsx.
   # ---------------------------------------------------------------------------
   S1:
