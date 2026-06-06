@@ -145,7 +145,9 @@ def test_cli_dry_run_returns_zero(argv):
     "thesis_pipeline.price.validate",
     "thesis_pipeline.sentiment.load",
     "thesis_pipeline.sentiment.score_vader",
-    "thesis_pipeline.sentiment.score_finbert",
+    # score_finbert was retired (FinBERT removed from the pipeline); the file
+    # remains on disk for historical traceability but is no longer part of
+    # the import contract.
     "thesis_pipeline.sentiment.score_cryptobert",
     "thesis_pipeline.sentiment.aggregate",
     "thesis_pipeline.sentiment.stationarity",

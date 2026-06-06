@@ -42,15 +42,14 @@ def test_dry_run_score_vader():
     assert rc == 0
 
 
-@pytest.mark.skipif(
-    importlib.util.find_spec("torch") is None
-    or importlib.util.find_spec("transformers") is None,
-    reason="torch/transformers not installed",
-)
-def test_dry_run_score_finbert():
-    rc = cli.main(["score-sentiment", "--model", "finbert",
-                   "--smoke", "--max-rows", "10", "--dry-run"])
-    assert rc == 0
+def test_dry_run_score_finbert_is_rejected(capsys):
+    """FinBERT was removed; the CLI must reject it with a clear, informative
+    error rather than silently accept it as a dry-run.
+    """
+    with pytest.raises(SystemExit):
+        cli.main(["score-sentiment", "--model", "finbert",
+                  "--smoke", "--max-rows", "10", "--dry-run"])
+    assert "FinBERT" in capsys.readouterr().err
 
 
 @pytest.mark.skipif(

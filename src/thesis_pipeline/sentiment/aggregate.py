@@ -48,11 +48,10 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # 1. CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-MODELS = ["vader", "finbert", "cryptobert"]
+MODELS = ["vader", "cryptobert"]   # FinBERT removed (see docs/refactor_log.md)
 
 DEFAULT_INPUTS = {
     "vader":      os.path.join("Data", "Transformed", "Sentiment_Scored_Vader.csv"),
-    "finbert":    os.path.join("Data", "Transformed", "Sentiment_Scored_Finbert.csv"),
     "cryptobert": os.path.join("Data", "Transformed", "Sentiment_Scored_Cryptobert.csv"),
 }
 
@@ -424,7 +423,7 @@ def compute_coverage_stats(aggregated: dict, output_dir: str) -> pd.DataFrame:
 
 def plot_score_distributions(df, plot_dir):
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), sharey=True)
-    colors = {"vader": "#2196F3", "finbert": "#4CAF50", "cryptobert": "#FF9800"}
+    colors = {"vader": "#2196F3", "cryptobert": "#FF9800"}
     for ax, model in zip(axes, MODELS):
         col = f"{model}_title_score"
         if col not in df.columns: continue
@@ -527,7 +526,7 @@ def plot_daily_sentiment_timeseries(df_daily, plot_dir):
     top_ticker = ticker_counts.idxmax()
     sub = df_daily[df_daily["ticker"] == top_ticker].sort_values("timestamp")
     fig, ax = plt.subplots(figsize=(14, 5))
-    colors = {"vader": "#2196F3", "finbert": "#4CAF50", "cryptobert": "#FF9800"}
+    colors = {"vader": "#2196F3", "cryptobert": "#FF9800"}
     for model in MODELS:
         col = f"{model}_title_score_mean"
         if col in sub.columns:
@@ -599,7 +598,6 @@ def main(argv=None):
         description="Sentiment Feature Engineering - build aggregated features"
     )
     parser.add_argument("--vader_input", type=str, default=DEFAULT_INPUTS["vader"])
-    parser.add_argument("--finbert_input", type=str, default=DEFAULT_INPUTS["finbert"])
     parser.add_argument("--cryptobert_input", type=str, default=DEFAULT_INPUTS["cryptobert"])
     parser.add_argument("--output_dir", type=str, default=OUTPUT_DIR)
     parser.add_argument("--test_days", type=int, default=None)
@@ -608,7 +606,6 @@ def main(argv=None):
 
     paths = {
         "vader":      args.vader_input,
-        "finbert":    args.finbert_input,
         "cryptobert": args.cryptobert_input,
     }
 

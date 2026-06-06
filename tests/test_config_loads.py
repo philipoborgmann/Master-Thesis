@@ -23,7 +23,7 @@ def test_all_configs_load():
     "cmc_market_cap", "cmc_price", "cmc_volume",
     "raw_sentiment_root", "subreddit_ticker_mapping",
     "sentiment_combined",
-    "sentiment_scored_vader", "sentiment_scored_finbert", "sentiment_scored_cryptobert",
+    "sentiment_scored_vader", "sentiment_scored_cryptobert",
     "features_root", "final_root",
     "signals_root", "diagnostics_root", "smoke_root",
 ])
@@ -73,7 +73,7 @@ def test_pipeline_stages_cover_known_stages():
     cfg = load_config("pipeline")
     expected = {
         "validate_price", "create_price_features", "load_sentiment",
-        "score_vader", "score_finbert", "score_cryptobert",
+        "score_vader", "score_cryptobert",
         "create_sentiment_features", "stationarity",
         "merge_features", "run_models", "diagnostics",
     }

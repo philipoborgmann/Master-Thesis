@@ -23,6 +23,29 @@ from .logging_utils import attach_file_handler, get_logger
 # Command handlers
 # ---------------------------------------------------------------------------
 
+_FINBERT_REMOVED_MSG = (
+    "FinBERT was removed from this pipeline. It is trained on financial / "
+    "analyst language and did not produce meaningful variation on Reddit / "
+    "crypto sentiment data in this project. Use --sentiment-model cryptobert "
+    "(domain-specific transformer) or --sentiment-model vader (transparent "
+    "lexicon baseline) instead."
+)
+
+
+def _sentiment_model_choice(value):
+    """argparse ``type`` for the ``--sentiment-model`` flag.
+
+    Yields a clear FinBERT-removed message before argparse's stock ``invalid
+    choice`` complaint would fire.
+    """
+    if value is None:
+        return value
+    v = str(value).strip().lower()
+    if v == "finbert":
+        raise argparse.ArgumentTypeError(_FINBERT_REMOVED_MSG)
+    return v
+
+
 def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--smoke", action="store_true",
                         help="Run with small smoke-mode defaults.")
@@ -47,7 +70,10 @@ def _add_run_models_args(parser: argparse.ArgumentParser) -> None:
                         dest="coins", nargs="*")
     parser.add_argument("--sentiment-model", "--sentiment_model",
                         dest="sentiment_model", default=None,
-                        choices=[None, "vader", "finbert", "cryptobert"])
+                        type=_sentiment_model_choice,
+                        choices=[None, "vader", "cryptobert", "multi"],
+                        help="Restrict to one sentiment scorer. FinBERT was "
+                             "removed and rejected with an informative error.")
     parser.add_argument("--model-type", "--model_type", dest="model_type",
                         default="per_asset",
                         choices=["per_asset", "panel_logit"],
@@ -184,13 +210,14 @@ def cmd_load_sentiment(args: argparse.Namespace) -> int:
 
 
 def cmd_score_sentiment(args: argparse.Namespace) -> int:
+    if str(getattr(args, "model", "")).lower() == "finbert":
+        # Friendly error for legacy callers that bypass argparse.
+        raise SystemExit(_FINBERT_REMOVED_MSG)
     rc = _stage_dry_run(f"score_{args.model}", args)
     if rc is not None:
         return rc
     if args.model == "vader":
         from .sentiment import score_vader as _m
-    elif args.model == "finbert":
-        from .sentiment import score_finbert as _m
     elif args.model == "cryptobert":
         from .sentiment import score_cryptobert as _m
     else:
@@ -427,7 +454,6 @@ def _dispatch_stage(stage: str, args: argparse.Namespace) -> int:
         "create_price_features":     cmd_create_price_features,
         "load_sentiment":            cmd_load_sentiment,
         "score_vader":               lambda a: cmd_score_sentiment(_with_attr(a, model="vader")),
-        "score_finbert":             lambda a: cmd_score_sentiment(_with_attr(a, model="finbert")),
         "score_cryptobert":          lambda a: cmd_score_sentiment(_with_attr(a, model="cryptobert")),
         "create_sentiment_features": cmd_create_sentiment_features,
         "stationarity":              cmd_stationarity,
@@ -490,7 +516,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     # score-sentiment
     sp = sub.add_parser("score-sentiment", help="Score sentiment with a chosen model.")
-    sp.add_argument("--model", required=True, choices=["vader", "finbert", "cryptobert"])
+    sp.add_argument("--model", required=True,
+                    type=_sentiment_model_choice,
+                    choices=["vader", "cryptobert"],
+                    help="Sentiment scorer to run. FinBERT was removed; the "
+                         "CLI rejects it with an informative error.")
     sp.add_argument("--max-rows", dest="max_rows", type=int, default=None)
     sp.add_argument("--batch-size", dest="batch_size", type=int, default=None)
     sp.add_argument("--restart", action="store_true",

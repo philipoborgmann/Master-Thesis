@@ -35,13 +35,20 @@ from .significance import SIGNIFICANCE_ALPHA, mcnemar_continuity_corrected
 # Mapping
 # ---------------------------------------------------------------------------
 
+#: Matched economic-only benchmark for every combined / multi feature set.
+#:
+#: After the family refactor (with FinBERT removed), each combined / multi set
+#: ``X_k`` pairs benchmark level ``k`` with sentiment level ``k`` (using the
+#: hierarchical mapping from ``feature_sets.xlsx``), so the matched benchmark
+#: is simply ``B_k``:
+#:
+#: * ``C_k``  (Benchmark + CryptoBERT)         → ``B_k``
+#: * ``CV_k`` (Benchmark + VADER)              → ``B_k``
+#: * ``M_k``  (Benchmark + CryptoBERT + VADER) → ``B_k``
 MATCHED_ECONOMIC_BENCHMARK: dict[str, str] = {
-    "C1": "E2",
-    "C2": "E4",
-    "C3": "E4",
-    "C4": "E2",
-    "C5": "E2",
-    "C6": "E4",
+    **{f"C{k}":  f"B{k}" for k in range(1, 7)},
+    **{f"CV{k}": f"B{k}" for k in range(1, 7)},
+    **{f"M{k}":  f"B{k}" for k in range(1, 7)},
 }
 
 

@@ -16,11 +16,43 @@ from ..config import load_config, resolve_path
 
 
 SET_ID_PATTERN = (
-    "B1", "B2",
-    "E1", "E2", "E3", "E4",
-    "S1", "S2", "S3", "S4", "S5", "S6", "S7",
-    "C1", "C2", "C3", "C4", "C5",
+    "B1", "B2", "B3", "B4", "B5", "B6",
+    "S1", "S2", "S3",
+    "SV1", "SV2", "SV3",
+    "C1", "C2", "C3", "C4", "C5", "C6",
+    "CV1", "CV2", "CV3", "CV4", "CV5", "CV6",
+    "M1", "M2", "M3", "M4", "M5", "M6",
 )
+
+# Set-IDs removed during the family-structure refactor + FinBERT removal.
+# Looking these up raises a clear migration error rather than silently
+# returning an empty config (see CLI guard in
+# :mod:`thesis_pipeline.modeling.run_models`).
+_FINBERT_REMOVED = (
+    "removed (FinBERT was dropped; trained on financial / analyst "
+    "language, no meaningful variation on Reddit/crypto data)"
+)
+REMOVED_SET_IDS: dict[str, str] = {
+    # Old economic family — folded into the benchmark family.
+    "E1": "B3",
+    "E2": "B4",
+    "E3": "B5",
+    "E4": "B6",
+    # Old multi-source sentiment-only IDs — replaced by the M* family.
+    "S4": "M1",
+    "S5": "M1",
+    "S6": "M2",
+    "S7": "M3",
+    # 2026 first-pass family naming (SC*=CryptoBERT, SF*=FinBERT) is replaced
+    # by the cleaner S*=CryptoBERT-as-default + SV*=VADER naming. FinBERT is
+    # gone entirely.
+    "SC1": "S1",
+    "SC2": "S2",
+    "SC3": "S3",
+    "SF1": _FINBERT_REMOVED,
+    "SF2": _FINBERT_REMOVED,
+    "SF3": _FINBERT_REMOVED,
+}
 
 
 def load_feature_sets_yaml() -> Dict[str, dict]:

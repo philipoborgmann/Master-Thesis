@@ -20,7 +20,7 @@ from thesis_pipeline.features import final_feature_utils as ffu
     ("volume_diff", "volume"),
     ("market_cap_t", "market_cap"),
     ("vader_combined_mean", "sentiment"),
-    ("finbert_post_count", "sentiment"),
+    ("cryptobert_post_count", "sentiment"),
     ("cryptobert_bullishness_ratio", "sentiment"),
     ("post_count", "sentiment"),
     ("some_other_feature", "other"),
@@ -43,8 +43,9 @@ def _df_with(cols):
 
 
 def test_resolve_expands_model_placeholder_across_all_scorers():
-    df = _df_with(["vader_combined_mean", "finbert_combined_mean",
-                   "cryptobert_combined_mean", "log_return_t"])
+    # FinBERT was removed; the placeholder now expands to CryptoBERT + VADER.
+    df = _df_with(["vader_combined_mean", "cryptobert_combined_mean",
+                   "log_return_t"])
     sets = {
         "B1": {"features": [], "category": "benchmark", "label": "b",
                 "sentiment_model": None},
@@ -54,18 +55,17 @@ def test_resolve_expands_model_placeholder_across_all_scorers():
     cols, resolution = ffu.resolve_final_feature_columns(df, sets)
     assert "log_return_t" in cols
     assert set(cols) >= {
-        "vader_combined_mean", "finbert_combined_mean", "cryptobert_combined_mean",
-        "log_return_t",
+        "vader_combined_mean", "cryptobert_combined_mean", "log_return_t",
     }
-    # Resolution log carries one row per expanded feature.
     expanded = {r["resolved_feature"] for r in resolution
                 if r["requested_feature"] == "{model}_combined_mean"}
-    assert expanded == {"vader_combined_mean", "finbert_combined_mean",
-                        "cryptobert_combined_mean"}
+    assert expanded == {"vader_combined_mean", "cryptobert_combined_mean"}
+    # And FinBERT placeholders never get manufactured.
+    assert "finbert_combined_mean" not in {r["resolved_feature"] for r in resolution}
 
 
 def test_resolve_respects_set_specific_sentiment_model():
-    df = _df_with(["vader_combined_mean", "finbert_combined_mean"])
+    df = _df_with(["vader_combined_mean", "cryptobert_combined_mean"])
     sets = {
         "S1": {"features": ["{model}_combined_mean"], "category": "sentiment",
                 "label": "s", "sentiment_model": "vader"},

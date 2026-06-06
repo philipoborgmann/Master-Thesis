@@ -27,7 +27,22 @@ from ..logging_utils import get_logger
 from .metrics import GROUP_KEYS, FRONT_META, _front_order, ensure_group_columns
 
 DEFAULT_BENCHMARKS: tuple[str, ...] = ("B1", "B2")
-ELIGIBLE_CATEGORIES = ("sentiment", "combined")
+# Categories eligible for benchmark comparisons (McNemar, threshold-lift,
+# economic-lift). After the family refactor + FinBERT removal:
+#
+# * ``sentiment_cryptobert`` (S*)        — pure CryptoBERT-only sentiment
+# * ``sentiment_vader``      (SV*)       — pure VADER-only sentiment
+# * ``combined_cryptobert``  (C*)        — Benchmark + CryptoBERT sentiment
+# * ``combined_vader``       (CV*)       — Benchmark + VADER sentiment
+# * ``multi``                (M*)        — Benchmark + CryptoBERT + VADER
+#
+# The legacy ``"sentiment"`` / ``"combined"`` literals are kept so any
+# in-flight signal frames produced before the refactor still pass through.
+ELIGIBLE_CATEGORIES = (
+    "sentiment", "sentiment_cryptobert", "sentiment_vader",
+    "combined", "combined_cryptobert", "combined_vader",
+    "multi",
+)
 SIGNIFICANCE_ALPHA = 0.05
 
 # Back-compat: some external callers still reference this name.
