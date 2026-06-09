@@ -517,6 +517,95 @@ def test_threshold_lift_algebra_synthetic():
     assert n_m65 <= n_m50
 
 
+def test_full_evaluation_writes_economic_diagnostics(signals_env):
+    """economic_diagnostics.csv must exist after a full run and contain one row
+    per attempted signal group (set_id × sentiment_model × model_type × …)."""
+    out_dir = signals_env["root"] / "Outputs" / "Evaluation_diag"
+    rc = eval_main.main([
+        "--horizon", "1d", "--force",
+        "--output-dir", str(out_dir),
+        "--feature-config", str(signals_env["feature_sets"]),
+    ])
+    assert rc == 0
+    diag_path = out_dir / "economic_diagnostics.csv"
+    assert diag_path.exists(), "economic_diagnostics.csv missing"
+    diag = pd.read_csv(diag_path)
+    # All four signal sets in the fixture must appear in diagnostics.
+    assert set(diag["set_id"]) == {"B1", "E4", "S1", "C1"}
+    for col in ("horizon", "set_id", "sentiment_model", "model_type",
+                "panel_mode", "hpo_variant", "category", "label",
+                "n_signal_rows", "n_unique_timestamps", "n_unique_tickers",
+                "n_forward_return_rows", "n_joined_rows",
+                "n_joined_non_null_forward_returns",
+                "n_portfolio_periods", "status", "reason"):
+        assert col in diag.columns
+
+
+def test_full_evaluation_economic_csv_contains_all_groups(signals_env):
+    """Regression: economic_performance.csv must contain every signal group, not
+    just the last-loaded one. Pre-fix this file contained only one (set,
+    sentiment) tuple per horizon."""
+    out_dir = signals_env["root"] / "Outputs" / "Evaluation_econ"
+    rc = eval_main.main([
+        "--horizon", "1d", "--force",
+        "--output-dir", str(out_dir),
+        "--feature-config", str(signals_env["feature_sets"]),
+    ])
+    assert rc == 0
+    econ = pd.read_csv(out_dir / "economic_performance.csv")
+    # Each fixture set is single-ticker → can't form a high-low portfolio →
+    # only BUY_HOLD survives in this synthetic env. The diagnostic CSV is
+    # the one that pins the bug fix here.
+    diag = pd.read_csv(out_dir / "economic_diagnostics.csv")
+    # All four model sets attempted, none collapsed.
+    assert set(diag["set_id"]) == {"B1", "E4", "S1", "C1"}
+    # BUY_HOLD still present in the metrics CSV (per the rest of the design).
+    assert "BUY_HOLD" in econ["set_id"].astype(str).tolist()
+
+
+def test_strict_feature_set_ids_drops_stale_signals(signals_env, tmp_path):
+    """A stale signal file whose set_id is not registered in feature_sets.xlsx
+    must be DROPPED before evaluation when --strict-feature-set-ids is set."""
+    # Drop a stale signal file into the fixture
+    rng = np.random.default_rng(99)
+    stale = _synthetic_signals(rng, set_id="ZZ_STALE", sentiment_model="vader")
+    stale.to_parquet(signals_env["signals_root"] / "1d" / "ZZ_STALE_vader.parquet",
+                     index=False)
+
+    out_dir = signals_env["root"] / "Outputs" / "Evaluation_strict"
+    rc = eval_main.main([
+        "--horizon", "1d", "--force",
+        "--output-dir", str(out_dir),
+        "--feature-config", str(signals_env["feature_sets"]),
+        "--strict-feature-set-ids",
+    ])
+    assert rc == 0
+    pooled = pd.read_csv(out_dir / "pooled_metrics.csv")
+    assert "ZZ_STALE" not in pooled["set_id"].astype(str).unique()
+    # Registered sets still present.
+    assert {"B1", "S1", "C1"}.issubset(set(pooled["set_id"].astype(str)))
+
+
+def test_non_strict_feature_set_ids_keeps_stale_signals(signals_env):
+    """Default (no flag) keeps stale signals; the diagnostic CSV records them."""
+    rng = np.random.default_rng(98)
+    stale = _synthetic_signals(rng, set_id="YY_STALE", sentiment_model="vader")
+    stale.to_parquet(signals_env["signals_root"] / "1d" / "YY_STALE_vader.parquet",
+                     index=False)
+
+    out_dir = signals_env["root"] / "Outputs" / "Evaluation_lax"
+    rc = eval_main.main([
+        "--horizon", "1d", "--force",
+        "--output-dir", str(out_dir),
+        "--feature-config", str(signals_env["feature_sets"]),
+    ])
+    assert rc == 0
+    pooled = pd.read_csv(out_dir / "pooled_metrics.csv")
+    assert "YY_STALE" in pooled["set_id"].astype(str).unique()
+    diag = pd.read_csv(out_dir / "economic_diagnostics.csv")
+    assert "YY_STALE" in diag["set_id"].astype(str).unique()
+
+
 def test_volatility_regime_join_dtype_stable(tmp_path):
     """Regression: signal date + OHLCV date must use the same dtype.
 

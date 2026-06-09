@@ -410,6 +410,7 @@ def write_csv_outputs(out_dir: Path, *,
                       economic: pd.DataFrame | None = None,
                       economic_threshold: pd.DataFrame | None = None,
                       economic_by_ticker: pd.DataFrame | None = None,
+                      economic_diagnostics: pd.DataFrame | None = None,
                       regime_mcnemar: pd.DataFrame | None = None,
                       regime_mcnemar_summary: pd.DataFrame | None = None,
                       incremental_sentiment: pd.DataFrame | None = None,
@@ -433,6 +434,7 @@ def write_csv_outputs(out_dir: Path, *,
     _emit("economic",            economic,            "economic_performance.csv")
     _emit("economic_threshold",  economic_threshold,  "economic_performance_by_threshold.csv")
     _emit("economic_by_ticker",  economic_by_ticker,  "economic_performance_by_ticker.csv")
+    _emit("economic_diagnostics", economic_diagnostics, "economic_diagnostics.csv")
     _emit("regime_mcnemar",         regime_mcnemar,         "regime_mcnemar_tests.csv")
     _emit("regime_mcnemar_summary", regime_mcnemar_summary, "regime_mcnemar_summary.csv")
     _emit("incremental_sentiment_value", incremental_sentiment,
@@ -517,6 +519,7 @@ def print_console_summary(*,
                           regime_interaction: pd.DataFrame | None = None,
                           economic: pd.DataFrame | None = None,
                           economic_threshold: pd.DataFrame | None = None,
+                          economic_diagnostics: pd.DataFrame | None = None,
                           regime_mcnemar: pd.DataFrame | None = None,
                           incremental_sentiment: pd.DataFrame | None = None) -> None:
     print("\n" + "=" * 72)
@@ -655,6 +658,27 @@ def print_console_summary(*,
                     print(f"     {r['set_id']}{tag:14s} acc={r['accuracy']:.4f}  "
                           f"n={int(r.get('n_obs', 0))}  "
                           f"days={int(r.get('n_days', 0))}")
+
+    # Economic diagnostics — attempted / successful / skipped per horizon,
+    # plus the top skip reasons. Printed BEFORE the best-Sharpe table so a
+    # reader who sees an empty leaderboard immediately understands why.
+    if economic_diagnostics is not None and not economic_diagnostics.empty:
+        print("\n  Economic backtest coverage (per attempted signal group):")
+        total = len(economic_diagnostics)
+        ok    = int((economic_diagnostics["status"] == "ok").sum())
+        skipped = total - ok
+        print(f"    attempted: {total}   ok: {ok}   skipped: {skipped}")
+        if "horizon" in economic_diagnostics.columns:
+            for hz, grp in economic_diagnostics.groupby("horizon", sort=True):
+                hz_ok = int((grp["status"] == "ok").sum())
+                print(f"      [{hz}]  attempted={len(grp)}  ok={hz_ok}  "
+                      f"skipped={len(grp) - hz_ok}")
+        if skipped:
+            reasons = (economic_diagnostics[economic_diagnostics["status"] != "ok"]
+                       ["status"].value_counts().head(5))
+            print("    top skip reasons:")
+            for status, n in reasons.items():
+                print(f"      {status}: {int(n)}")
 
     # Economic — best Sharpe / cumulative return per horizon and cost.
     if economic is not None and not economic.empty:

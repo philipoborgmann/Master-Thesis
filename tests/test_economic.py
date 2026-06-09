@@ -321,6 +321,176 @@ def test_load_backtest_config_reads_real_file(tmp_path):
 # Threshold backtest with flat zone
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Regression: multi-set / multi-sentiment / multi-family signals all survive
+# the forward-return join. The pre-fix dedup collapsed (ticker, ts) across
+# groups and only the last-loaded set/sentiment reached economic_performance.csv.
+# ---------------------------------------------------------------------------
+
+def _multi_group_signals():
+    rng = np.random.default_rng(0)
+    ts = pd.date_range("2024-01-01", periods=10, tz="UTC", freq="D")
+    tickers = ["BTC", "ETH", "XRP", "SOL", "ADA"]
+    rows = []
+    groups = [
+        ("B1",  "-",         "per_asset",   "-",       "fixed"),
+        ("S1",  "vader",     "per_asset",   "-",       "fixed"),
+        ("S2",  "cryptobert", "per_asset",  "-",       "fixed"),
+        ("C1",  "vader",     "per_asset",   "-",       "fixed"),
+        ("M1",  "vader",     "panel_logit", "pooled",  "fixed"),
+        ("M1",  "vader",     "panel_logit", "pooled",  "hpo_brier"),
+    ]
+    for sid, sm, mt, pm, hv in groups:
+        for t in ts:
+            for tk in tickers:
+                rows.append({
+                    "timestamp":      t,
+                    "ticker":         tk,
+                    "probability":    float(rng.uniform(0.1, 0.9)),
+                    "prediction":     int(rng.integers(0, 2)),
+                    "target":         int(rng.integers(0, 2)),
+                    "set_id":         sid,
+                    "sentiment_model": sm,
+                    "model_type":     mt,
+                    "panel_mode":     pm,
+                    "hpo_variant":    hv,
+                    "horizon":        "1d",
+                    "category":       "sentiment",
+                    "label":          "test",
+                })
+    return pd.DataFrame(rows), tickers, ts
+
+
+def _forward_returns_for(tickers, ts):
+    rng = np.random.default_rng(7)
+    rows = []
+    for tk in tickers:
+        for t in ts:
+            rows.append({"ticker": tk, "timestamp": t,
+                          "forward_log_return": float(rng.normal(0, 0.02))})
+    return pd.DataFrame(rows)
+
+
+def test_summarize_high_low_preserves_every_set_sentiment_family():
+    """Pre-fix dedup keyed only on (ticker, ts) — that collapsed every group
+    but the last-loaded one. Make sure all six groups now appear."""
+    signals, tickers, ts = _multi_group_signals()
+    fr = _forward_returns_for(tickers, ts)
+    out = ec.summarize_high_low_backtest(signals, fr, CFG_DEFAULT, horizon="1d")
+    assert not out.empty
+    seen = set(map(tuple, out[["set_id", "sentiment_model", "model_type",
+                                "panel_mode", "hpo_variant"]]
+                                .drop_duplicates().to_records(index=False)))
+    expected = {
+        ("B1", "-", "per_asset", "-", "fixed"),
+        ("S1", "vader", "per_asset", "-", "fixed"),
+        ("S2", "cryptobert", "per_asset", "-", "fixed"),
+        ("C1", "vader", "per_asset", "-", "fixed"),
+        ("M1", "vader", "panel_logit", "pooled", "fixed"),
+        ("M1", "vader", "panel_logit", "pooled", "hpo_brier"),
+    }
+    assert seen == expected, (
+        f"missing groups: {expected - seen}, unexpected groups: {seen - expected}"
+    )
+
+
+def test_signals_with_forward_returns_does_not_collapse_groups():
+    """Direct unit test of the merge — every (set, ts, ticker) signal row
+    must survive when forward returns have a single unique (ticker, ts)."""
+    signals, tickers, ts = _multi_group_signals()
+    fr = _forward_returns_for(tickers, ts)
+    merged = ec._signals_with_forward_returns(signals, fr, horizon="1d")
+    # Same number of rows as input signals (no row dropped silently).
+    assert len(merged) == len(signals)
+    # forward_log_return matched on every row.
+    assert merged["forward_log_return"].notna().all()
+    # Every group still represented.
+    assert (merged.groupby(["set_id", "sentiment_model", "model_type",
+                            "panel_mode", "hpo_variant"]).size() > 0).all()
+
+
+# ---------------------------------------------------------------------------
+# economic_group_diagnostics
+# ---------------------------------------------------------------------------
+
+def test_economic_group_diagnostics_one_row_per_group_ok():
+    signals, tickers, ts = _multi_group_signals()
+    fr = _forward_returns_for(tickers, ts)
+    diag = ec.economic_group_diagnostics(signals, fr, CFG_DEFAULT, horizon="1d")
+    # 6 distinct groups → 6 rows.
+    assert len(diag) == 6
+    assert (diag["status"] == "ok").all()
+    for col in ("horizon", "set_id", "sentiment_model", "model_type",
+                "panel_mode", "hpo_variant", "category", "label",
+                "n_signal_rows", "n_unique_timestamps", "n_unique_tickers",
+                "n_forward_return_rows", "n_joined_rows",
+                "n_joined_non_null_forward_returns",
+                "n_portfolio_periods", "status", "reason"):
+        assert col in diag.columns
+
+
+def test_economic_group_diagnostics_no_forward_returns():
+    signals, _, _ = _multi_group_signals()
+    diag = ec.economic_group_diagnostics(
+        signals, pd.DataFrame(), CFG_DEFAULT, horizon="1d",
+    )
+    assert (diag["status"] == "skip_no_forward_returns").all()
+    assert (diag["n_joined_non_null_forward_returns"] == 0).all()
+    assert len(diag) == 6
+
+
+def test_economic_group_diagnostics_zero_forward_matches():
+    """Signals exist but the FR ticker universe doesn't overlap."""
+    signals, _, ts = _multi_group_signals()
+    fr = _forward_returns_for(["DOGE", "LTC"], ts)
+    diag = ec.economic_group_diagnostics(signals, fr, CFG_DEFAULT, horizon="1d")
+    assert (diag["status"] == "skip_zero_forward_matches").all()
+    assert (diag["n_joined_non_null_forward_returns"] == 0).all()
+
+
+def test_economic_group_diagnostics_no_portfolio_periods():
+    """A single-ticker group can never form both legs unless allow_single_leg."""
+    ts = pd.date_range("2024-01-01", periods=5, tz="UTC", freq="D")
+    rows = [{
+        "timestamp": t, "ticker": "BTC", "probability": 0.9,
+        "prediction": 1, "target": 1,
+        "set_id": "B1", "sentiment_model": "-", "horizon": "1d",
+        "model_type": "per_asset", "panel_mode": "-", "hpo_variant": "fixed",
+    } for t in ts]
+    signals = pd.DataFrame(rows)
+    fr = pd.DataFrame({
+        "ticker": "BTC", "timestamp": ts,
+        "forward_log_return": np.linspace(0.001, 0.01, 5),
+    })
+    diag = ec.economic_group_diagnostics(signals, fr, CFG_DEFAULT, horizon="1d")
+    assert len(diag) == 1
+    row = diag.iloc[0]
+    assert row["status"] == "skip_no_portfolio_periods"
+    assert row["n_joined_non_null_forward_returns"] == 5
+    assert row["n_portfolio_periods"] == 0
+
+
+def test_economic_group_diagnostics_missing_required_column():
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2024-01-01", periods=3, tz="UTC"),
+        "ticker":    "BTC",
+        # no probability column
+        "set_id": "B1", "sentiment_model": "-", "horizon": "1d",
+        "model_type": "per_asset", "panel_mode": "-", "hpo_variant": "fixed",
+    })
+    fr = pd.DataFrame({"ticker": "BTC",
+                        "timestamp": pd.date_range("2024-01-01", periods=3, tz="UTC"),
+                        "forward_log_return": [0.0, 0.0, 0.0]})
+    diag = ec.economic_group_diagnostics(df, fr, CFG_DEFAULT, horizon="1d")
+    assert len(diag) == 1
+    assert diag.iloc[0]["status"] == "skip_missing_required_columns"
+    assert "probability" in diag.iloc[0]["reason"]
+
+
+# ---------------------------------------------------------------------------
+# Threshold backtest with flat zone
+# ---------------------------------------------------------------------------
+
 def test_threshold_backtest_skips_when_one_leg_empty():
     # 3 timestamps × 3 assets. Threshold 0.6:
     #   t0: BTC=0.95 (long), ETH=0.55 (flat), XRP=0.05 (short)  → traded
