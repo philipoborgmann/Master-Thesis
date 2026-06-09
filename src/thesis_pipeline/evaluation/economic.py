@@ -169,7 +169,17 @@ def load_forward_returns(tickers: Iterable[str],
 def _signals_with_forward_returns(signals: pd.DataFrame,
                                   forward_returns: pd.DataFrame,
                                   horizon: str) -> pd.DataFrame:
-    """Horizon-aware merge — exact timestamp for 1h / 6h, date for 1d."""
+    """Horizon-aware merge — exact timestamp for 1h / 6h, date for 1d.
+
+    The ``signals`` frame validly contains multiple rows per ``(ticker,
+    timestamp)`` — one per evaluated group ``(set_id, sentiment_model,
+    model_type, panel_mode, hpo_variant)``. Forward returns, in contrast,
+    are model-independent and have a unique ``(ticker, timestamp)`` key.
+    The merge is therefore **many-to-one**: dedup on the signal side must
+    preserve the group identity, otherwise every group but the last-loaded
+    one is silently dropped before grouping (the bug that left only one
+    set/sentiment in ``economic_performance.csv``).
+    """
     if signals.empty or forward_returns.empty:
         return pd.DataFrame()
 
@@ -192,21 +202,33 @@ def _signals_with_forward_returns(signals: pd.DataFrame,
         sig["__join_ts__"] = sig["timestamp"]
         fr["__join_ts__"]  = fr["timestamp"]
 
-    # Guard against many-to-many merges.
-    sig_dup_n = int(sig.duplicated(subset=["ticker", "__join_ts__"]).sum())
-    fr_dup_n  = int(fr.duplicated(subset=["ticker", "__join_ts__"]).sum())
-    if sig_dup_n or fr_dup_n:
+    # Forward returns: must be unique per (ticker, ts). Dedup-with-warning
+    # if not.
+    fr_dup_n = int(fr.duplicated(subset=["ticker", "__join_ts__"]).sum())
+    if fr_dup_n:
         get_logger().warning(
-            "economic: %d duplicate signal keys and %d duplicate forward-return keys "
-            "for horizon=%s — keeping last to enforce 1:1 join",
-            sig_dup_n, fr_dup_n, horizon,
+            "economic: %d duplicate forward-return keys for horizon=%s — "
+            "keeping last to enforce a unique forward-return key",
+            fr_dup_n, horizon,
         )
-        sig = sig.drop_duplicates(subset=["ticker", "__join_ts__"], keep="last")
-        fr  = fr.drop_duplicates(subset=["ticker", "__join_ts__"], keep="last")
+        fr = fr.drop_duplicates(subset=["ticker", "__join_ts__"], keep="last")
+
+    # Signals: dedup INSIDE each group only — the identity columns must be
+    # part of the dedup key so we never collapse signals across groups.
+    group_id_cols = [c for c in GROUP_KEYS if c in sig.columns and c != "horizon"]
+    sig_dup_keys = ["ticker", "__join_ts__"] + group_id_cols
+    sig_dup_n = int(sig.duplicated(subset=sig_dup_keys).sum())
+    if sig_dup_n:
+        get_logger().warning(
+            "economic: %d duplicate signal keys for horizon=%s within identity "
+            "(%s) — keeping last", sig_dup_n, horizon,
+            "+".join(["ticker", "ts"] + group_id_cols),
+        )
+        sig = sig.drop_duplicates(subset=sig_dup_keys, keep="last")
 
     merged = sig.merge(
         fr[["ticker", "__join_ts__", "forward_log_return"]],
-        on=["ticker", "__join_ts__"], how="left", validate="one_to_one",
+        on=["ticker", "__join_ts__"], how="left", validate="many_to_one",
     )
     n_matched = int(merged["forward_log_return"].notna().sum())
     if n_matched == 0:
@@ -572,25 +594,34 @@ def summarize_high_low_backtest(signals: pd.DataFrame,
                                  cfg: dict,
                                  *,
                                  horizon: str) -> pd.DataFrame:
-    """One row per (horizon × set × sentiment × cost_bps).
+    """One row per (horizon × set × sentiment × model × panel × hpo × cost_bps).
 
     Cross-sectional High-Low portfolio with the quantile cutoffs from
     ``cfg``. The result reports portfolio-level metrics — *not* a sum over
-    individual ticker observations.
+    individual ticker observations. A group that fails any backtest gate
+    (no forward-return matches; cross-section never forms both legs) is
+    silently omitted from this table; :func:`economic_group_diagnostics`
+    records exactly which gate dropped it.
     """
     if signals.empty:
         return pd.DataFrame()
     merged = _signals_with_forward_returns(signals, forward_returns, horizon=horizon)
-    if merged.empty or merged["forward_log_return"].notna().sum() == 0:
+    if merged.empty:
         return pd.DataFrame()
     merged = ensure_group_columns(merged)
 
     cost_grid = list(cfg.get("transaction_cost_bps", [0, 5, 10]))
     rows: list[dict] = []
     for keys, grp in merged.groupby(list(GROUP_KEYS), dropna=False):
+        # Per-group gate: a horizon-wide gate would mask groups that *do*
+        # have matches once another group's join failed.
+        if grp["forward_log_return"].notna().sum() == 0:
+            continue
         meta = _group_meta(grp)
         n_signal_periods = int(grp["timestamp"].nunique())
         portfolio = build_high_low_portfolio_returns(grp, cfg, selector="quantile")
+        if portfolio.empty:
+            continue
         for cost in cost_grid:
             row = _portfolio_metrics_row(portfolio, float(cost), cfg)
             row["coverage"] = (
@@ -619,6 +650,135 @@ def summarize_high_low_backtest(signals: pd.DataFrame,
     return _front_order(out, front)
 
 
+def economic_group_diagnostics(signals: pd.DataFrame,
+                               forward_returns: pd.DataFrame,
+                               cfg: dict,
+                               *,
+                               horizon: str) -> pd.DataFrame:
+    """One row per attempted (horizon × set × sentiment × model × panel × hpo).
+
+    Reports whether the group reached the ``economic_performance.csv`` table
+    and, if not, which gate dropped it. Status values:
+
+    * ``ok`` — produced a portfolio with at least one period.
+    * ``skip_missing_required_columns`` — signals frame lacks one of
+      ``timestamp / ticker / probability``.
+    * ``skip_no_signals`` — group has zero rows (defensive; should not occur
+      when iterating groups of a non-empty frame).
+    * ``skip_no_forward_returns`` — :func:`load_forward_returns` returned an
+      empty frame for the horizon (no local OHLCV).
+    * ``skip_zero_forward_matches`` — every ``forward_log_return`` for the
+      group was NaN after the join (no overlapping ticker × timestamp).
+    * ``skip_no_valid_probability`` — no rows had both a ``probability`` and
+      a non-NaN ``forward_log_return``.
+    * ``skip_no_portfolio_periods`` — :func:`build_high_low_portfolio_returns`
+      produced no rows (cross-section never had both legs satisfied under
+      ``min_assets_per_leg`` / ``allow_single_leg``).
+    """
+    front_cols = list(GROUP_KEYS) + [
+        "category", "label",
+        "n_signal_rows", "n_unique_timestamps", "n_unique_tickers",
+        "n_forward_return_rows", "n_joined_rows",
+        "n_joined_non_null_forward_returns",
+        "n_portfolio_periods", "status", "reason",
+    ]
+    if signals is None or signals.empty:
+        return pd.DataFrame(columns=front_cols)
+
+    n_fr_rows = int(0 if forward_returns is None else len(forward_returns))
+    sig = ensure_group_columns(signals.copy())
+
+    def _base_row(keys, grp):
+        row = dict(zip(GROUP_KEYS, keys))
+        meta = _group_meta(grp)
+        row["category"] = meta.get("category", "")
+        row["label"]    = meta.get("label", "")
+        row["n_signal_rows"]       = int(len(grp))
+        row["n_unique_timestamps"] = (int(grp["timestamp"].nunique())
+                                       if "timestamp" in grp.columns else 0)
+        row["n_unique_tickers"]    = (int(grp["ticker"].nunique())
+                                       if "ticker" in grp.columns else 0)
+        row["n_forward_return_rows"] = n_fr_rows
+        row["n_joined_rows"] = int(len(grp))
+        row["n_joined_non_null_forward_returns"] = (
+            int(grp["forward_log_return"].notna().sum())
+            if "forward_log_return" in grp.columns else 0
+        )
+        row["n_portfolio_periods"] = 0
+        return row
+
+    required = ["timestamp", "ticker", "probability"]
+    missing = [c for c in required if c not in sig.columns]
+    if missing:
+        rows = []
+        for keys, grp in sig.groupby(list(GROUP_KEYS), dropna=False):
+            row = _base_row(keys, grp)
+            row["status"] = "skip_missing_required_columns"
+            row["reason"] = f"missing columns: {missing}"
+            rows.append(row)
+        return pd.DataFrame(rows, columns=front_cols)
+
+    if forward_returns is None or forward_returns.empty:
+        rows = []
+        for keys, grp in sig.groupby(list(GROUP_KEYS), dropna=False):
+            row = _base_row(keys, grp)
+            row["status"] = "skip_no_forward_returns"
+            row["reason"] = f"no forward returns for horizon={horizon}"
+            rows.append(row)
+        return pd.DataFrame(rows, columns=front_cols)
+
+    merged = _signals_with_forward_returns(sig, forward_returns, horizon=horizon)
+    if merged.empty:
+        rows = []
+        for keys, grp in sig.groupby(list(GROUP_KEYS), dropna=False):
+            row = _base_row(keys, grp)
+            row["status"] = "skip_zero_forward_matches"
+            row["reason"] = "signal × forward-return merge produced no rows"
+            rows.append(row)
+        return pd.DataFrame(rows, columns=front_cols)
+
+    merged = ensure_group_columns(merged)
+    rows: list[dict] = []
+    for keys, grp in merged.groupby(list(GROUP_KEYS), dropna=False):
+        row = _base_row(keys, grp)
+        n_rows    = row["n_signal_rows"]
+        n_matched = row["n_joined_non_null_forward_returns"]
+
+        if n_rows == 0:
+            row["status"] = "skip_no_signals"
+            row["reason"] = "group has no rows"
+            rows.append(row)
+            continue
+        if n_matched == 0:
+            row["status"] = "skip_zero_forward_matches"
+            row["reason"] = "all forward_log_return joins were NaN for this group"
+            rows.append(row)
+            continue
+        valid_prob = int(grp.dropna(subset=["forward_log_return",
+                                            "probability"]).shape[0])
+        if valid_prob == 0:
+            row["status"] = "skip_no_valid_probability"
+            row["reason"] = "no rows with both probability and forward_log_return"
+            rows.append(row)
+            continue
+        portfolio = build_high_low_portfolio_returns(grp, cfg, selector="quantile")
+        n_pp = int(len(portfolio))
+        row["n_portfolio_periods"] = n_pp
+        if n_pp == 0:
+            row["status"] = "skip_no_portfolio_periods"
+            row["reason"] = (
+                f"cross-section never formed both legs "
+                f"(min_assets_per_leg={cfg.get('min_assets_per_leg', 1)}, "
+                f"allow_single_leg={cfg.get('allow_single_leg', False)})"
+            )
+            rows.append(row)
+            continue
+        row["status"] = "ok"
+        row["reason"] = ""
+        rows.append(row)
+    return pd.DataFrame(rows, columns=front_cols)
+
+
 def summarize_high_low_threshold_backtest(signals: pd.DataFrame,
                                            forward_returns: pd.DataFrame,
                                            cfg: dict,
@@ -634,7 +794,7 @@ def summarize_high_low_threshold_backtest(signals: pd.DataFrame,
     if signals.empty:
         return pd.DataFrame()
     merged = _signals_with_forward_returns(signals, forward_returns, horizon=horizon)
-    if merged.empty or merged["forward_log_return"].notna().sum() == 0:
+    if merged.empty:
         return pd.DataFrame()
     merged = ensure_group_columns(merged)
 
@@ -642,6 +802,8 @@ def summarize_high_low_threshold_backtest(signals: pd.DataFrame,
     cost_grid  = list(cfg.get("transaction_cost_bps", [0, 5, 10]))
     rows: list[dict] = []
     for keys, grp in merged.groupby(list(GROUP_KEYS), dropna=False):
+        if grp["forward_log_return"].notna().sum() == 0:
+            continue
         meta = _group_meta(grp)
         n_signal_periods = int(grp["timestamp"].nunique())
         for thr in thresholds:
@@ -685,7 +847,7 @@ def summarize_backtest_by_ticker(signals: pd.DataFrame,
     if signals.empty:
         return pd.DataFrame()
     merged = _signals_with_forward_returns(signals, forward_returns, horizon=horizon)
-    if merged.empty or merged["forward_log_return"].notna().sum() == 0:
+    if merged.empty:
         return pd.DataFrame()
     merged = ensure_group_columns(merged)
 

@@ -360,6 +360,78 @@ the new hierarchy: `C_k`, `CV_k`, `M_k` are compared against `B_k` (18
 entries). Old `E*` IDs were never reintroduced and `M_k → E_*` mappings
 were removed.
 
+## Economic backtest: cross-group merge bug fix (June 2026)
+
+### Symptom
+
+`Outputs/Evaluation/economic_performance.csv` carried only one
+`(set_id, sentiment_model)` row per horizon (plus `BUY_HOLD`), regardless of
+how many signal groups were present under `Outputs/Signals/{horizon}/`.
+
+### Root cause
+
+`evaluation.economic._signals_with_forward_returns` deduplicated the signal
+side of the merge on `("ticker", "__join_ts__")` alone, then ran the merge
+with `validate="one_to_one"`. The signal frame validly contains many rows
+per `(ticker, ts)` — one per evaluated group `(set_id, sentiment_model,
+model_type, panel_mode, hpo_variant)`. The dedup therefore collapsed every
+group but the last-loaded one (a `keep="last"` semantics that depended on
+filename order). Pooled metrics survived because they never merged with
+forward returns; the bug was localised to the economic layer.
+
+### Fix
+
+- Forward returns dedup stays on `("ticker", "__join_ts__")` (they are
+  model-independent).
+- Signals dedup now includes the group identity:
+  `["ticker", "__join_ts__"] + GROUP_KEYS \ {"horizon"}`.
+- Merge changed to `validate="many_to_one"`.
+- The horizon-wide early return
+  `if merged.empty or notna.sum() == 0: return empty`
+  was relaxed: each group is now gated individually in
+  `summarize_high_low_backtest`, `summarize_high_low_threshold_backtest`,
+  and `summarize_backtest_by_ticker`, so one failing group never masks
+  every other group in the same horizon.
+
+### New: `economic_diagnostics.csv`
+
+`evaluation.economic.economic_group_diagnostics(...)` records exactly one
+row per attempted `(horizon, set_id, sentiment_model, model_type,
+panel_mode, hpo_variant)` with a `status` of one of:
+
+```
+ok
+skip_missing_required_columns
+skip_no_signals
+skip_no_forward_returns
+skip_zero_forward_matches
+skip_no_valid_probability
+skip_no_portfolio_periods
+```
+
+and counters: `n_signal_rows`, `n_unique_timestamps`, `n_unique_tickers`,
+`n_forward_return_rows`, `n_joined_rows`,
+`n_joined_non_null_forward_returns`, `n_portfolio_periods`. Written to
+`Outputs/Evaluation/economic_diagnostics.csv`.
+
+A console summary section ("Economic backtest coverage") prints
+attempted / ok / skipped counts per horizon and the top-five skip reasons.
+
+### New CLI flag: `--strict-feature-set-ids`
+
+`evaluate-signals` now accepts `--strict-feature-set-ids`. When set, only
+signal rows whose `set_id` is in the active `feature_sets.xlsx` survive
+into evaluation. Default is non-strict — stale legacy IDs are still
+scored, and the diagnostics CSV flags them.
+
+### Tests
+
+`tests/test_economic.py` gains a regression suite covering
+multi-set + multi-sentiment + multi-family signal frames, plus six
+`economic_group_diagnostics` unit tests. `tests/test_evaluate_signals.py`
+gains four integration tests covering the strict / non-strict modes and
+the on-disk diagnostics CSV.
+
 ## Things explicitly **not** changed
 
 - Target construction (`Create_Price_Features.py`).

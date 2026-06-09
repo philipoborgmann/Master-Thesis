@@ -39,6 +39,7 @@ from .market_cap import (
 from .metrics import pooled_metrics_table, per_ticker_metrics_table
 from .economic import (
     attach_benchmark_lifts, buy_and_hold_benchmark,
+    economic_group_diagnostics,
     load_backtest_config, load_forward_returns,
     summarize_backtest_by_ticker,
     summarize_high_low_backtest,
@@ -103,6 +104,12 @@ def build_parser() -> argparse.ArgumentParser:
                         dest="no_regime_mcnemar", action="store_true",
                         help="Skip the regime-specific (volatility / market-cap / "
                              "interaction) McNemar tests.")
+    parser.add_argument("--strict-feature-set-ids", "--strict_feature_set_ids",
+                        dest="strict_feature_set_ids", action="store_true",
+                        help="Only evaluate signal groups whose set_id appears in "
+                             "the active feature_sets.xlsx. Default: evaluate every "
+                             "loaded signal file (legacy / stale IDs are still "
+                             "scored, just flagged in economic_diagnostics.csv).")
     return parser
 
 
@@ -128,6 +135,7 @@ def run(*, horizon: str | None = None,
         force: bool = False, no_volatility: bool = False,
         no_market_cap: bool = False, no_economic: bool = False,
         no_regime_mcnemar: bool = False,
+        strict_feature_set_ids: bool = False,
         feature_config: str | None = None,
         backtest_config: str | None = None,
         transaction_cost_bps: list[float] | None = None) -> int:
@@ -157,6 +165,8 @@ def run(*, horizon: str | None = None,
         argv.append("--no-economic")
     if no_regime_mcnemar:
         argv.append("--no-regime-mcnemar")
+    if strict_feature_set_ids:
+        argv.append("--strict-feature-set-ids")
     return main(argv)
 
 
@@ -190,7 +200,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.no_economic:
         outputs += [out_root / "economic_performance.csv",
                     out_root / "economic_performance_by_threshold.csv",
-                    out_root / "economic_performance_by_ticker.csv"]
+                    out_root / "economic_performance_by_ticker.csv",
+                    out_root / "economic_diagnostics.csv"]
     if not args.no_regime_mcnemar:
         outputs.append(out_root / "regime_mcnemar_tests.csv")
         outputs.append(out_root / "regime_mcnemar_summary.csv")
@@ -201,15 +212,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         inputs=inputs,
         outputs=outputs,
         extra={
-            "horizon":              args.horizon or "(all)",
-            "output_dir":           str(out_root),
-            "no_volatility":        args.no_volatility,
-            "no_market_cap":        args.no_market_cap,
-            "no_economic":          args.no_economic,
-            "no_regime_mcnemar":    args.no_regime_mcnemar,
-            "transaction_cost_bps": args.transaction_cost_bps or "(from config)",
-            "backtest_config":      args.backtest_config or "(default)",
-            "force":                args.force,
+            "horizon":               args.horizon or "(all)",
+            "output_dir":            str(out_root),
+            "no_volatility":         args.no_volatility,
+            "no_market_cap":         args.no_market_cap,
+            "no_economic":           args.no_economic,
+            "no_regime_mcnemar":     args.no_regime_mcnemar,
+            "strict_feature_set_ids": args.strict_feature_set_ids,
+            "transaction_cost_bps":  args.transaction_cost_bps or "(from config)",
+            "backtest_config":       args.backtest_config or "(default)",
+            "force":                 args.force,
         },
     )
 
@@ -241,6 +253,35 @@ def main(argv: Sequence[str] | None = None) -> int:
                        "columns will be empty", fs_path, exc)
         feature_sets = pd.DataFrame(columns=["set_id", "category", "label"])
     signals = attach_feature_set_metadata(signals, feature_sets)
+
+    # ── 2b. Optional strict feature-set-id filter ───────────────
+    # Without the flag we evaluate every signal file on disk and let
+    # economic_diagnostics.csv flag stale/legacy set_ids. With it, only
+    # set_ids registered in the active feature_sets.xlsx survive — useful
+    # when comparing across a fixed registry version.
+    if args.strict_feature_set_ids:
+        if "set_id" not in feature_sets.columns or feature_sets["set_id"].empty:
+            logger.warning(
+                "evaluate-signals: --strict-feature-set-ids requested but "
+                "feature_sets.xlsx has no set_id column / is empty — filter "
+                "would drop everything; ignoring the flag."
+            )
+        else:
+            registered = set(feature_sets["set_id"].dropna().astype(str))
+            before_n = len(signals)
+            present  = set(signals["set_id"].astype(str).unique())
+            stale    = sorted(present - registered)
+            signals  = signals[signals["set_id"].astype(str).isin(registered)]
+            logger.info(
+                "evaluate-signals: --strict-feature-set-ids kept %d / %d rows "
+                "(%d set_ids in registry, %d dropped: %s)",
+                len(signals), before_n, len(registered), len(stale),
+                ", ".join(stale) if stale else "(none)",
+            )
+            if signals.empty:
+                logger.warning("evaluate-signals: no signal rows survive strict "
+                               "feature-set-id filter — nothing to evaluate")
+                return 0
 
     # ── 3. Pooled + per-ticker metrics ──────────────────────────
     pooled     = pooled_metrics_table(signals)
@@ -330,6 +371,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     economic_df      = pd.DataFrame()
     economic_thr_df  = pd.DataFrame()
     economic_tk_df   = pd.DataFrame()
+    economic_diag_df = pd.DataFrame()
     if args.no_economic:
         logger.info("evaluate-signals: --no-economic set, skipping backtest")
     else:
@@ -343,6 +385,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 continue
             hz_tickers = sorted(hz_signals["ticker"].astype(str).str.upper().unique())
             fr = load_forward_returns(hz_tickers, horizon=hz)
+            # Always build diagnostics — even when no FR data exists — so the
+            # CSV records *every* attempted (horizon × group) with a reason.
+            economic_diag_df = pd.concat(
+                [economic_diag_df,
+                 economic_group_diagnostics(hz_signals, fr, bcfg, horizon=hz)],
+                ignore_index=True,
+            )
             if fr.empty:
                 logger.warning("evaluate-signals: no close-price data for %s — "
                                "backtest will skip this horizon", hz)
@@ -467,6 +516,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         economic=(economic_df       if not args.no_economic   else None),
         economic_threshold=(economic_thr_df if not args.no_economic else None),
         economic_by_ticker=(economic_tk_df  if not args.no_economic else None),
+        economic_diagnostics=(economic_diag_df if not args.no_economic else None),
         regime_mcnemar=(regime_mcnemar_df if not args.no_regime_mcnemar else None),
         regime_mcnemar_summary=(regime_mcnemar_summary_df
                                 if not args.no_regime_mcnemar else None),
@@ -499,6 +549,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         mcnemar=mcnemar_df_long, threshold_lift=threshold_lift_df,
         market_cap=mcap_df, regime_interaction=interaction_df,
         economic=economic_df, economic_threshold=economic_thr_df,
+        economic_diagnostics=(economic_diag_df
+                              if not args.no_economic else None),
         regime_mcnemar=regime_mcnemar_df,
         incremental_sentiment=incremental_df,
     )
