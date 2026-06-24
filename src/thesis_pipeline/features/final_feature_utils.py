@@ -35,11 +35,15 @@ _SENTIMENT_TOKENS: tuple[str, ...] = ("bullishness", "post_count")
 
 # Group membership for the canonical thesis features.
 _PRICE_FEATURES: frozenset = frozenset({
-    "log_return_t", "cum_log_return_7", "cum_log_return_14",
+    "log_return_t",
+    # v4 calendar-consistent windows; legacy bar-count names kept so old
+    # final parquets still classify (they're treated identically downstream).
+    "cum_log_return_7d", "cum_log_return_14d", "cum_log_return_21d",
+    "cum_log_return_7",  "cum_log_return_14",
 })
-_VOLATILITY_FEATURES: frozenset = frozenset({"realized_vol_14"})
+_VOLATILITY_FEATURES: frozenset = frozenset({"realized_vol_14d", "realized_vol_14"})
 _VOLUME_FEATURES: frozenset = frozenset({"volume_diff"})
-_MARKETCAP_FEATURES: frozenset = frozenset({"market_cap_t"})
+_MARKETCAP_FEATURES: frozenset = frozenset({"log_market_cap_lag1", "market_cap_t"})
 
 
 # ---------------------------------------------------------------------------

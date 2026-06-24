@@ -566,7 +566,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Override the default diagnostic basket.")
     sp.add_argument("--include-market-cap", dest="include_market_cap",
                     action="store_true",
-                    help="Include market_cap_t in the default basket.")
+                    help="Include log_market_cap_lag1 in the default basket.")
     sp.add_argument("--max-breaks", dest="max_breaks", type=int, default=None)
     sp.add_argument("--min-segment-frac", dest="min_segment_frac", type=float,
                     default=None)
