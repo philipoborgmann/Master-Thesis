@@ -1,131 +1,250 @@
-# Feature-set definitions.
+# Feature-set definitions — v4 (Variante A, 17 sets).
 #
-# This YAML mirrors feature_sets.xlsx (sheets: summary, feature_sets) and
-# becomes the canonical, version-controlled source. The code still loads
-# feature_sets.xlsx by default for backward compatibility; switch the
-# default in src/thesis_pipeline/features/feature_registry.py once
-# feature_sets.xlsx is verified to match this file exactly.
+# Designed to eliminate identified engagement-related look-ahead leakage.
+# This YAML is the version-controlled mirror of feature_sets.xlsx; the
+# registry loader prefers the XLSX when present, otherwise falls back here.
 #
-# Set IDs preserved from feature_sets.xlsx / Run_Models.py:
-#   - B1, B2                 (benchmarks)
-#   - E1, E2, E3, E4         (economic / price-only)
-#   - S1, S2, S3, S4, S5, S6, S7  (sentiment sets, applied per scorer)
-#   - C1, C2, C3, C4, C5     (combined price + sentiment sets, per scorer)
+# Structure:
+#   * ECON                      — economic-only benchmark.
+#   * SENT_{VAD|CBT}_{block}    — sentiment-only, one per (vader, cryptobert).
+#   * ECON_{VAD|CBT}_{block}    — combined = ECON core + sentiment block.
 #
-# Feature names below mirror the columns produced by
-#   Create_Price_Features.py and Sentiment_feature_engineering.py.
-# Sentiment features follow the pattern produced upstream:
-#   {model}_{title|selftext|combined}_{mean|median|std|weighted_mean}
-#   {model}_post_count, {model}_bullishness_ratio, etc.
+# Blocks (title-based, no engagement weighting):
+#   * L   = {m}_title_score_mean
+#   * LD  = + {m}_title_score_std
+#   * DA  = {m}_bullishness_ratio, log1p_post_count
+#   * F   = all four (mean, std, bullishness, log1p_post_count)
 #
-# NOTE: This file is a structural mirror. Cross-check against
-# feature_sets.xlsx and confirm the exact feature lists before flipping
-# the loader default. Items marked TODO need verification.
+# Diagnostic-only columns kept in the merged frame but NOT in the 17-set grid:
+# has_posts, {m}_directional_post_count, {m}_combined_score_mean,
+# {m}_selftext_score_mean (robustness / supplementary analyses only).
 
-source_of_truth: "feature_sets.xlsx"   # change to "feature_sets.yaml" after verification
+source_of_truth: "feature_sets.xlsx"
 
-# ---------------------------------------------------------------------------
-# Common price features (produced by Create_Price_Features.py)
-# ---------------------------------------------------------------------------
-price_features_core:
+# ECON core, repeated identically across every combined set for transparency.
+econ_core:
   - log_return_t
-  - cum_log_return_7
-  - cum_log_return_14
-  - realized_vol_14
+  - cum_log_return_7d
+  - cum_log_return_14d
+  - cum_log_return_21d
+  - realized_vol_14d
   - volume_diff
-  - market_cap_t
+  - log_market_cap_lag1
 
-# ---------------------------------------------------------------------------
-# Feature sets
-# ---------------------------------------------------------------------------
 sets:
 
-  B1:
+  # ---------------------------------------------------------------------
+  # ECON — economic-only benchmark
+  # ---------------------------------------------------------------------
+  ECON:
     category: benchmark
-    label: "Naive benchmark — rolling probability"
-    features: []
-    sentiment_model: null
-    model_override: "rolling_probability"
-
-  B2:
-    category: benchmark
-    label: "Logistic benchmark — last log return only"
+    sentiment_model: none
+    label: "Economic-only benchmark (ECON core)"
     features:
       - log_return_t
-    sentiment_model: null
-
-  E1:
-    category: economic
-    label: "Return + lagged returns"
-    features:
-      - log_return_t
-      - cum_log_return_7
-    sentiment_model: null
-
-  E2:
-    category: economic
-    label: "Return + volatility"
-    features:
-      - log_return_t
-      - realized_vol_14
-    sentiment_model: null
-
-  E3:
-    category: economic
-    label: "Return + volume"
-    features:
-      - log_return_t
+      - cum_log_return_7d
+      - cum_log_return_14d
+      - cum_log_return_21d
+      - realized_vol_14d
       - volume_diff
-    sentiment_model: null
+      - log_market_cap_lag1
 
-  E4:
-    category: economic
-    label: "Full economic set"
-    features:
-      - log_return_t
-      - cum_log_return_7
-      - cum_log_return_14
-      - realized_vol_14
-      - volume_diff
-      - market_cap_t
-    sentiment_model: null
-
-  # ---------------------------------------------------------------------------
-  # Sentiment-only sets (S*) — applied separately for VADER, FinBERT, CryptoBERT
-  # The {model} placeholder is substituted to cryptobert / vader (FinBERT
-  # was removed — see docs/refactor_log.md).
-  # TODO: confirm exact column list against feature_sets.xlsx.
-  # ---------------------------------------------------------------------------
-  S1:
+  # ---------------------------------------------------------------------
+  # SENT_VAD_* — sentiment-only, VADER
+  # ---------------------------------------------------------------------
+  SENT_VAD_L:
     category: sentiment
-    label: "Sentiment combined mean"
+    sentiment_model: vader
+    label: "VADER title score mean (L)"
     features:
-      - "{model}_combined_mean"
-    per_sentiment_model: true
+      - vader_title_score_mean
 
-  S2:
+  SENT_VAD_LD:
     category: sentiment
-    label: "Sentiment combined weighted mean (engagement)"
+    sentiment_model: vader
+    label: "VADER title score mean + std (LD)"
     features:
-      - "{model}_combined_weighted_mean"
-    per_sentiment_model: true
+      - vader_title_score_mean
+      - vader_title_score_std
 
-  # ---------------------------------------------------------------------------
-  # Combined economic + sentiment sets (C*)
-  # ---------------------------------------------------------------------------
-  C1:
+  SENT_VAD_DA:
+    category: sentiment
+    sentiment_model: vader
+    label: "VADER bullishness ratio + log1p_post_count (DA)"
+    features:
+      - vader_bullishness_ratio
+      - log1p_post_count
+
+  SENT_VAD_F:
+    category: sentiment
+    sentiment_model: vader
+    label: "VADER full sentiment block (F)"
+    features:
+      - vader_title_score_mean
+      - vader_title_score_std
+      - vader_bullishness_ratio
+      - log1p_post_count
+
+  # ---------------------------------------------------------------------
+  # SENT_CBT_* — sentiment-only, CryptoBERT
+  # ---------------------------------------------------------------------
+  SENT_CBT_L:
+    category: sentiment
+    sentiment_model: cryptobert
+    label: "CryptoBERT title score mean (L)"
+    features:
+      - cryptobert_title_score_mean
+
+  SENT_CBT_LD:
+    category: sentiment
+    sentiment_model: cryptobert
+    label: "CryptoBERT title score mean + std (LD)"
+    features:
+      - cryptobert_title_score_mean
+      - cryptobert_title_score_std
+
+  SENT_CBT_DA:
+    category: sentiment
+    sentiment_model: cryptobert
+    label: "CryptoBERT bullishness ratio + log1p_post_count (DA)"
+    features:
+      - cryptobert_bullishness_ratio
+      - log1p_post_count
+
+  SENT_CBT_F:
+    category: sentiment
+    sentiment_model: cryptobert
+    label: "CryptoBERT full sentiment block (F)"
+    features:
+      - cryptobert_title_score_mean
+      - cryptobert_title_score_std
+      - cryptobert_bullishness_ratio
+      - log1p_post_count
+
+  # ---------------------------------------------------------------------
+  # ECON_VAD_* — combined ECON core + VADER block
+  # ---------------------------------------------------------------------
+  ECON_VAD_L:
     category: combined
-    label: "Full economic + sentiment combined mean"
+    sentiment_model: vader
+    label: "ECON + VADER L"
     features:
       - log_return_t
-      - cum_log_return_7
-      - cum_log_return_14
-      - realized_vol_14
+      - cum_log_return_7d
+      - cum_log_return_14d
+      - cum_log_return_21d
+      - realized_vol_14d
       - volume_diff
-      - market_cap_t
-      - "{model}_combined_mean"
-    per_sentiment_model: true
+      - log_market_cap_lag1
+      - vader_title_score_mean
 
-# TODO(refactor_log): cross-check additional sets S3-S7 / C2-C5 against
-# feature_sets.xlsx — leave them resolved via the Excel loader until the
-# mapping is verified by hand.
+  ECON_VAD_LD:
+    category: combined
+    sentiment_model: vader
+    label: "ECON + VADER LD"
+    features:
+      - log_return_t
+      - cum_log_return_7d
+      - cum_log_return_14d
+      - cum_log_return_21d
+      - realized_vol_14d
+      - volume_diff
+      - log_market_cap_lag1
+      - vader_title_score_mean
+      - vader_title_score_std
+
+  ECON_VAD_DA:
+    category: combined
+    sentiment_model: vader
+    label: "ECON + VADER DA"
+    features:
+      - log_return_t
+      - cum_log_return_7d
+      - cum_log_return_14d
+      - cum_log_return_21d
+      - realized_vol_14d
+      - volume_diff
+      - log_market_cap_lag1
+      - vader_bullishness_ratio
+      - log1p_post_count
+
+  ECON_VAD_F:
+    category: combined
+    sentiment_model: vader
+    label: "ECON + VADER F (full sentiment block)"
+    features:
+      - log_return_t
+      - cum_log_return_7d
+      - cum_log_return_14d
+      - cum_log_return_21d
+      - realized_vol_14d
+      - volume_diff
+      - log_market_cap_lag1
+      - vader_title_score_mean
+      - vader_title_score_std
+      - vader_bullishness_ratio
+      - log1p_post_count
+
+  # ---------------------------------------------------------------------
+  # ECON_CBT_* — combined ECON core + CryptoBERT block
+  # ---------------------------------------------------------------------
+  ECON_CBT_L:
+    category: combined
+    sentiment_model: cryptobert
+    label: "ECON + CryptoBERT L"
+    features:
+      - log_return_t
+      - cum_log_return_7d
+      - cum_log_return_14d
+      - cum_log_return_21d
+      - realized_vol_14d
+      - volume_diff
+      - log_market_cap_lag1
+      - cryptobert_title_score_mean
+
+  ECON_CBT_LD:
+    category: combined
+    sentiment_model: cryptobert
+    label: "ECON + CryptoBERT LD"
+    features:
+      - log_return_t
+      - cum_log_return_7d
+      - cum_log_return_14d
+      - cum_log_return_21d
+      - realized_vol_14d
+      - volume_diff
+      - log_market_cap_lag1
+      - cryptobert_title_score_mean
+      - cryptobert_title_score_std
+
+  ECON_CBT_DA:
+    category: combined
+    sentiment_model: cryptobert
+    label: "ECON + CryptoBERT DA"
+    features:
+      - log_return_t
+      - cum_log_return_7d
+      - cum_log_return_14d
+      - cum_log_return_21d
+      - realized_vol_14d
+      - volume_diff
+      - log_market_cap_lag1
+      - cryptobert_bullishness_ratio
+      - log1p_post_count
+
+  ECON_CBT_F:
+    category: combined
+    sentiment_model: cryptobert
+    label: "ECON + CryptoBERT F (full sentiment block)"
+    features:
+      - log_return_t
+      - cum_log_return_7d
+      - cum_log_return_14d
+      - cum_log_return_21d
+      - realized_vol_14d
+      - volume_diff
+      - log_market_cap_lag1
+      - cryptobert_title_score_mean
+      - cryptobert_title_score_std
+      - cryptobert_bullishness_ratio
+      - log1p_post_count

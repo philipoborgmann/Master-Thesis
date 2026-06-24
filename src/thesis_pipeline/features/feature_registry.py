@@ -1,10 +1,12 @@
-"""Feature-set registry.
+"""Feature-set registry — v4 (Variante A, 17 sets).
 
-Reads ``feature_sets.xlsx`` (the current source of truth) and, when
-``configs/feature_sets.yaml`` has been verified, optionally the YAML mirror.
-The behavior contract is: every ``set_id`` declared in either source maps
-to a non-empty list of feature column names (B1, the rolling-probability
-benchmark, is allowed to have an empty feature list).
+Reads ``feature_sets.xlsx`` (the source of truth) and falls back to
+``configs/feature_sets.yaml``. The behaviour contract is:
+
+* exactly 17 ``set_id`` values, all listed in :data:`SET_ID_PATTERN`;
+* every set has a non-empty feature list (no empty-feature exception);
+* ``has_posts`` and ``{model}_directional_post_count`` are **diagnostic-only**
+  columns; they MUST NOT appear in any of the 17 set definitions.
 """
 
 from __future__ import annotations
@@ -15,16 +17,37 @@ from typing import Dict, List
 from ..config import load_config, resolve_path
 
 
+# The canonical 17 feature sets (v4 — Variante A).
+#
+#   * ECON                 — economic-only benchmark (no sentiment).
+#   * SENT_{model}_{block} — sentiment-only, one block per (vader, cryptobert).
+#   * ECON_{model}_{block} — combined = ECON core + sentiment block.
+#
+# Blocks: L = score mean only; LD = + std; DA = bullishness + log1p_post_count;
+# F = all four (mean, std, bullishness, log1p_post_count). See feature_sets.yaml
+# for the canonical feature lists.
 SET_ID_PATTERN = (
-    "B1", "B2", "B3", "B4", "B5", "B6",
-    "S1", "S2", "S3",
-    "SV1", "SV2", "SV3",
-    "C1", "C2", "C3", "C4", "C5", "C6",
-    "CV1", "CV2", "CV3", "CV4", "CV5", "CV6",
-    "M1", "M2", "M3", "M4", "M5", "M6",
+    "ECON",
+    "SENT_VAD_L", "SENT_VAD_LD", "SENT_VAD_DA", "SENT_VAD_F",
+    "SENT_CBT_L", "SENT_CBT_LD", "SENT_CBT_DA", "SENT_CBT_F",
+    "ECON_VAD_L", "ECON_VAD_LD", "ECON_VAD_DA", "ECON_VAD_F",
+    "ECON_CBT_L", "ECON_CBT_LD", "ECON_CBT_DA", "ECON_CBT_F",
+)
+assert len(SET_ID_PATTERN) == 17, "v4 registry must contain exactly 17 sets"
+
+# Diagnostic-only columns. Never expose them as features in the primary grid.
+DIAGNOSTIC_ONLY_COLUMNS = (
+    "has_posts",
+    "vader_directional_post_count",
+    "cryptobert_directional_post_count",
+    "vader_combined_score_mean",      # robustness / supplementary only
+    "vader_selftext_score_mean",      # robustness / supplementary only
+    "cryptobert_combined_score_mean", # robustness / supplementary only
+    "cryptobert_selftext_score_mean", # robustness / supplementary only
 )
 
-# Set-IDs removed during the family-structure refactor + FinBERT removal.
+
+# Set-IDs removed during the v4 family-structure refactor + FinBERT removal.
 # Looking these up raises a clear migration error rather than silently
 # returning an empty config (see CLI guard in
 # :mod:`thesis_pipeline.modeling.run_models`).
@@ -32,26 +55,34 @@ _FINBERT_REMOVED = (
     "removed (FinBERT was dropped; trained on financial / analyst "
     "language, no meaningful variation on Reddit/crypto data)"
 )
+_V4_REMOVED = (
+    "removed in v4 — the 17-set registry replaces the old B/E/S/SV/C/CV/M "
+    "families. See SET_ID_PATTERN; e.g. previous B6/E4 → ECON, SV3 → "
+    "SENT_VAD_F, CV3 → ECON_VAD_F, S3 → SENT_CBT_F."
+)
 REMOVED_SET_IDS: dict[str, str] = {
-    # Old economic family — folded into the benchmark family.
-    "E1": "B3",
-    "E2": "B4",
-    "E3": "B5",
-    "E4": "B6",
-    # Old multi-source sentiment-only IDs — replaced by the M* family.
-    "S4": "M1",
-    "S5": "M1",
-    "S6": "M2",
-    "S7": "M3",
-    # 2026 first-pass family naming (SC*=CryptoBERT, SF*=FinBERT) is replaced
-    # by the cleaner S*=CryptoBERT-as-default + SV*=VADER naming. FinBERT is
-    # gone entirely.
-    "SC1": "S1",
-    "SC2": "S2",
-    "SC3": "S3",
-    "SF1": _FINBERT_REMOVED,
-    "SF2": _FINBERT_REMOVED,
-    "SF3": _FINBERT_REMOVED,
+    # Old benchmark family — folded into ECON.
+    "B1": _V4_REMOVED, "B2": _V4_REMOVED, "B3": _V4_REMOVED,
+    "B4": _V4_REMOVED, "B5": _V4_REMOVED, "B6": _V4_REMOVED,
+    # Old economic family — folded into ECON.
+    "E1": _V4_REMOVED, "E2": _V4_REMOVED, "E3": _V4_REMOVED, "E4": _V4_REMOVED,
+    # Old sentiment-only family (CryptoBERT in S*, VADER in SV*).
+    "S1":  "SENT_CBT_L",  "S2":  "SENT_CBT_LD", "S3":  "SENT_CBT_F",
+    "S4":  _V4_REMOVED,   "S5":  _V4_REMOVED,   "S6":  _V4_REMOVED, "S7": _V4_REMOVED,
+    "SV1": "SENT_VAD_L",  "SV2": "SENT_VAD_LD", "SV3": "SENT_VAD_F",
+    # Old combined families (C* = CryptoBERT, CV* = VADER) — superseded by
+    # ECON_CBT_* / ECON_VAD_*.
+    "C1":  "ECON_CBT_L",  "C2":  "ECON_CBT_LD", "C3":  "ECON_CBT_F",
+    "C4":  _V4_REMOVED,   "C5":  _V4_REMOVED,   "C6":  _V4_REMOVED,
+    "CV1": "ECON_VAD_L",  "CV2": "ECON_VAD_LD", "CV3": "ECON_VAD_F",
+    "CV4": _V4_REMOVED,   "CV5": _V4_REMOVED,   "CV6": _V4_REMOVED,
+    # Old multi-source / M family — Variante A does not run dual-scorer
+    # combined sets; mixed-source M* is dropped.
+    "M1":  _V4_REMOVED, "M2": _V4_REMOVED, "M3": _V4_REMOVED,
+    "M4":  _V4_REMOVED, "M5": _V4_REMOVED, "M6": _V4_REMOVED,
+    # FinBERT family — dropped entirely.
+    "SC1": "SENT_CBT_L", "SC2": "SENT_CBT_LD", "SC3": "SENT_CBT_F",
+    "SF1": _FINBERT_REMOVED, "SF2": _FINBERT_REMOVED, "SF3": _FINBERT_REMOVED,
 }
 
 
@@ -65,20 +96,8 @@ def load_feature_sets_xlsx() -> Dict[str, dict] | None:
 
     Header handling is intentionally kept in lock-step with
     :func:`thesis_pipeline.modeling.run_models.load_feature_sets` so the
-    registry and the modelling loader can never disagree on which column holds
-    the comma-separated feature list:
-
-      1. Every header is normalised to snake_case by stripping, lower-casing
-         and replacing any run of non-alphanumerics with a single ``_``. After
-         this pass ``"Set ID"`` → ``"set_id"``,
-         ``"Feature Columns (comma-separated)"`` → ``"feature_columns_comma_separated"``
-         and ``"# Features"`` → ``"features"``.
-      2. The feature-list column is chosen by explicit priority:
-         ``feature_columns_comma_separated`` ≻ ``feature_columns`` ≻
-         ``features``. When a higher-priority header is present, any
-         pre-existing ``features`` column (e.g. the integer ``# Features``
-         count that just normalised to that name) is dropped first so the
-         rename actually wins.
+    registry and the modelling loader can never disagree on which column
+    holds the comma-separated feature list.
     """
     path = resolve_path("feature_sets_xlsx")
     if not Path(path).exists():
@@ -92,14 +111,12 @@ def load_feature_sets_xlsx() -> Dict[str, dict] | None:
     except Exception:  # noqa: BLE001 — be tolerant; the script handles details
         return None
 
-    # Normalise display headers to snake_case (matches run_models.load_feature_sets).
     df.columns = (df.columns.astype(str)
                   .str.strip()
                   .str.lower()
                   .str.replace(r"[^a-z0-9]+", "_", regex=True)
                   .str.strip("_"))
 
-    # Pick the feature-list column by priority and drop the loser ``features``.
     for preferred in ("feature_columns_comma_separated", "feature_columns"):
         if preferred in df.columns:
             if "features" in df.columns and preferred != "features":
@@ -136,15 +153,29 @@ def load_feature_sets() -> Dict[str, dict]:
 
 
 def validate_registry(sets: Dict[str, dict]) -> List[str]:
-    """Return a list of validation problems (empty list → registry is OK)."""
+    """Return a list of validation problems (empty list → registry is OK).
+
+    v4 contract:
+      * ID must be in :data:`SET_ID_PATTERN`.
+      * feature list must be non-empty.
+      * features must be unique.
+      * no feature may be one of the diagnostic-only columns.
+    """
     problems: list[str] = []
-    seen_per_set: dict[str, set] = {}
+    declared = set(SET_ID_PATTERN)
+    diagnostics = set(DIAGNOSTIC_ONLY_COLUMNS)
     for set_id, spec in sets.items():
         features = list(spec.get("features", []))
-        # Allow B1 (rolling-probability benchmark) to have empty features.
-        if set_id != "B1" and not features:
-            problems.append(f"{set_id}: empty feature list")
+        if set_id not in declared:
+            problems.append(f"{set_id}: not in SET_ID_PATTERN (v4 expects 17 sets)")
+        if not features:
+            problems.append(f"{set_id}: empty feature list (no v4 set may be empty)")
         if len(features) != len(set(features)):
             problems.append(f"{set_id}: duplicate features {features}")
-        seen_per_set[set_id] = set(features)
+        bad_diag = [f for f in features if f in diagnostics]
+        if bad_diag:
+            problems.append(
+                f"{set_id}: includes diagnostic-only columns {bad_diag} — "
+                f"keep these for robustness analyses, not in the 17-set grid"
+            )
     return problems

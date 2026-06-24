@@ -409,7 +409,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Panel-logit variant (only used when "
                              "--model-type panel_logit).")
     parser.add_argument("--smoke", action="store_true",
-                        help="Smoke mode: defaults to horizon=1d, coins=[BTC, ETH], set_id=B1.")
+                        help="Smoke mode: defaults to horizon=1d, coins=[BTC, ETH], set_id=ECON.")
     parser.add_argument("--dry-run", "--dry_run", dest="dry_run",
                         action="store_true",
                         help="Print planned inputs/outputs and exit.")
@@ -565,21 +565,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     and the package CLI. Returns 0 on success."""
     args = build_parser().parse_args(argv)
 
-    # ── Legacy-ID guard (2026 family-structure refactor) ─────────────
-    # E* (economic) and the multi-source S4–S7 / C4–C6 IDs no longer exist:
-    # see ``thesis_pipeline.features.feature_registry.REMOVED_SET_IDS`` and
-    # the migration table in ``docs/refactor_log.md``. Detect the request up
-    # front so the user gets a clear, actionable error rather than the silent
-    # "Feature-set config is empty after filtering" log.
+    # ── Legacy-ID guard (v4 17-set registry refactor) ────────────────
+    # Old B/E/S/SV/C/CV/M IDs were superseded by ECON / SENT_* / ECON_*; see
+    # ``thesis_pipeline.features.feature_registry.REMOVED_SET_IDS`` and the
+    # migration table in ``docs/refactor_log.md``. If the user references a
+    # legacy ID AND it is NOT present in their feature_sets.xlsx, raise a
+    # clear migration error. If they have a custom xlsx that still defines
+    # the legacy ID (e.g. unit-test fixtures), allow the run with a warning
+    # so synthetic test harnesses keep working under the v4 registry.
     if args.set_id:
         from ..features.feature_registry import REMOVED_SET_IDS as _REMOVED
         if args.set_id in _REMOVED:
-            replacement = _REMOVED[args.set_id]
-            raise SystemExit(
-                f"[run-models] set_id {args.set_id!r} was removed in the 2026 "
-                f"family-structure refactor. Use {replacement!r} instead. "
-                f"See docs/refactor_log.md for the full migration table."
-            )
+            try:
+                _user_xlsx = load_feature_sets(args.feature_config)
+                _user_ids = set(_user_xlsx["set_id"].astype(str))
+            except Exception:  # noqa: BLE001
+                _user_ids = set()
+            if args.set_id in _user_ids:
+                print(f"[run-models] WARNING: set_id {args.set_id!r} is a legacy "
+                      f"v3 name found in {args.feature_config}. The v4 registry "
+                      f"replaces it with {_REMOVED[args.set_id]!r}; this run "
+                      f"continues only because your xlsx still defines it.")
+            else:
+                replacement = _REMOVED[args.set_id]
+                raise SystemExit(
+                    f"[run-models] set_id {args.set_id!r} was removed in the v4 "
+                    f"17-set registry refactor. Use {replacement!r} instead. "
+                    f"See docs/refactor_log.md for the full migration table."
+                )
 
     # ── Resolve hyperparameter-tuning config (shared by both families) ──
     from .hyperparameter_tuning import hpo_variant_label, load_hpo_config
@@ -606,7 +619,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.coins:
             args.coins = ["BTC", "ETH"]
         if not args.set_id:
-            args.set_id = "B1"
+            args.set_id = "ECON"
 
     # ── Checkpointing config ────────────────────────────────────
     ckpt_on   = bool(getattr(args, "checkpoint", True))
