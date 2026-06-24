@@ -1,21 +1,12 @@
-"""Tests for the FinBERT-removal + S*/SV*/C*/CV*/M* family refactor.
+"""Tests for the v4 17-set feature registry (Variante A).
 
-Verifies the canonical ``feature_sets.xlsx`` shipped in the repo matches the
-final structure:
+Supersedes the v3 family-layout tests. Verifies:
 
-* Benchmark family `B1`–`B6` (Historical Majority, Single Lag Return,
-  Momentum, Momentum + Volatility, Momentum + Volume, Full Economic).
-* Pure sentiment families `S1`–`S3` (CryptoBERT) and `SV1`–`SV3` (VADER).
-* Combined families `C1`–`C6` (Benchmark + CryptoBERT) and `CV1`–`CV6`
-  (Benchmark + VADER) following the hierarchical mapping
-  C_k = B_k + S_min(k,3) (k=1,2,3 use sentiment level k; k=4,5,6 use the rich
-  level 3 paired with richer benchmarks).
-* Multi-source `M1`–`M6` (Benchmark + CryptoBERT + VADER) with the same
-  benchmark / sentiment-level pairing.
-
-The old `E*`, `SC*`, `SF*` IDs and FinBERT scoring are gone; requesting any of
-them from `run-models` / `score-sentiment` raises a controlled migration
-error.
+* the canonical `feature_sets.xlsx` matches the 17-set v4 structure;
+* every removed v3 ID (`B*`, `E*`, `S*`, `SV*`, `C*`, `CV*`, `M*`,
+  `SC*`, `SF*`) raises a clear migration error mentioning the v4 successor
+  (or "no exact equivalent" where the information set genuinely differs);
+* every active v4 ID is accepted by `run-models --dry-run`.
 """
 from __future__ import annotations
 
@@ -29,8 +20,8 @@ from thesis_pipeline.features import feature_registry as fr
 # ---------------------------------------------------------------------------
 
 def _load_all_rows():
-    """Return every row from feature_sets.xlsx with the **canonical** header
-    normalisation (mirrors ``feature_registry.load_feature_sets_xlsx``)."""
+    """Return every row from feature_sets.xlsx with the canonical header
+    normalisation (mirrors :func:`feature_registry.load_feature_sets_xlsx`)."""
     import pandas as pd
     from thesis_pipeline.config import resolve_path
     df = pd.read_excel(resolve_path("feature_sets_xlsx"), sheet_name="feature_sets")
@@ -45,13 +36,10 @@ def _load_all_rows():
     return df
 
 
-def _by_set(set_id: str, sentiment_model: str | None = None) -> dict:
+def _by_set(set_id: str) -> dict:
     df = _load_all_rows()
-    mask = df["set_id"].astype(str) == set_id
-    if sentiment_model is not None:
-        mask &= df["sentiment_model"].astype(str) == sentiment_model
-    sub = df[mask]
-    assert not sub.empty, f"no row for set_id={set_id}, sentiment_model={sentiment_model}"
+    sub = df[df["set_id"].astype(str) == set_id]
+    assert not sub.empty, f"no row for set_id={set_id} in feature_sets.xlsx"
     row = sub.iloc[0]
     return {
         "category": str(row["category"]),
@@ -68,25 +56,25 @@ def sets() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Spec items 1, 2, 3 — no FinBERT, no SF*, no SC*, no finbert_* features
+# Shape: exactly 17 v4 sets, no legacy IDs
 # ---------------------------------------------------------------------------
 
-def test_no_finbert_set_ids(sets):
-    for legacy in ("SF1", "SF2", "SF3"):
-        assert legacy not in sets, f"FinBERT set {legacy!r} still in workbook"
+def test_registry_contains_exactly_the_v4_seventeen_sets(sets):
+    assert set(sets.keys()) == set(fr.SET_ID_PATTERN)
+    assert len(sets) == 17
 
 
-def test_no_legacy_sc_set_ids(sets):
-    for legacy in ("SC1", "SC2", "SC3"):
-        assert legacy not in sets, (
-            f"legacy CryptoBERT set {legacy!r} still in workbook — "
-            f"use S* instead"
-        )
-
-
-def test_no_legacy_economic_set_ids(sets):
-    for legacy in ("E1", "E2", "E3", "E4"):
-        assert legacy not in sets
+@pytest.mark.parametrize("legacy", [
+    "B1", "B2", "B3", "B4", "B5", "B6",
+    "E1", "E2", "E3", "E4",
+    "S1", "S2", "S3", "SV1", "SV2", "SV3",
+    "C1", "C2", "C3", "C4", "C5", "C6",
+    "CV1", "CV2", "CV3", "CV4", "CV5", "CV6",
+    "M1", "M2", "M3", "M4", "M5", "M6",
+    "SC1", "SC2", "SC3", "SF1", "SF2", "SF3",
+])
+def test_no_legacy_set_ids_in_workbook(sets, legacy):
+    assert legacy not in sets
 
 
 def test_no_finbert_features_in_any_set(sets):
@@ -98,122 +86,61 @@ def test_no_finbert_features_in_any_set(sets):
 def test_no_finbert_sentiment_model_value():
     df = _load_all_rows()
     sm = df["sentiment_model"].astype(str).str.lower().unique().tolist()
-    assert "finbert" not in sm, f"sentiment_model column still mentions finbert: {sm}"
+    assert "finbert" not in sm
+
+
+def test_no_engagement_weighted_features_anywhere(sets):
+    """Variante A: no `_weighted_mean` columns may appear in the registry."""
+    for set_id, spec in sets.items():
+        bad = [f for f in spec["features"] if f.endswith("_weighted_mean")]
+        assert not bad, f"{set_id} still uses engagement-weighted column: {bad}"
 
 
 # ---------------------------------------------------------------------------
-# Spec items 4, 5 — S* means CryptoBERT, SV* means VADER
+# v4 spec — block definitions and ECON-core constancy
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("set_id,expected_feats", [
-    ("S1", ["cryptobert_title_score_mean"]),
-    ("S2", ["cryptobert_title_score_mean", "cryptobert_bullishness_ratio"]),
-    ("S3", ["cryptobert_title_score_mean", "cryptobert_title_score_weighted_mean",
-             "cryptobert_bullishness_ratio", "cryptobert_title_score_std",
-             "post_count"]),
-])
-def test_s_family_is_cryptobert(set_id, expected_feats):
-    spec = _by_set(set_id, "cryptobert")
-    assert spec["sentiment_model"] == "cryptobert"
-    assert spec["category"] == "sentiment_cryptobert"
-    assert spec["features"] == expected_feats
+ECON_CORE = [
+    "log_return_t",
+    "cum_log_return_7d", "cum_log_return_14d", "cum_log_return_21d",
+    "realized_vol_14d", "volume_diff", "log_market_cap_lag1",
+]
 
 
-@pytest.mark.parametrize("set_id,expected_feats", [
-    ("SV1", ["vader_title_score_mean"]),
-    ("SV2", ["vader_title_score_mean", "vader_bullishness_ratio"]),
-    ("SV3", ["vader_title_score_mean", "vader_title_score_weighted_mean",
-              "vader_bullishness_ratio", "vader_title_score_std",
-              "post_count"]),
-])
-def test_sv_family_is_vader(set_id, expected_feats):
-    spec = _by_set(set_id, "vader")
-    assert spec["sentiment_model"] == "vader"
-    assert spec["category"] == "sentiment_vader"
-    assert spec["features"] == expected_feats
+def test_econ_set_is_econ_core():
+    assert _by_set("ECON")["features"] == ECON_CORE
 
 
-# ---------------------------------------------------------------------------
-# Spec items 6, 7, 8 — C* / CV* / M* family identities
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("scorer,prefix", [("vader", "SENT_VAD"), ("cryptobert", "SENT_CBT")])
+def test_sentiment_only_blocks(scorer, prefix):
+    L  = _by_set(f"{prefix}_L")["features"]
+    LD = _by_set(f"{prefix}_LD")["features"]
+    DA = _by_set(f"{prefix}_DA")["features"]
+    F  = _by_set(f"{prefix}_F")["features"]
 
-def _benchmark_real_features(bench_id: str) -> list[str]:
-    spec = _by_set(bench_id, "-")
-    if spec["features"] == ["__majority_class__"]:
-        return []
-    return spec["features"]
-
-
-# Hierarchical pairing per spec: C_k pairs B_k with sentiment level
-# min(k, 3) (k=1→1, k=2→2, k≥3→3).
-PAIRING = {1: 1, 2: 2, 3: 3, 4: 3, 5: 3, 6: 3}
+    assert L  == [f"{scorer}_title_score_mean"]
+    assert LD == [f"{scorer}_title_score_mean", f"{scorer}_title_score_std"]
+    assert DA == [f"{scorer}_bullishness_ratio", "log1p_post_count"]
+    assert F  == [f"{scorer}_title_score_mean", f"{scorer}_title_score_std",
+                   f"{scorer}_bullishness_ratio", "log1p_post_count"]
 
 
-def _sentiment_features(level: int, scorer: str) -> list[str]:
-    prefix = {"vader": "SV", "cryptobert": "S"}[scorer]
-    return _by_set(f"{prefix}{level}", scorer)["features"]
+@pytest.mark.parametrize("scorer,prefix", [("vader", "ECON_VAD"), ("cryptobert", "ECON_CBT")])
+def test_combined_sets_equal_econ_core_plus_block(scorer, prefix):
+    L  = _by_set(f"{prefix}_L")["features"]
+    LD = _by_set(f"{prefix}_LD")["features"]
+    DA = _by_set(f"{prefix}_DA")["features"]
+    F  = _by_set(f"{prefix}_F")["features"]
 
-
-@pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 6])
-def test_c_family_is_benchmark_plus_cryptobert(k):
-    combined = _by_set(f"C{k}", "cryptobert")
-    assert combined["sentiment_model"] == "cryptobert"
-    assert combined["category"] == "combined_cryptobert"
-    bench = _benchmark_real_features(f"B{k}")
-    sent  = _sentiment_features(PAIRING[k], "cryptobert")
-    expected = list(dict.fromkeys([*bench, *sent]))
-    assert combined["features"] == expected
-
-
-@pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 6])
-def test_cv_family_is_benchmark_plus_vader(k):
-    combined = _by_set(f"CV{k}", "vader")
-    assert combined["sentiment_model"] == "vader"
-    assert combined["category"] == "combined_vader"
-    bench = _benchmark_real_features(f"B{k}")
-    sent  = _sentiment_features(PAIRING[k], "vader")
-    expected = list(dict.fromkeys([*bench, *sent]))
-    assert combined["features"] == expected
-
-
-@pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 6])
-def test_m_family_is_benchmark_plus_cryptobert_plus_vader(k):
-    multi = _by_set(f"M{k}", "multi")
-    assert multi["sentiment_model"] == "multi"
-    assert multi["category"] == "multi"
-    bench = _benchmark_real_features(f"B{k}")
-    s    = _sentiment_features(PAIRING[k], "cryptobert")
-    sv   = _sentiment_features(PAIRING[k], "vader")
-    expected = list(dict.fromkeys([*bench, *s, *sv]))
-    assert multi["features"] == expected
+    sent_prefix = "SENT_VAD" if scorer == "vader" else "SENT_CBT"
+    assert L  == ECON_CORE + _by_set(f"{sent_prefix}_L")["features"]
+    assert LD == ECON_CORE + _by_set(f"{sent_prefix}_LD")["features"]
+    assert DA == ECON_CORE + _by_set(f"{sent_prefix}_DA")["features"]
+    assert F  == ECON_CORE + _by_set(f"{sent_prefix}_F")["features"]
 
 
 # ---------------------------------------------------------------------------
-# Spec items 9-11 — the spec-given canonical examples
-# ---------------------------------------------------------------------------
-
-def test_c1_equals_b1_plus_s1():
-    c1 = _by_set("C1", "cryptobert")["features"]
-    s1 = _by_set("S1", "cryptobert")["features"]
-    # B1's sentinel is dropped because it is a routing marker, not a feature.
-    assert c1 == s1
-
-
-def test_cv1_equals_b1_plus_sv1():
-    cv1 = _by_set("CV1", "vader")["features"]
-    sv1 = _by_set("SV1", "vader")["features"]
-    assert cv1 == sv1
-
-
-def test_m1_equals_b1_plus_s1_plus_sv1():
-    m1 = _by_set("M1", "multi")["features"]
-    s1 = _by_set("S1", "cryptobert")["features"]
-    sv1 = _by_set("SV1", "vader")["features"]
-    assert m1 == list(dict.fromkeys([*s1, *sv1]))
-
-
-# ---------------------------------------------------------------------------
-# Spec item 12 — no duplicate features inside any set
+# Validation invariants
 # ---------------------------------------------------------------------------
 
 def test_no_duplicate_features_anywhere(sets):
@@ -227,17 +154,11 @@ def test_registry_validator_reports_no_problems(sets):
 
 
 # ---------------------------------------------------------------------------
-# Spec item 13 — CLI accepts every new ID
+# CLI accepts every v4 ID
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("set_id", [
-    "B1", "B2", "B3", "B4", "B5", "B6",
-    "S1", "S2", "S3", "SV1", "SV2", "SV3",
-    "C1", "C2", "C3", "C4", "C5", "C6",
-    "CV1", "CV2", "CV3", "CV4", "CV5", "CV6",
-    "M1", "M2", "M3", "M4", "M5", "M6",
-])
-def test_cli_dry_run_accepts_new_set_ids(set_id):
+@pytest.mark.parametrize("set_id", list(fr.SET_ID_PATTERN))
+def test_cli_dry_run_accepts_each_v4_set_id(set_id):
     from thesis_pipeline import cli
     rc = cli.main(["run-models", "--horizon", "1d", "--set-id", set_id,
                    "--dry-run"])
@@ -245,60 +166,133 @@ def test_cli_dry_run_accepts_new_set_ids(set_id):
 
 
 # ---------------------------------------------------------------------------
-# Spec item 14 — every removed ID raises a clear migration error
+# CLI rejects every removed v3 ID — strictly, regardless of any custom xlsx
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("legacy,replacement_substr", [
-    ("E1", "B3"),
-    ("E2", "B4"),
-    ("E3", "B5"),
-    ("E4", "B6"),
-    ("SC1", "S1"),
-    ("SC2", "S2"),
-    ("SC3", "S3"),
-    ("S4", "M1"),
-    ("S5", "M1"),
-    ("S6", "M2"),
-    ("S7", "M3"),
+@pytest.mark.parametrize("legacy", list(fr.REMOVED_SET_IDS.keys()))
+def test_removed_ids_always_raise(legacy):
+    from thesis_pipeline import cli
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["run-models", "--horizon", "1d", "--set-id", legacy,
+                  "--dry-run"])
+    msg = str(excinfo.value)
+    assert legacy in msg
+    assert "removed" in msg.lower() or "v4" in msg.lower() or "NAIVE" in msg
+
+
+def test_removed_id_cannot_be_revived_by_custom_xlsx(tmp_path):
+    """Even when a user-supplied feature_sets.xlsx defines the legacy ID,
+    the v4 guard must still refuse it. Otherwise a stale fixture could
+    silently revive a deprecated information set."""
+    import pandas as pd
+    fs_path = tmp_path / "legacy_xlsx_with_b1.xlsx"
+    pd.DataFrame({
+        "set_id":   ["B1"],
+        "category": ["benchmark"],
+        "sentiment_model": ["-"],
+        "label":    ["legacy"],
+        "feature_columns_comma_separated": ["__majority_class__"],
+    }).to_excel(fs_path, sheet_name="feature_sets", index=False)
+
+    from thesis_pipeline import cli
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["run-models", "--horizon", "1d", "--set-id", "B1",
+                  "--feature-config", str(fs_path), "--dry-run"])
+    assert "B1" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Migration messages — distinguish exact-equivalent from no-exact-equivalent
+# ---------------------------------------------------------------------------
+
+def test_b1_migration_message_points_to_naive_not_a_set():
+    """B1 was the rolling-probability benchmark. It is NOT a feature set in
+    v4; the message must explain that it lives in the modeling.benchmarks
+    module as the NAIVE evaluation reference."""
+    msg = fr.REMOVED_SET_IDS["B1"]
+    assert "NAIVE" in msg
+    assert "run_rolling_probability" in msg
+
+
+@pytest.mark.parametrize("legacy", ["B2", "B3", "B4", "B5", "B6",
+                                     "E1", "E2", "E3", "E4"])
+def test_economic_only_migration_messages_point_to_econ(legacy):
+    """B2..B6 / E1..E4 were variants of the economic-only baseline. v4
+    consolidates them into ECON (with documented additions)."""
+    msg = fr.REMOVED_SET_IDS[legacy]
+    assert "ECON" in msg
+
+
+@pytest.mark.parametrize("legacy", ["S1", "S2", "S3"])
+def test_cbt_sentiment_no_exact_equivalent_messages(legacy):
+    msg = fr.REMOVED_SET_IDS[legacy]
+    assert "no exact" in msg.lower() or "No exact" in msg
+    # Points the user at the four sentiment-only CBT successors.
+    for cand in ("SENT_CBT_L", "SENT_CBT_LD", "SENT_CBT_DA", "SENT_CBT_F"):
+        assert cand in msg
+
+
+@pytest.mark.parametrize("legacy", ["SV1", "SV2", "SV3"])
+def test_vad_sentiment_no_exact_equivalent_messages(legacy):
+    msg = fr.REMOVED_SET_IDS[legacy]
+    assert "no exact" in msg.lower() or "No exact" in msg
+    for cand in ("SENT_VAD_L", "SENT_VAD_LD", "SENT_VAD_DA", "SENT_VAD_F"):
+        assert cand in msg
+
+
+@pytest.mark.parametrize("legacy", ["C1", "C2", "C3", "C4", "C5", "C6"])
+def test_cbt_combined_no_exact_equivalent_messages(legacy):
+    msg = fr.REMOVED_SET_IDS[legacy]
+    assert "no exact" in msg.lower() or "No exact" in msg
+    for cand in ("ECON_CBT_L", "ECON_CBT_LD", "ECON_CBT_DA", "ECON_CBT_F"):
+        assert cand in msg
+
+
+@pytest.mark.parametrize("legacy", ["CV1", "CV2", "CV3", "CV4", "CV5", "CV6"])
+def test_vad_combined_no_exact_equivalent_messages(legacy):
+    msg = fr.REMOVED_SET_IDS[legacy]
+    assert "no exact" in msg.lower() or "No exact" in msg
+    for cand in ("ECON_VAD_L", "ECON_VAD_LD", "ECON_VAD_DA", "ECON_VAD_F"):
+        assert cand in msg
+
+
+@pytest.mark.parametrize("legacy", ["M1", "M2", "M3", "M4", "M5", "M6"])
+def test_m_family_removed_messages(legacy):
+    msg = fr.REMOVED_SET_IDS[legacy]
+    assert "removed" in msg.lower()
+    # No exact v4 successor — points at both single-scorer families.
+    for cand in ("ECON_VAD_F", "ECON_CBT_F"):
+        assert cand in msg
+
+
+@pytest.mark.parametrize("legacy", ["SC1", "SC2", "SC3", "SF1", "SF2", "SF3"])
+def test_finbert_era_messages(legacy):
+    msg = fr.REMOVED_SET_IDS[legacy]
+    assert "FinBERT" in msg
+
+
+@pytest.mark.parametrize("legacy,expected_substr", [
+    # Removed-id error reaches the SystemExit message with the migration text.
+    ("B1", "NAIVE"),
+    ("E4", "ECON"),
+    ("S3", "SENT_CBT"),
+    ("SV3", "SENT_VAD"),
+    ("C3", "ECON_CBT"),
+    ("CV3", "ECON_VAD"),
+    ("M3", "ECON_VAD_F"),
+    ("SF1", "FinBERT"),
 ])
-def test_legacy_set_ids_raise_clear_migration_error(legacy, replacement_substr):
+def test_removed_id_error_carries_migration_substr(legacy, expected_substr):
     from thesis_pipeline import cli
     with pytest.raises(SystemExit) as excinfo:
         cli.main(["run-models", "--horizon", "1d", "--set-id", legacy,
                   "--dry-run"])
-    msg = str(excinfo.value)
-    assert legacy in msg
-    assert "removed" in msg
-    assert replacement_substr in msg
-
-
-@pytest.mark.parametrize("legacy", ["SF1", "SF2", "SF3"])
-def test_finbert_set_ids_raise_with_finbert_message(legacy):
-    from thesis_pipeline import cli
-    with pytest.raises(SystemExit) as excinfo:
-        cli.main(["run-models", "--horizon", "1d", "--set-id", legacy,
-                  "--dry-run"])
-    msg = str(excinfo.value)
-    assert legacy in msg
-    assert "FinBERT" in msg
+    assert expected_substr in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
-# FinBERT sentiment-model rejection
+# FinBERT sentiment-model rejection at the score-sentiment level still works
 # ---------------------------------------------------------------------------
-
-def test_sentiment_model_finbert_raises_friendly_error(capsys):
-    """``--sentiment-model finbert`` must raise an informative error mentioning
-    why FinBERT was removed.
-    """
-    from thesis_pipeline import cli
-    with pytest.raises(SystemExit):
-        cli.main(["run-models", "--horizon", "1d", "--set-id", "S1",
-                  "--sentiment-model", "finbert", "--dry-run"])
-    msg = capsys.readouterr().err
-    assert "FinBERT" in msg
-    assert "Reddit" in msg
-
 
 def test_score_sentiment_finbert_raises(capsys):
     from thesis_pipeline import cli

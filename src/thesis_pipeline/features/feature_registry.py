@@ -47,41 +47,114 @@ DIAGNOSTIC_ONLY_COLUMNS = (
 )
 
 
-# Set-IDs removed during the v4 family-structure refactor + FinBERT removal.
-# Looking these up raises a clear migration error rather than silently
-# returning an empty config (see CLI guard in
-# :mod:`thesis_pipeline.modeling.run_models`).
+# Set-IDs removed during the v4 17-set registry refactor + FinBERT removal.
+# Each entry is a HUMAN-READABLE migration sentence (not a bare replacement
+# ID). The CLI guard concatenates this string into its SystemExit so the
+# user sees exactly what to use — and, crucially, when there is no exact
+# feature-equivalent v4 replacement, the message says so rather than
+# silently mapping to a similarly-named v4 ID with a different information
+# set. The previous "S2 → SENT_CBT_LD" shorthand implied a one-to-one swap
+# even when the underlying score variant changed (combined vs title-only),
+# which would mislead anyone doing a re-run.
+
 _FINBERT_REMOVED = (
-    "removed (FinBERT was dropped; trained on financial / analyst "
-    "language, no meaningful variation on Reddit/crypto data)"
+    "removed in v4 — FinBERT was dropped from the pipeline "
+    "(trained on financial / analyst language, no meaningful variation "
+    "on Reddit/crypto data). No v4 replacement exists; rerun with one "
+    "of the VADER (SENT_VAD_*) or CryptoBERT (SENT_CBT_*) sets instead."
 )
-_V4_REMOVED = (
-    "removed in v4 — the 17-set registry replaces the old B/E/S/SV/C/CV/M "
-    "families. See SET_ID_PATTERN; e.g. previous B6/E4 → ECON, SV3 → "
-    "SENT_VAD_F, CV3 → ECON_VAD_F, S3 → SENT_CBT_F."
+
+_NO_EXACT_EQUIVALENT_CBT = (
+    "No exact v4 equivalent exists — the v3 set used a *combined* "
+    "title+selftext score; v4 sentiment sets are *title-only*. Choose "
+    "one of SENT_CBT_L, SENT_CBT_LD, SENT_CBT_DA, SENT_CBT_F based on "
+    "the intended information set."
 )
+_NO_EXACT_EQUIVALENT_VAD = (
+    "No exact v4 equivalent exists — the v3 set used a *combined* "
+    "title+selftext score; v4 sentiment sets are *title-only*. Choose "
+    "one of SENT_VAD_L, SENT_VAD_LD, SENT_VAD_DA, SENT_VAD_F based on "
+    "the intended information set."
+)
+_NO_EXACT_EQUIVALENT_ECON_CBT = (
+    "No exact v4 equivalent exists — the v3 combined set used a "
+    "*combined* title+selftext sentiment score; v4 combined sets are "
+    "*title-only*. Choose one of ECON_CBT_L, ECON_CBT_LD, ECON_CBT_DA, "
+    "ECON_CBT_F based on the intended information set."
+)
+_NO_EXACT_EQUIVALENT_ECON_VAD = (
+    "No exact v4 equivalent exists — the v3 combined set used a "
+    "*combined* title+selftext sentiment score; v4 combined sets are "
+    "*title-only*. Choose one of ECON_VAD_L, ECON_VAD_LD, ECON_VAD_DA, "
+    "ECON_VAD_F based on the intended information set."
+)
+_M_REMOVED = (
+    "removed in v4 — Variante A no longer runs mixed-scorer (VADER + "
+    "CryptoBERT) sets. Pick the relevant single-scorer family instead: "
+    "ECON_VAD_F or ECON_CBT_F for the full combined block, SENT_VAD_F "
+    "or SENT_CBT_F for the sentiment-only block."
+)
+
+# Bare-benchmark / economic-only IDs collapse cleanly into ECON because
+# both v3 B1/B2/B3/B4/B5/B6/E1/E2/E3/E4 and v4 ECON used title-free
+# economic features. ECON adds cum_log_return_21d and switches market_cap
+# to log_market_cap_lag1, so the information set is *broader* — still
+# named explicitly here so the user knows what changed.
+_ECON_EXPANDED = (
+    "Use ECON. The v4 ECON set is a superset of the old v3 economic "
+    "benchmark: it adds cum_log_return_21d and replaces market_cap_t "
+    "with log_market_cap_lag1 (strict as-of merge)."
+)
+_NAIVE_NOT_A_SET = (
+    "The historical-majority rolling-probability benchmark is no longer "
+    "a feature set in v4 — it is a separate evaluation reference (NAIVE), "
+    "exposed via thesis_pipeline.modeling.benchmarks.run_rolling_probability "
+    "and evaluated outside the 17-set grid."
+)
+
 REMOVED_SET_IDS: dict[str, str] = {
-    # Old benchmark family — folded into ECON.
-    "B1": _V4_REMOVED, "B2": _V4_REMOVED, "B3": _V4_REMOVED,
-    "B4": _V4_REMOVED, "B5": _V4_REMOVED, "B6": _V4_REMOVED,
-    # Old economic family — folded into ECON.
-    "E1": _V4_REMOVED, "E2": _V4_REMOVED, "E3": _V4_REMOVED, "E4": _V4_REMOVED,
-    # Old sentiment-only family (CryptoBERT in S*, VADER in SV*).
-    "S1":  "SENT_CBT_L",  "S2":  "SENT_CBT_LD", "S3":  "SENT_CBT_F",
-    "S4":  _V4_REMOVED,   "S5":  _V4_REMOVED,   "S6":  _V4_REMOVED, "S7": _V4_REMOVED,
-    "SV1": "SENT_VAD_L",  "SV2": "SENT_VAD_LD", "SV3": "SENT_VAD_F",
-    # Old combined families (C* = CryptoBERT, CV* = VADER) — superseded by
-    # ECON_CBT_* / ECON_VAD_*.
-    "C1":  "ECON_CBT_L",  "C2":  "ECON_CBT_LD", "C3":  "ECON_CBT_F",
-    "C4":  _V4_REMOVED,   "C5":  _V4_REMOVED,   "C6":  _V4_REMOVED,
-    "CV1": "ECON_VAD_L",  "CV2": "ECON_VAD_LD", "CV3": "ECON_VAD_F",
-    "CV4": _V4_REMOVED,   "CV5": _V4_REMOVED,   "CV6": _V4_REMOVED,
-    # Old multi-source / M family — Variante A does not run dual-scorer
-    # combined sets; mixed-source M* is dropped.
-    "M1":  _V4_REMOVED, "M2": _V4_REMOVED, "M3": _V4_REMOVED,
-    "M4":  _V4_REMOVED, "M5": _V4_REMOVED, "M6": _V4_REMOVED,
-    # FinBERT family — dropped entirely.
-    "SC1": "SENT_CBT_L", "SC2": "SENT_CBT_LD", "SC3": "SENT_CBT_F",
+    # Old benchmark family.
+    # B1 was the rolling-probability benchmark — that is NOT a feature
+    # set in v4; it lives in modeling.benchmarks.run_rolling_probability
+    # and is evaluated as the NAIVE reference.
+    "B1": _NAIVE_NOT_A_SET,
+    # B2..B6 / E1..E4 were variants of the economic-only baseline.
+    "B2": _ECON_EXPANDED, "B3": _ECON_EXPANDED, "B4": _ECON_EXPANDED,
+    "B5": _ECON_EXPANDED, "B6": _ECON_EXPANDED,
+    "E1": _ECON_EXPANDED, "E2": _ECON_EXPANDED, "E3": _ECON_EXPANDED,
+    "E4": _ECON_EXPANDED,
+    # CryptoBERT sentiment-only (v3 S*).
+    # S1 was the bare combined-score mean — no exact title-only twin.
+    "S1": _NO_EXACT_EQUIVALENT_CBT,
+    "S2": _NO_EXACT_EQUIVALENT_CBT,
+    "S3": _NO_EXACT_EQUIVALENT_CBT,
+    "S4": _NO_EXACT_EQUIVALENT_CBT,
+    "S5": _NO_EXACT_EQUIVALENT_CBT,
+    "S6": _NO_EXACT_EQUIVALENT_CBT,
+    "S7": _NO_EXACT_EQUIVALENT_CBT,
+    # VADER sentiment-only.
+    "SV1": _NO_EXACT_EQUIVALENT_VAD,
+    "SV2": _NO_EXACT_EQUIVALENT_VAD,
+    "SV3": _NO_EXACT_EQUIVALENT_VAD,
+    # CryptoBERT combined (v3 C*).
+    "C1": _NO_EXACT_EQUIVALENT_ECON_CBT,
+    "C2": _NO_EXACT_EQUIVALENT_ECON_CBT,
+    "C3": _NO_EXACT_EQUIVALENT_ECON_CBT,
+    "C4": _NO_EXACT_EQUIVALENT_ECON_CBT,
+    "C5": _NO_EXACT_EQUIVALENT_ECON_CBT,
+    "C6": _NO_EXACT_EQUIVALENT_ECON_CBT,
+    # VADER combined (v3 CV*).
+    "CV1": _NO_EXACT_EQUIVALENT_ECON_VAD,
+    "CV2": _NO_EXACT_EQUIVALENT_ECON_VAD,
+    "CV3": _NO_EXACT_EQUIVALENT_ECON_VAD,
+    "CV4": _NO_EXACT_EQUIVALENT_ECON_VAD,
+    "CV5": _NO_EXACT_EQUIVALENT_ECON_VAD,
+    "CV6": _NO_EXACT_EQUIVALENT_ECON_VAD,
+    # Old multi-scorer M family.
+    "M1": _M_REMOVED, "M2": _M_REMOVED, "M3": _M_REMOVED,
+    "M4": _M_REMOVED, "M5": _M_REMOVED, "M6": _M_REMOVED,
+    # FinBERT-era families (SC* / SF*).
+    "SC1": _FINBERT_REMOVED, "SC2": _FINBERT_REMOVED, "SC3": _FINBERT_REMOVED,
     "SF1": _FINBERT_REMOVED, "SF2": _FINBERT_REMOVED, "SF3": _FINBERT_REMOVED,
 }
 

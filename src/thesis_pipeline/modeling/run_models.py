@@ -566,33 +566,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     # ── Legacy-ID guard (v4 17-set registry refactor) ────────────────
-    # Old B/E/S/SV/C/CV/M IDs were superseded by ECON / SENT_* / ECON_*; see
-    # ``thesis_pipeline.features.feature_registry.REMOVED_SET_IDS`` and the
-    # migration table in ``docs/refactor_log.md``. If the user references a
-    # legacy ID AND it is NOT present in their feature_sets.xlsx, raise a
-    # clear migration error. If they have a custom xlsx that still defines
-    # the legacy ID (e.g. unit-test fixtures), allow the run with a warning
-    # so synthetic test harnesses keep working under the v4 registry.
+    # The v4 registry replaces the old B/E/S/SV/C/CV/M/SC/SF families with
+    # the explicit 17-set grid ECON / SENT_{VAD,CBT}_{L,LD,DA,F} /
+    # ECON_{VAD,CBT}_{L,LD,DA,F}. Production code MUST reject any removed
+    # ID up front, regardless of what the user's feature_sets.xlsx
+    # contains — otherwise a stale legacy fixture can silently reactivate
+    # a deprecated information set under the v4 registry. The error
+    # message carries the migration explanation from
+    # :data:`thesis_pipeline.features.feature_registry.REMOVED_SET_IDS`.
     if args.set_id:
         from ..features.feature_registry import REMOVED_SET_IDS as _REMOVED
         if args.set_id in _REMOVED:
-            try:
-                _user_xlsx = load_feature_sets(args.feature_config)
-                _user_ids = set(_user_xlsx["set_id"].astype(str))
-            except Exception:  # noqa: BLE001
-                _user_ids = set()
-            if args.set_id in _user_ids:
-                print(f"[run-models] WARNING: set_id {args.set_id!r} is a legacy "
-                      f"v3 name found in {args.feature_config}. The v4 registry "
-                      f"replaces it with {_REMOVED[args.set_id]!r}; this run "
-                      f"continues only because your xlsx still defines it.")
-            else:
-                replacement = _REMOVED[args.set_id]
-                raise SystemExit(
-                    f"[run-models] set_id {args.set_id!r} was removed in the v4 "
-                    f"17-set registry refactor. Use {replacement!r} instead. "
-                    f"See docs/refactor_log.md for the full migration table."
-                )
+            raise SystemExit(
+                f"[run-models] set_id {args.set_id!r} was removed in the v4 "
+                f"17-set registry refactor. {_REMOVED[args.set_id]} "
+                f"See docs/refactor_log.md for the full migration table."
+            )
 
     # ── Resolve hyperparameter-tuning config (shared by both families) ──
     from .hyperparameter_tuning import hpo_variant_label, load_hpo_config

@@ -51,7 +51,7 @@ def repo(tmp_path, monkeypatch):
     _features().to_parquet(tmp_path / "Data" / "Final" / "features_1d.parquet",
                            index=False)
     fs = pd.DataFrame({
-        "set_id":   ["B1", "B2", "C3"],
+        "set_id":   ["NAIVE_FIXTURE", "ECON", "ECON_CBT_F"],
         "category": ["benchmark", "economic", "combined"],
         "sentiment_model": ["-", "-", "cryptobert"],
         "label":    ["bench", "econ", "combo"],
@@ -74,13 +74,13 @@ def _sig_dir(repo):
 # ---------------------------------------------------------------------------
 
 def test_hpo_run_does_not_overwrite_fixed_filename(repo):
-    rm.main(["--horizon", "1d", "--set-id", "C3", "--sentiment-model",
+    rm.main(["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model",
              "cryptobert", "--restart"])
-    rm.main(["--horizon", "1d", "--set-id", "C3", "--sentiment-model",
+    rm.main(["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model",
              "cryptobert", "--tune-hyperparams", "--hpo-objective",
              "brier_score", "--restart"])
-    fixed = _sig_dir(repo) / "C3_cryptobert.parquet"
-    hpo = _sig_dir(repo) / "C3_cryptobert_hpo_brier.parquet"
+    fixed = _sig_dir(repo) / "ECON_CBT_F_cryptobert.parquet"
+    hpo = _sig_dir(repo) / "ECON_CBT_F_cryptobert_hpo_brier.parquet"
     assert fixed.exists()
     assert hpo.exists()
     # Distinct files; the fixed one has no HPO objective.
@@ -99,10 +99,10 @@ def test_hpo_run_does_not_overwrite_fixed_filename(repo):
     ("accuracy",    "hpo_accuracy"),
 ])
 def test_hpo_filename_objective_suffix(repo, objective, suffix):
-    rm.main(["--horizon", "1d", "--set-id", "C3", "--sentiment-model",
+    rm.main(["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model",
              "cryptobert", "--tune-hyperparams", "--hpo-objective", objective,
              "--restart"])
-    assert (_sig_dir(repo) / f"C3_cryptobert_{suffix}.parquet").exists()
+    assert (_sig_dir(repo) / f"ECON_CBT_F_cryptobert_{suffix}.parquet").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -110,21 +110,21 @@ def test_hpo_filename_objective_suffix(repo, objective, suffix):
 # ---------------------------------------------------------------------------
 
 def test_panel_hpo_filenames(repo):
-    rm.main(["--horizon", "1d", "--set-id", "C3", "--sentiment-model",
+    rm.main(["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model",
              "cryptobert", "--model-type", "panel_logit", "--panel-mode",
              "pooled", "--tune-hyperparams", "--hpo-objective", "brier_score",
              "--restart"])
-    assert (_sig_dir(repo) / "C3_cryptobert_panel_pooled_hpo_brier.parquet").exists()
+    assert (_sig_dir(repo) / "ECON_CBT_F_cryptobert_panel_pooled_hpo_brier.parquet").exists()
 
-    rm.main(["--horizon", "1d", "--set-id", "C3", "--sentiment-model",
+    rm.main(["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model",
              "cryptobert", "--model-type", "panel_logit", "--panel-mode",
              "ticker_fixed_effects", "--tune-hyperparams", "--hpo-objective",
              "brier_score", "--restart"])
-    assert (_sig_dir(repo) / "C3_cryptobert_panel_ticker_fe_hpo_brier.parquet").exists()
+    assert (_sig_dir(repo) / "ECON_CBT_F_cryptobert_panel_ticker_fe_hpo_brier.parquet").exists()
 
 
 def test_metrics_summary_has_hpo_variant_aggregate(repo):
-    rm.main(["--horizon", "1d", "--set-id", "C3", "--sentiment-model",
+    rm.main(["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model",
              "cryptobert", "--tune-hyperparams", "--hpo-objective",
              "brier_score", "--restart"])
     m = pd.read_csv(repo / "Outputs" / "Signals" / "metrics_summary.csv")
@@ -142,9 +142,9 @@ def test_loading_old_signal_defaults_to_fixed(tmp_path):
         "timestamp": pd.date_range("2024-01-01", periods=5, tz="UTC"),
         "ticker": "BTC", "target": [1, 0, 1, 0, 1],
         "prediction": [1, 0, 1, 0, 1], "probability": [0.7, 0.3, 0.6, 0.4, 0.8],
-        "set_id": "C3", "sentiment_model": "cryptobert", "horizon": "1d",
+        "set_id": "ECON_CBT_F", "sentiment_model": "cryptobert", "horizon": "1d",
     })
-    p = tmp_path / "C3_cryptobert.parquet"
+    p = tmp_path / "ECON_CBT_F_cryptobert.parquet"
     old.to_parquet(p, index=False)
     loaded = loading.load_signal_file(p)
     assert (loaded["hpo_enabled"] == False).all()  # noqa: E712
@@ -183,8 +183,8 @@ def _block(set_id, sentiment_model, category, *, hpo_variant, model_type="per_as
 
 def test_pooled_metrics_separates_fixed_and_hpo():
     both = pd.concat([
-        _block("C3", "cryptobert", "combined", hpo_variant="fixed", seed=1),
-        _block("C3", "cryptobert", "combined", hpo_variant="hpo_brier", seed=2),
+        _block("ECON_CBT_F", "cryptobert", "combined", hpo_variant="fixed", seed=1),
+        _block("ECON_CBT_F", "cryptobert", "combined", hpo_variant="hpo_brier", seed=2),
     ], ignore_index=True)
     pooled = metrics.pooled_metrics_table(both)
     assert len(pooled) == 2
@@ -200,38 +200,38 @@ def test_pooled_metrics_separates_fixed_and_hpo():
 
 def _model_plus_bench(hpo_variant, seed):
     return pd.concat([
-        _block("C3", "cryptobert", "combined", hpo_variant=hpo_variant,
+        _block("ECON_CBT_F", "cryptobert", "combined", hpo_variant=hpo_variant,
                acc=0.64, seed=seed),
-        _block("B2", "-", "economic", hpo_variant=hpo_variant, acc=0.50, seed=seed + 1),
+        _block("ECON", "-", "economic", hpo_variant=hpo_variant, acc=0.50, seed=seed + 1),
     ], ignore_index=True)
 
 
 def test_mcnemar_matches_within_hpo_variant():
     df = pd.concat([_model_plus_bench("fixed", 10),
                     _model_plus_bench("hpo_brier", 20)], ignore_index=True)
-    out = sig.mcnemar_table(df, benchmarks=("B2",))
-    c3 = out[out["set_id"] == "C3"]
+    out = sig.mcnemar_table(df, benchmarks=("ECON",))
+    ecbt = out[out["set_id"] == "ECON_CBT_F"]
     # One row per variant — never pooled across fixed/hpo.
-    assert set(c3["hpo_variant"]) == {"fixed", "hpo_brier"}
-    assert len(c3) == 2
+    assert set(ecbt["hpo_variant"]) == {"fixed", "hpo_brier"}
+    assert len(ecbt) == 2
 
 
 def test_mcnemar_no_fixed_hpo_cross_fallback():
     # hpo_brier model present, but only a FIXED B2 benchmark exists.
     df = pd.concat([
-        _block("C3", "cryptobert", "combined", hpo_variant="hpo_brier", seed=1),
-        _block("B2", "-", "economic", hpo_variant="fixed", acc=0.5, seed=2),
+        _block("ECON_CBT_F", "cryptobert", "combined", hpo_variant="hpo_brier", seed=1),
+        _block("ECON", "-", "economic", hpo_variant="fixed", acc=0.5, seed=2),
     ], ignore_index=True)
-    out = sig.mcnemar_table(df, benchmarks=("B2",))
+    out = sig.mcnemar_table(df, benchmarks=("ECON",))
     # No same-variant benchmark exists → the comparison is skipped entirely
     # (empty frame), and certainly no hpo_brier row borrows the fixed B2.
     if not out.empty:
-        assert out[(out["set_id"] == "C3")
+        assert out[(out["set_id"] == "ECON_CBT_F")
                    & (out["hpo_variant"] == "hpo_brier")].empty
     # Even the cross-model opt-in must not mix fixed and HPO.
-    out2 = sig.mcnemar_table(df, benchmarks=("B2",), allow_cross_model_benchmark=True)
+    out2 = sig.mcnemar_table(df, benchmarks=("ECON",), allow_cross_model_benchmark=True)
     if not out2.empty:
-        assert out2[(out2["set_id"] == "C3")
+        assert out2[(out2["set_id"] == "ECON_CBT_F")
                     & (out2["hpo_variant"] == "hpo_brier")].empty
 
 
@@ -242,18 +242,18 @@ def test_mcnemar_no_fixed_hpo_cross_fallback():
 def test_threshold_lift_within_hpo_variant():
     df = pd.concat([_model_plus_bench("fixed", 30),
                     _model_plus_bench("hpo_brier", 40)], ignore_index=True)
-    out = thresholds.threshold_lift_table(df, benchmarks=("B2",), thresholds=(0.50,))
-    c3 = out[out["set_id"] == "C3"]
-    assert set(c3["hpo_variant"]) == {"fixed", "hpo_brier"}
+    out = thresholds.threshold_lift_table(df, benchmarks=("ECON",), thresholds=(0.50,))
+    ecbt = out[out["set_id"] == "ECON_CBT_F"]
+    assert set(ecbt["hpo_variant"]) == {"fixed", "hpo_brier"}
 
     # Missing same-variant benchmark → no lift row for that variant.
     df2 = pd.concat([
-        _block("C3", "cryptobert", "combined", hpo_variant="hpo_brier", seed=1),
-        _block("B2", "-", "economic", hpo_variant="fixed", acc=0.5, seed=2),
+        _block("ECON_CBT_F", "cryptobert", "combined", hpo_variant="hpo_brier", seed=1),
+        _block("ECON", "-", "economic", hpo_variant="fixed", acc=0.5, seed=2),
     ], ignore_index=True)
-    out2 = thresholds.threshold_lift_table(df2, benchmarks=("B2",), thresholds=(0.50,))
+    out2 = thresholds.threshold_lift_table(df2, benchmarks=("ECON",), thresholds=(0.50,))
     if not out2.empty:
-        assert out2[(out2["set_id"] == "C3")
+        assert out2[(out2["set_id"] == "ECON_CBT_F")
                     & (out2["hpo_variant"] == "hpo_brier")].empty
 
 
@@ -286,14 +286,14 @@ def test_economic_benchmark_lift_within_hpo_variant():
 # ---------------------------------------------------------------------------
 
 def test_run_models_run_wrapper_accepts_hpo_args():
-    rc = rm.run(horizon="1d", set_id="C3", sentiment_model="cryptobert",
+    rc = rm.run(horizon="1d", set_id="ECON_CBT_F", sentiment_model="cryptobert",
                 tune_hyperparams=True, hpo_objective="brier_score",
                 hpo_grid_C=[0.1, 1.0], hpo_class_weight=["none"], dry_run=True)
     assert rc == 0
 
 
 def test_panel_run_wrapper_accepts_hpo_args():
-    rc = pl.run(horizon="1d", set_id="C3", sentiment_model="cryptobert",
+    rc = pl.run(horizon="1d", set_id="ECON_CBT_F", sentiment_model="cryptobert",
                 panel_mode="pooled", tune_hyperparams=True,
                 hpo_objective="accuracy", dry_run=True)
     assert rc == 0

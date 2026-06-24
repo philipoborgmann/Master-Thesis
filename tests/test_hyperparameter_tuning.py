@@ -365,7 +365,7 @@ def test_summarize_hpo_columns_aggregates():
 
 def test_cli_dry_run_with_tune_hyperparams():
     from thesis_pipeline import cli
-    rc = cli.main(["run-models", "--horizon", "1d", "--set-id", "C3",
+    rc = cli.main(["run-models", "--horizon", "1d", "--set-id", "ECON_CBT_F",
                    "--sentiment-model", "cryptobert", "--tune-hyperparams",
                    "--hpo-objective", "brier_score", "--dry-run"])
     assert rc == 0
@@ -373,7 +373,7 @@ def test_cli_dry_run_with_tune_hyperparams():
 
 def test_cli_dry_run_panel_with_tune_hyperparams():
     from thesis_pipeline import cli
-    rc = cli.main(["run-models", "--horizon", "1d", "--set-id", "C3",
+    rc = cli.main(["run-models", "--horizon", "1d", "--set-id", "ECON_CBT_F",
                    "--sentiment-model", "cryptobert", "--model-type", "panel_logit",
                    "--panel-mode", "pooled", "--tune-hyperparams",
                    "--hpo-objective", "brier_score", "--dry-run"])

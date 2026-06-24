@@ -99,7 +99,7 @@ def _write_feature_sets_xlsx(path: Path) -> None:
     (comma-separated)`` must take priority.
     """
     fs = pd.DataFrame({
-        "set_id":   ["B1", "SYN1", "SYN_NOISE"],
+        "set_id":   ["NAIVE_FIXTURE", "SYN1", "SYN_NOISE"],
         "category": ["benchmark", "synthetic", "synthetic"],
         "sentiment_model": ["-", "-", "-"],
         "label":    ["rolling-probability benchmark",
@@ -252,42 +252,42 @@ def test_full_pipeline_writes_metrics_summary(synth_repo):
 # Section D — benchmark comparison
 # ---------------------------------------------------------------------------
 
-def test_syn1_outperforms_b1_benchmark(synth_repo):
-    main(["--horizon", "1d", "--set-id", "B1",
+def test_syn1_outperforms_naive_benchmark(synth_repo):
+    main(["--horizon", "1d", "--set-id", "NAIVE_FIXTURE",
           "--coins", "BTC", "ETH", "--restart"])
     main(["--horizon", "1d", "--set-id", "SYN1",
           "--coins", "BTC", "ETH", "--restart"])
 
-    b1   = pd.read_parquet(synth_repo / "Outputs" / "Signals" / "1d" / "B1.parquet")
+    naive   = pd.read_parquet(synth_repo / "Outputs" / "Signals" / "1d" / "NAIVE_FIXTURE.parquet")
     syn1 = pd.read_parquet(synth_repo / "Outputs" / "Signals" / "1d" / "SYN1.parquet")
 
-    acc_b1   = float((b1["prediction"]   == b1["target"]).mean())
+    acc_naive   = float((naive["prediction"]   == naive["target"]).mean())
     acc_syn1 = float((syn1["prediction"] == syn1["target"]).mean())
 
-    assert acc_syn1 - acc_b1 >= 0.05, (
-        f"SYN1 acc={acc_syn1:.3f} must beat B1 acc={acc_b1:.3f} by ≥ 0.05; "
+    assert acc_syn1 - acc_naive >= 0.05, (
+        f"SYN1 acc={acc_syn1:.3f} must beat NAIVE acc={acc_naive:.3f} by ≥ 0.05; "
         "if this regresses, walk-forward or the benchmark logic is broken."
     )
 
 
-def test_syn_noise_does_not_meaningfully_beat_b1(synth_repo):
+def test_syn_noise_does_not_meaningfully_beat_naive(synth_repo):
     """Pure-noise feature should not beat the rolling-probability benchmark
     by more than a small finite-sample margin."""
-    main(["--horizon", "1d", "--set-id", "B1",
+    main(["--horizon", "1d", "--set-id", "NAIVE_FIXTURE",
           "--coins", "BTC", "ETH", "--restart"])
     main(["--horizon", "1d", "--set-id", "SYN_NOISE",
           "--coins", "BTC", "ETH", "--restart"])
 
-    b1    = pd.read_parquet(synth_repo / "Outputs" / "Signals" / "1d" / "B1.parquet")
+    naive    = pd.read_parquet(synth_repo / "Outputs" / "Signals" / "1d" / "NAIVE_FIXTURE.parquet")
     noise = pd.read_parquet(synth_repo / "Outputs" / "Signals" / "1d" / "SYN_NOISE.parquet")
-    acc_b1    = float((b1["prediction"]    == b1["target"]).mean())
+    acc_naive    = float((naive["prediction"]    == naive["target"]).mean())
     acc_noise = float((noise["prediction"] == noise["target"]).mean())
 
     # Allow at most a 5-percentage-point sampling advantage; well below the
     # SYN1 lift of ≥ 5 pp that we test above.
-    assert acc_noise <= acc_b1 + 0.05, (
+    assert acc_noise <= acc_naive + 0.05, (
         f"noise-feature SYN_NOISE acc={acc_noise:.3f} should not exceed "
-        f"B1 acc={acc_b1:.3f} + 0.05 — the noise feature carries no signal."
+        f"B1 acc={acc_naive:.3f} + 0.05 — the noise feature carries no signal."
     )
 
 
@@ -313,10 +313,10 @@ def test_feature_sets_loader_prefers_comma_separated_over_hash_features(synth_re
 def test_feature_sets_loader_normalises_majority_class_sentinel(synth_repo):
     """B1's sentinel must be normalised so the benchmark path triggers."""
     sets = load_feature_sets(str(synth_repo / "feature_sets.xlsx"))
-    b1_features = sets[sets["set_id"] == "B1"]["features"].iloc[0]
+    naive_features = sets[sets["set_id"] == "NAIVE_FIXTURE"]["features"].iloc[0]
     # ``__majority_class__`` is rewritten to ``__rolling_probability__`` by
     # the loader so the benchmark code path triggers downstream.
-    assert b1_features == "__rolling_probability__"
+    assert naive_features == "__rolling_probability__"
 
 
 # ---------------------------------------------------------------------------
@@ -352,11 +352,11 @@ def _collect_validation_metrics() -> pd.DataFrame:
 
     syn1  = _pooled(["signal_feature"], "walk_forward")
     noise = _pooled(["noise_feature"],  "walk_forward")
-    b1    = _pooled(None,               "rolling_probability")
+    naive    = _pooled(None,               "rolling_probability")
 
     acc_syn1  = _pooled_accuracy(syn1)
     acc_noise = _pooled_accuracy(noise)
-    acc_b1    = _pooled_accuracy(b1)
+    acc_naive    = _pooled_accuracy(naive)
 
     def _metric_block(label, set_id, feature, signals, acc, expectation, passed):
         m = compute_metrics(signals, "pooled") if not signals.empty else {}
@@ -379,13 +379,13 @@ def _collect_validation_metrics() -> pd.DataFrame:
         _metric_block("logistic on pure noise", "SYN_NOISE", "noise_feature",
                       noise, acc_noise, "accuracy < 0.60 (no leakage)",
                       acc_noise < 0.60),
-        _metric_block("rolling-probability benchmark", "B1", "__rolling_probability__",
-                      b1, acc_b1, "baseline ≈ 0.50", True),
+        _metric_block("rolling-probability benchmark", "NAIVE_FIXTURE", "__rolling_probability__",
+                      naive, acc_naive, "baseline ≈ 0.50", True),
     ]
     # Lift rows (not tied to a single set).
-    lift = acc_syn1 - acc_b1
+    lift = acc_syn1 - acc_naive
     rows.append({
-        "set_id": "SYN1_vs_B1", "feature": "-", "label": "signal lift over benchmark",
+        "set_id": "SYN1_vs_NAIVE", "feature": "-", "label": "signal lift over benchmark",
         "accuracy": float("nan"), "balanced_accuracy": float("nan"),
         "f1": float("nan"), "brier_score": float("nan"), "n_obs": 0,
         "expectation": "lift >= 0.05", "status": "PASS" if lift >= 0.05 else "FAIL",
@@ -424,4 +424,4 @@ def test_write_synthetic_validation_report():
     assert out_path.exists()
     # Round-trip sanity.
     reloaded = pd.read_csv(out_path)
-    assert set(reloaded["set_id"]) >= {"SYN1", "SYN_NOISE", "B1", "SYN1_vs_B1"}
+    assert set(reloaded["set_id"]) >= {"SYN1", "SYN_NOISE", "NAIVE_FIXTURE", "SYN1_vs_NAIVE"}

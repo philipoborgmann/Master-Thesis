@@ -109,7 +109,7 @@ def _panel_repo(tmp_path):
     df = _build_synthetic_panel(n_timestamps=200, tickers=("BTC", "ETH", "SOL"))
     df.to_parquet(tmp_path / "Data" / "Final" / "features_1d.parquet", index=False)
     fs = pd.DataFrame({
-        "set_id":   ["B1", "B2", "C2"],
+        "set_id":   ["NAIVE_FIXTURE", "ECON", "ECON_VAD_L"],
         "category": ["benchmark", "economic", "combined"],
         "sentiment_model": ["-", "-", "vader"],
         "label":    ["bench", "econ", "combo"],
@@ -141,17 +141,17 @@ def _build_synthetic_panel(n_timestamps=200, tickers=("BTC", "ETH", "SOL"), seed
 def test_rolling_window_filename_differs_from_expanding(tmp_path, monkeypatch):
     repo = _panel_repo(tmp_path)
     monkeypatch.chdir(repo)
-    expanded = run_models_main(["--horizon", "1d", "--set-id", "B2",
+    expanded = run_models_main(["--horizon", "1d", "--set-id", "ECON",
                                  "--model-type", "panel_logit", "--panel-mode", "pooled",
                                  "--restart"])
-    rolling = run_models_main(["--horizon", "1d", "--set-id", "B2",
+    rolling = run_models_main(["--horizon", "1d", "--set-id", "ECON",
                                 "--model-type", "panel_logit", "--panel-mode", "pooled",
                                 "--train-window", "rolling_fixed",
                                 "--rolling-window-timestamps", "30",
                                 "--restart"])
     assert expanded == 0 and rolling == 0
-    assert (repo / "Outputs" / "Signals" / "1d" / "B2_panel_pooled.parquet").exists()
-    rolling_path = repo / "Outputs" / "Signals" / "1d" / "B2_panel_pooled_rw30.parquet"
+    assert (repo / "Outputs" / "Signals" / "1d" / "ECON_panel_pooled.parquet").exists()
+    rolling_path = repo / "Outputs" / "Signals" / "1d" / "ECON_panel_pooled_rw30.parquet"
     assert rolling_path.exists(), \
         "rolling-window run must NOT overwrite the expanding filename"
     sig = pd.read_parquet(rolling_path)
@@ -163,10 +163,10 @@ def test_checkpoint_manifest_refuses_reuse_when_window_changes(tmp_path, monkeyp
     repo = _panel_repo(tmp_path)
     monkeypatch.chdir(repo)
     # Run 1: expanding window — checkpoints + manifest written.
-    run_models_main(["--horizon", "1d", "--set-id", "B2",
+    run_models_main(["--horizon", "1d", "--set-id", "ECON",
                      "--model-type", "panel_logit", "--panel-mode", "pooled",
                      "--restart"])
-    root = (repo / "Outputs" / "Checkpoints" / "Models" / "1d" / "B2_panel_pooled")
+    root = (repo / "Outputs" / "Checkpoints" / "Models" / "1d" / "ECON_panel_pooled")
     mf = ckpt.load_manifest(root)
     assert mf["train_window_mode"] == "expanding"
     chunk = ckpt.chunk_checkpoint_path(root, 0)
@@ -184,7 +184,7 @@ def test_checkpoint_manifest_refuses_reuse_when_window_changes(tmp_path, monkeyp
     ckpt.write_manifest(root, incompatible)
     mtime_before = chunk.stat().st_mtime
 
-    run_models_main(["--horizon", "1d", "--set-id", "B2",
+    run_models_main(["--horizon", "1d", "--set-id", "ECON",
                      "--model-type", "panel_logit", "--panel-mode", "pooled",
                      "--restart"])
     # The chunk was rewritten (not silently reused).
@@ -194,12 +194,12 @@ def test_checkpoint_manifest_refuses_reuse_when_window_changes(tmp_path, monkeyp
 def test_panel_b1_runs_as_rolling_probability_benchmark(tmp_path, monkeypatch):
     repo = _panel_repo(tmp_path)
     monkeypatch.chdir(repo)
-    rc = run_models_main(["--horizon", "1d", "--set-id", "B1",
+    rc = run_models_main(["--horizon", "1d", "--set-id", "NAIVE_FIXTURE",
                           "--model-type", "panel_logit", "--panel-mode", "pooled",
                           "--restart"])
     assert rc == 0
-    out = repo / "Outputs" / "Signals" / "1d" / "B1_panel_pooled.parquet"
-    assert out.exists(), "panel B1 must be produced, not silently skipped"
+    out = repo / "Outputs" / "Signals" / "1d" / "NAIVE_FIXTURE_panel_pooled.parquet"
+    assert out.exists(), "panel rolling-prob NAIVE_FIXTURE must be produced, not silently skipped"
     sig = pd.read_parquet(out)
     assert not sig.empty
     assert (sig["benchmark_model"]

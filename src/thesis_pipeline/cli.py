@@ -68,6 +68,10 @@ def _add_run_models_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--set-id", "--set_id", dest="set_id", default=None)
     parser.add_argument("--coins", "--coin", "--ticker",
                         dest="coins", nargs="*")
+    parser.add_argument("--feature-config", "--feature_config",
+                        dest="feature_config", default=None,
+                        help="Override path to feature_sets.xlsx (used by "
+                             "modeling.run_models.load_feature_sets).")
     parser.add_argument("--sentiment-model", "--sentiment_model",
                         dest="sentiment_model", default=None,
                         type=_sentiment_model_choice,
@@ -343,6 +347,8 @@ def cmd_run_models(args: argparse.Namespace) -> int:
         argv += ["--set-id", args.set_id]
     if args.coins:
         argv += ["--coins", *list(args.coins)]
+    if getattr(args, "feature_config", None):
+        argv += ["--feature-config", args.feature_config]
     if args.sentiment_model:
         argv += ["--sentiment-model", args.sentiment_model]
     if getattr(args, "model_type", None):
