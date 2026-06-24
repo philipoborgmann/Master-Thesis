@@ -81,12 +81,14 @@ def sentiment_neutral_columns(sentiment_cols: list[str]) -> list[str]:
 
     Scope is intentionally narrow — only sentiment / attention columns:
 
-    * ``*_mean`` / ``*_weighted_mean`` / ``*_median``  → 0.0
-    * ``*_bullishness_ratio``                          → 0.5
-    * ``*_std``                                        → 0.0 (no posts → no
-      observed dispersion; included here so the merge report counts these as
-      filled)
-    * ``post_count`` / ``*_post_count``                → 0
+    * ``*_score_mean`` / ``*_score_median`` / ``*_score_std``   → ``0`` (neutral)
+    * ``*_bullishness_ratio``                                   → ``0.5``
+      (no directional information — never ``0``, which would imply
+      *bearish unanimity*)
+    * ``post_count`` / ``*_post_count`` / ``*_directional_post_count``  → ``0``
+
+    Variante A removed ``*_weighted_mean`` upstream; those columns are
+    therefore no longer recognised here.
 
     Non-sentiment columns (price, volatility, volume, market_cap, target,
     timestamp, ticker) are never returned here, regardless of which flag the
@@ -94,11 +96,16 @@ def sentiment_neutral_columns(sentiment_cols: list[str]) -> list[str]:
     """
     keep = []
     for col in sentiment_cols:
+        # Variante A: *_weighted_mean is forbidden in the feature frame and
+        # must NOT be auto-filled here (engagement-weighted columns no longer
+        # exist; recognising them would silently restore the dead branch).
+        if col.endswith("_weighted_mean"):
+            continue
         if col == "post_count" or col.endswith("_post_count"):
             keep.append(col)
         elif "bullishness_ratio" in col:
             keep.append(col)
-        elif any(col.endswith(s) for s in ("_mean", "_weighted_mean", "_median", "_std")):
+        elif any(col.endswith(s) for s in ("_mean", "_median", "_std")):
             keep.append(col)
     return keep
 
@@ -107,30 +114,48 @@ def fill_missing_sentiment(df: pd.DataFrame,
                            sentiment_cols: list[str]) -> pd.DataFrame:
     """Fill NaN sentiment / attention columns with their neutral values.
 
-    Only sentiment / attention columns are touched — never price, return,
-    volatility, volume, market_cap, target, timestamp or ticker columns.
+    Variante A fill rules (separate per family — see ``sentiment_neutral_columns``):
 
-    * Score columns (``*_mean`` / ``*_weighted_mean`` / ``*_median``)
-                                                          → 0.0 (neutral signal)
-    * Std columns (``*_std``)                              → 0.0 (no posts →
-      no observed dispersion; encodes "no sentiment information" rather than
-      leaving NaN, which would cascade into downstream ``dropna`` calls and
-      silently drop rich rows in panel_logit)
-    * Bullishness ratio (``*_bullishness_ratio``)         → 0.5 (neutral)
-    * post_count / ``*_post_count``                       → 0
+    * ``*_score_mean`` / ``*_score_median`` / ``*_score_std`` → ``0`` (neutral score).
+    * ``*_bullishness_ratio`` → ``0.5``. **Not ``0``.** ``0`` would mean
+      "unanimously bearish", which is a *directional* signal; the slot
+      had no directional posts at all, so the neutral fill must be the
+      midpoint. This also catches slots in which every post happens to
+      be classified ``neutral`` (denominator = 0 → NaN upstream).
+    * ``post_count`` / ``*_post_count`` / ``*_directional_post_count`` → ``0``.
+
+    Non-sentiment columns are never touched.
     """
     for col in sentiment_cols:
+        # Variante A: refuse to fill engagement-weighted columns. They should
+        # not exist in any v4 pipeline; leaving them NaN forces downstream
+        # callers to discover and remove them.
+        if col.endswith("_weighted_mean"):
+            continue
         if col == "post_count" or col.endswith("_post_count"):
             df[col] = df[col].fillna(COUNT_FILL)
-        elif col.endswith("_std"):
-            df[col] = df[col].fillna(0.0)
         elif "bullishness_ratio" in col:
             df[col] = df[col].fillna(0.5)
-        elif any(col.endswith(s) for s in ("_mean", "_weighted_mean", "_median")):
+        elif any(col.endswith(s) for s in ("_mean", "_median", "_std")):
             df[col] = df[col].fillna(SCORE_FILL)
         else:
             df[col] = df[col].fillna(SCORE_FILL)
 
+    return df
+
+
+def derive_post_count_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Derive ``log1p_post_count`` and ``has_posts`` AFTER neutral-fill.
+
+    These are deterministic functions of ``post_count`` and must be computed
+    *after* the fill so that slots with no posts (``post_count == 0``)
+    receive ``log1p_post_count = 0`` and ``has_posts = 0``. Idempotent —
+    safe to call repeatedly.
+    """
+    if "post_count" not in df.columns:
+        return df
+    df["log1p_post_count"] = np.log1p(df["post_count"].astype(float))
+    df["has_posts"]        = (df["post_count"] > 0).astype("int8")
     return df
 
 
@@ -218,6 +243,11 @@ def merge_horizon(horizon: str, included_tickers: list[str],
                      if fill_targets else 0)
         n_sentiment_nans_filled = int(before_nan - after_nan)
         columns_filled = [c for c in fill_targets if c in merged.columns]
+
+    # Derive log1p_post_count and has_posts AFTER the fill so that no-post
+    # slots get the correct values (0.0 and 0).
+    merged = derive_post_count_features(merged)
+
     merged = merged.sort_values(["ticker", "timestamp"]).reset_index(drop=True)
 
     report = {

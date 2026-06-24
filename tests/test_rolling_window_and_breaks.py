@@ -394,40 +394,45 @@ def test_fill_missing_sentiment_fills_each_column_kind_correctly():
     """Spot-check every neutral-fill branch in one go on a synthetic frame
     so a future edit can't quietly regress one of them.
     """
+    # Variante A: *_weighted_mean is no longer a valid sentiment column and
+    # must NOT be auto-filled; including one here verifies it stays NaN.
     df = pd.DataFrame({
         "ticker":                       ["BTC", "BTC"],
         "post_count":                   [np.nan, 3],
         "vader_post_count":             [np.nan, 7],
+        "vader_directional_post_count": [np.nan, 5],
         "vader_title_score_mean":       [np.nan, 0.42],
-        "vader_combined_weighted_mean": [np.nan, 0.10],
+        "vader_combined_weighted_mean": [np.nan, 0.10],  # forbidden — stays NaN
         "vader_title_score_median":     [np.nan, 0.05],
         "vader_title_score_std":        [np.nan, 0.20],
         "vader_combined_score_std":     [np.nan, 0.30],
         "cryptobert_bullishness_ratio": [np.nan, 0.60],
         # Non-sentiment columns the function must NEVER touch.
         "log_return_t":                 [np.nan, 0.01],
-        "realized_vol_14":              [np.nan, 0.02],
+        "realized_vol_14d":             [np.nan, 0.02],
         "target":                       [np.nan, 1.0],
     })
     sent_cols = [c for c in df.columns
-                 if c not in ("ticker", "log_return_t", "realized_vol_14",
+                 if c not in ("ticker", "log_return_t", "realized_vol_14d",
                               "target")]
     out = fm.fill_missing_sentiment(df.copy(), sent_cols)
-    # post_count → 0
+    # post_count / directional_post_count → 0
     assert (out["post_count"] == [0, 3]).all()
     assert (out["vader_post_count"] == [0, 7]).all()
-    # mean / weighted_mean / median → 0.0
+    assert (out["vader_directional_post_count"] == [0, 5]).all()
+    # mean / median → 0.0
     assert out["vader_title_score_mean"].iat[0] == 0.0
-    assert out["vader_combined_weighted_mean"].iat[0] == 0.0
     assert out["vader_title_score_median"].iat[0] == 0.0
-    # std → 0.0 (the change under test)
+    # std → 0.0
     assert out["vader_title_score_std"].iat[0] == 0.0
     assert out["vader_combined_score_std"].iat[0] == 0.0
     # bullishness_ratio → 0.5
     assert out["cryptobert_bullishness_ratio"].iat[0] == 0.5
+    # Variante A: *_weighted_mean must stay NaN — engagement weighting was removed.
+    assert pd.isna(out["vader_combined_weighted_mean"].iat[0])
     # Non-sentiment columns stay NaN.
     assert pd.isna(out["log_return_t"].iat[0])
-    assert pd.isna(out["realized_vol_14"].iat[0])
+    assert pd.isna(out["realized_vol_14d"].iat[0])
     assert pd.isna(out["target"].iat[0])
     # And real values are preserved on the non-NaN rows.
     assert out["vader_title_score_std"].iat[1] == 0.20
