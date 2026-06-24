@@ -524,7 +524,14 @@ def build_market_cap_series(
 
         tmp = market_cap[["date", col]].rename(columns={col: "market_cap"}).copy()
         tmp["market_cap"] = pd.to_numeric(tmp["market_cap"], errors="coerce")
-        tmp = tmp.dropna(subset=["market_cap"]).sort_values("date").reset_index(drop=True)
+        # ── Defensive pre-log filtering ────────────────────────────
+        # log() of non-positive / non-finite values yields NaN or -inf
+        # and would silently leak into log_market_cap_lag1. Drop ≤0,
+        # NaN and ±inf market-caps here so only finite, strictly positive
+        # source values survive into the feature pipeline.
+        valid_mask  = tmp["market_cap"].notna() & np.isfinite(tmp["market_cap"]) & (tmp["market_cap"] > 0)
+        n_invalid_raw = int((~valid_mask).sum())
+        tmp = tmp[valid_mask].sort_values("date").reset_index(drop=True)
         # Add documented availability columns:
         #   market_cap_source_date  – the calendar date D the snapshot belongs to.
         #   market_cap_available_at – D + 1 day, 00:00 UTC (conservative default
@@ -533,8 +540,15 @@ def build_market_cap_series(
         tmp["market_cap_available_at"] = (
             tmp["market_cap_source_date"] + MARKET_CAP_AVAILABILITY_LAG
         )
-        # log_market_cap_lag1 — log transform once, here.
-        tmp["log_market_cap_lag1"] = np.log(tmp["market_cap"])
+        # log_market_cap_lag1 — log transform once, here. After the
+        # pre-filter above this can only produce finite values; the
+        # ``replace`` is a belt-and-braces safety net.
+        tmp["log_market_cap_lag1"] = (
+            np.log(tmp["market_cap"]).replace([np.inf, -np.inf], np.nan)
+        )
+        n_invalid_after_log = int(tmp["log_market_cap_lag1"].isna().sum())
+        if n_invalid_after_log:
+            tmp = tmp.dropna(subset=["log_market_cap_lag1"]).reset_index(drop=True)
         series_by_ticker[ticker] = tmp
 
         cmc_id, sym = parse_cmc_column(col)
@@ -543,9 +557,11 @@ def build_market_cap_series(
             "market_cap_column": col,
             "parsed_cmc_id": cmc_id,
             "parsed_symbol": sym,
-            "n_non_null_market_cap": int(tmp["market_cap"].notna().sum()),
+            "n_non_null_market_cap":           int(tmp["market_cap"].notna().sum()),
+            "n_invalid_market_cap_rows_raw":   n_invalid_raw,
+            "n_invalid_market_cap_after_log":  n_invalid_after_log,
             "first_market_cap_date": str(tmp["date"].min()) if len(tmp) else "",
-            "last_market_cap_date": str(tmp["date"].max()) if len(tmp) else "",
+            "last_market_cap_date":  str(tmp["date"].max()) if len(tmp) else "",
             "status": "ok",
         })
 
@@ -787,6 +803,9 @@ def main(argv=None) -> int:
 
     all_reports: list[dict] = []
     all_thresholds: list[dict] = []
+    # Audit accumulators (effective market-cap lag + bar-grid regularity).
+    lag_audit_rows: list[pd.DataFrame] = []
+    bar_audit_rows: list[pd.DataFrame] = []
 
     for horizon in args.horizons:
         print("\n" + "=" * 70)
@@ -822,6 +841,19 @@ def main(argv=None) -> int:
             df_horizon = pd.concat(horizon_parts, ignore_index=True)
             df_horizon = df_horizon.sort_values(["timestamp", "ticker"]).reset_index(drop=True)
 
+            # Section F / G — timing audits per horizon (best-effort; the
+            # main feature pipeline is never broken by an audit failure).
+            try:
+                from ..diagnostics.timing_audit import (
+                    market_cap_lag_audit, bar_grid_audit,
+                )
+                if {"market_cap_source_date", "market_cap_available_at"}.issubset(
+                        df_horizon.columns):
+                    lag_audit_rows.append(market_cap_lag_audit(df_horizon))
+                bar_audit_rows.append(bar_grid_audit(df_horizon))
+            except Exception as exc:  # noqa: BLE001
+                print(f"[WARN] timing audit skipped for {horizon}: {exc}")
+
             output_path = output_dir / f"features_{horizon}.parquet"
             df_horizon.to_parquet(output_path, index=False)
             print(f"\n[INFO] Saved {output_path} ({len(df_horizon):,} rows, {df_horizon.shape[1]} columns)")
@@ -830,6 +862,27 @@ def main(argv=None) -> int:
 
     # Audit files.
     report_df = pd.DataFrame(all_reports)
+    # ── Section F: market-cap effective-lag summary appended to the report ─
+    if lag_audit_rows:
+        from ..diagnostics.timing_audit import market_cap_lag_summary
+        lag_full = pd.concat(lag_audit_rows, ignore_index=True)
+        per_h = (lag_full.groupby("horizon", as_index=False)
+                 .apply(lambda g: pd.Series(market_cap_lag_summary(g)))
+                 .reset_index(drop=True))
+        per_h.to_csv(output_dir / "market_cap_lag_summary.csv", index=False)
+        # Append global summary columns to the per-(ticker,horizon) report.
+        global_summary = market_cap_lag_summary(lag_full)
+        for k, v in global_summary.items():
+            report_df[k] = v
+        print(f"[INFO] market_cap_lag_summary: {global_summary}")
+    # ── Section G: bar-grid regularity report ─────────────────────────────
+    if bar_audit_rows:
+        bar_full = pd.concat(bar_audit_rows, ignore_index=True)
+        bar_full.to_csv(output_dir / "bar_grid_audit.csv", index=False)
+        n_irregular = int((bar_full["n_missing_expected_bars"] > 0).sum())
+        if n_irregular:
+            print(f"[WARN] bar-grid: {n_irregular} (ticker, horizon) entries "
+                  f"have missing bars — see bar_grid_audit.csv.")
     report_path = output_dir / "feature_generation_report.csv"
     report_df.to_csv(report_path, index=False)
 

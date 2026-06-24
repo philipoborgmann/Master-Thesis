@@ -35,16 +35,60 @@ SET_ID_PATTERN = (
 )
 assert len(SET_ID_PATTERN) == 17, "v4 registry must contain exactly 17 sets"
 
-# Diagnostic-only columns. Never expose them as features in the primary grid.
+# Diagnostic-only columns. Exact-name list (kept for symmetry and for
+# clarity in error messages); the canonical primary-grid validation uses
+# the pattern matcher :func:`is_diagnostic_only_feature` below so the rule
+# extends automatically to all `_mean / _median / _std / _max / _min`
+# variants and to both VADER and CryptoBERT.
 DIAGNOSTIC_ONLY_COLUMNS = (
     "has_posts",
     "vader_directional_post_count",
     "cryptobert_directional_post_count",
-    "vader_combined_score_mean",      # robustness / supplementary only
-    "vader_selftext_score_mean",      # robustness / supplementary only
-    "cryptobert_combined_score_mean", # robustness / supplementary only
-    "cryptobert_selftext_score_mean", # robustness / supplementary only
+    "vader_combined_score_mean",
+    "vader_combined_score_median",
+    "vader_combined_score_std",
+    "vader_selftext_score_mean",
+    "vader_selftext_score_median",
+    "vader_selftext_score_std",
+    "cryptobert_combined_score_mean",
+    "cryptobert_combined_score_median",
+    "cryptobert_combined_score_std",
+    "cryptobert_selftext_score_mean",
+    "cryptobert_selftext_score_median",
+    "cryptobert_selftext_score_std",
 )
+
+
+def is_diagnostic_only_feature(feature: str) -> bool:
+    """Return True if ``feature`` is a robustness/diagnostic-only column.
+
+    These columns may live in the merged feature frame for supplementary
+    analyses, but they must never appear in any of the 17 primary-grid
+    sets. Pattern-based so a new ``_max`` / ``_kurtosis`` / etc.
+    aggregation cannot silently slip into the grid:
+
+      * ``has_posts``                              — derived indicator.
+      * ``*_directional_post_count``               — post-class count.
+      * ``*_combined_score_*``                     — title+selftext blend
+        (Variante A keeps it for robustness, not in the grid).
+      * ``*_selftext_score_*``                     — selftext-only score.
+      * ``*_weighted_mean``                        — engagement-weighted
+        column (Variante A removed engagement weighting entirely; any
+        residual ``*_weighted_mean`` is therefore forbidden).
+    """
+    if not isinstance(feature, str):
+        return False
+    if feature == "has_posts":
+        return True
+    if feature.endswith("_directional_post_count"):
+        return True
+    if "_combined_score_" in feature:
+        return True
+    if "_selftext_score_" in feature:
+        return True
+    if feature.endswith("_weighted_mean"):
+        return True
+    return False
 
 
 # Set-IDs removed during the v4 17-set registry refactor + FinBERT removal.
@@ -228,27 +272,52 @@ def load_feature_sets() -> Dict[str, dict]:
 def validate_registry(sets: Dict[str, dict]) -> List[str]:
     """Return a list of validation problems (empty list → registry is OK).
 
-    v4 contract:
-      * ID must be in :data:`SET_ID_PATTERN`.
-      * feature list must be non-empty.
-      * features must be unique.
-      * no feature may be one of the diagnostic-only columns.
+    v4 contract — every category of problem is reported with a distinct
+    prefix so callers can grep:
+
+      * ``[shape] total count …``         — the registry has != 17 sets.
+      * ``[shape] missing required IDs …`` — at least one of the canonical
+        17 v4 IDs is absent.
+      * ``[shape] unexpected IDs …``      — IDs outside SET_ID_PATTERN are
+        present (covers legacy v3 leftovers and typos alike).
+      * ``[content] <set_id>: empty …``    — feature list is empty.
+      * ``[content] <set_id>: duplicate …``— feature list contains
+        duplicates.
+      * ``[content] <set_id>: diagnostic-only feature …`` — feature
+        matches :func:`is_diagnostic_only_feature`.
     """
     problems: list[str] = []
     declared = set(SET_ID_PATTERN)
-    diagnostics = set(DIAGNOSTIC_ONLY_COLUMNS)
-    for set_id, spec in sets.items():
+    present  = set(sets.keys())
+
+    # ── Shape: exact 17-set contract ──────────────────────────────
+    if len(sets) != 17:
+        problems.append(
+            f"[shape] total count {len(sets)} != 17 (v4 registry contract)"
+        )
+    missing = sorted(declared - present)
+    if missing:
+        problems.append(f"[shape] missing required IDs: {missing}")
+    unexpected = sorted(present - declared)
+    if unexpected:
+        problems.append(
+            f"[shape] unexpected IDs (not in SET_ID_PATTERN): {unexpected}"
+        )
+
+    # ── Content: per-set checks ───────────────────────────────────
+    for set_id, spec in sorted(sets.items()):
         features = list(spec.get("features", []))
-        if set_id not in declared:
-            problems.append(f"{set_id}: not in SET_ID_PATTERN (v4 expects 17 sets)")
         if not features:
-            problems.append(f"{set_id}: empty feature list (no v4 set may be empty)")
+            problems.append(
+                f"[content] {set_id}: empty feature list (no v4 set may be empty)"
+            )
+            continue
         if len(features) != len(set(features)):
-            problems.append(f"{set_id}: duplicate features {features}")
-        bad_diag = [f for f in features if f in diagnostics]
+            problems.append(f"[content] {set_id}: duplicate features {features}")
+        bad_diag = [f for f in features if is_diagnostic_only_feature(f)]
         if bad_diag:
             problems.append(
-                f"{set_id}: includes diagnostic-only columns {bad_diag} — "
-                f"keep these for robustness analyses, not in the 17-set grid"
+                f"[content] {set_id}: diagnostic-only feature(s) {bad_diag} "
+                f"— keep these for robustness analyses, not in the 17-set grid"
             )
     return problems
