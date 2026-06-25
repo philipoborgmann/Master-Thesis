@@ -74,11 +74,15 @@ def _sig_dir(repo):
 # ---------------------------------------------------------------------------
 
 def test_hpo_run_does_not_overwrite_fixed_filename(repo):
+    # Both calls are per-asset so the filename matches the legacy
+    # expectation (no `_panel_*_rw180d` suffix). Fixed first, then HPO.
     rm.main(["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model",
-             "cryptobert", "--restart"])
+             "cryptobert", "--restart",
+             "--model-type", "per_asset", "--no-tune-hyperparams"])
     rm.main(["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model",
-             "cryptobert", "--tune-hyperparams", "--hpo-objective",
-             "brier_score", "--restart"])
+             "cryptobert", "--restart",
+             "--model-type", "per_asset",
+             "--tune-hyperparams", "--hpo-objective", "brier_score"])
     fixed = _sig_dir(repo) / "ECON_CBT_F_cryptobert.parquet"
     hpo = _sig_dir(repo) / "ECON_CBT_F_cryptobert_hpo_brier.parquet"
     assert fixed.exists()
@@ -99,8 +103,11 @@ def test_hpo_run_does_not_overwrite_fixed_filename(repo):
     ("accuracy",    "hpo_accuracy"),
 ])
 def test_hpo_filename_objective_suffix(repo, objective, suffix):
+    # Per-asset filename test — opt out of the v4 panel default so the
+    # name lacks the panel/rolling suffixes (`_panel_ticker_fe_rw180d`).
     rm.main(["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model",
-             "cryptobert", "--tune-hyperparams", "--hpo-objective", objective,
+             "cryptobert", "--model-type", "per_asset",
+             "--tune-hyperparams", "--hpo-objective", objective,
              "--restart"])
     assert (_sig_dir(repo) / f"ECON_CBT_F_cryptobert_{suffix}.parquet").exists()
 
@@ -110,22 +117,29 @@ def test_hpo_filename_objective_suffix(repo, objective, suffix):
 # ---------------------------------------------------------------------------
 
 def test_panel_hpo_filenames(repo):
+    # Opt out of the v4 rolling-180d default so the filename lacks the
+    # `_rw180d` suffix that the test was written before v4.
     rm.main(["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model",
              "cryptobert", "--model-type", "panel_logit", "--panel-mode",
-             "pooled", "--tune-hyperparams", "--hpo-objective", "brier_score",
+             "pooled", "--train-window", "expanding",
+             "--tune-hyperparams", "--hpo-objective", "brier_score",
              "--restart"])
     assert (_sig_dir(repo) / "ECON_CBT_F_cryptobert_panel_pooled_hpo_brier.parquet").exists()
 
     rm.main(["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model",
              "cryptobert", "--model-type", "panel_logit", "--panel-mode",
-             "ticker_fixed_effects", "--tune-hyperparams", "--hpo-objective",
+             "ticker_fixed_effects", "--train-window", "expanding",
+             "--tune-hyperparams", "--hpo-objective",
              "brier_score", "--restart"])
     assert (_sig_dir(repo) / "ECON_CBT_F_cryptobert_panel_ticker_fe_hpo_brier.parquet").exists()
 
 
 def test_metrics_summary_has_hpo_variant_aggregate(repo):
+    # Per-asset run (no panel suffix) so the metrics row matches the
+    # legacy expectation.
     rm.main(["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model",
-             "cryptobert", "--tune-hyperparams", "--hpo-objective",
+             "cryptobert", "--model-type", "per_asset",
+             "--tune-hyperparams", "--hpo-objective",
              "brier_score", "--restart"])
     m = pd.read_csv(repo / "Outputs" / "Signals" / "metrics_summary.csv")
     pooled = m[m["ticker"] == "pooled"]

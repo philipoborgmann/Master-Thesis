@@ -11,8 +11,11 @@ from thesis_pipeline.diagnostics.leakage_checks import (
 
 
 def test_scheme_is_walk_forward_not_random_split():
+    """Walk-forward (either expanding or fixed-rolling) — never a random
+    split. v4 default is ``rolling_fixed`` with rolling_window_days=180;
+    earlier versions used ``expanding``. Both are walk-forward."""
     cfg = load_config("model_specs")
-    assert cfg["walk_forward"]["scheme"] == "expanding"
+    assert cfg["walk_forward"]["scheme"] in ("expanding", "rolling_fixed")
     # Random split would imply absence of walk_forward block / shuffle flag.
     assert "shuffle" not in cfg["walk_forward"]
 

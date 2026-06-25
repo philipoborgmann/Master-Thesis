@@ -127,7 +127,7 @@ def test_chunk_indices_partitions_without_reordering():
 # ---------------------------------------------------------------------------
 
 def test_per_asset_writes_ticker_checkpoints(repo):
-    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart"])
+    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart", "--model-type", "per_asset", "--no-tune-hyperparams"])
     tdir = _ckpt_dir(repo, "ECON") / "tickers"
     assert {p.stem for p in tdir.glob("*.parquet")} == {"BTC", "ETH", "SOL"}
     # Manifest written and marked complete.
@@ -142,11 +142,11 @@ def test_per_asset_writes_ticker_checkpoints(repo):
 # ---------------------------------------------------------------------------
 
 def test_per_asset_resume_skips_existing(repo):
-    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart"])
+    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart", "--model-type", "per_asset", "--no-tune-hyperparams"])
     cp = _ckpt_dir(repo, "ECON") / "tickers" / "BTC.parquet"
     mtime_before = os.path.getmtime(cp)
     # --restart ignores the final file but resume (default) reuses checkpoints.
-    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart"])
+    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart", "--model-type", "per_asset", "--no-tune-hyperparams"])
     assert os.path.getmtime(cp) == mtime_before, "resumed ticker must not be rewritten"
 
 
@@ -155,7 +155,7 @@ def test_per_asset_resume_skips_existing(repo):
 # ---------------------------------------------------------------------------
 
 def test_per_asset_finalizes_from_checkpoints_when_final_missing(repo):
-    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart"])
+    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart", "--model-type", "per_asset", "--no-tune-hyperparams"])
     final = _final(repo, "ECON")
     original = pd.read_parquet(final)
     cp = _ckpt_dir(repo, "ECON") / "tickers" / "BTC.parquet"
@@ -163,7 +163,7 @@ def test_per_asset_finalizes_from_checkpoints_when_final_missing(repo):
     final.unlink()  # delete only the final signal file
 
     # Re-run without --restart: final missing → rebuild from checkpoints.
-    rm.main(["--horizon", "1d", "--set-id", "ECON"])
+    rm.main(["--horizon", "1d", "--set-id", "ECON", "--model-type", "per_asset", "--no-tune-hyperparams"])
     assert final.exists()
     rebuilt = pd.read_parquet(final)
     assert len(rebuilt) == len(original)
@@ -176,10 +176,10 @@ def test_per_asset_finalizes_from_checkpoints_when_final_missing(repo):
 # ---------------------------------------------------------------------------
 
 def test_restart_does_not_clear_checkpoints(repo):
-    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart"])
+    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart", "--model-type", "per_asset", "--no-tune-hyperparams"])
     cp = _ckpt_dir(repo, "ECON") / "tickers" / "BTC.parquet"
     assert cp.exists()
-    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart"])
+    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart", "--model-type", "per_asset", "--no-tune-hyperparams"])
     assert cp.exists(), "--restart alone must keep checkpoints"
 
 
@@ -188,9 +188,9 @@ def test_restart_does_not_clear_checkpoints(repo):
 # ---------------------------------------------------------------------------
 
 def test_clear_checkpoints_only_affects_this_run(repo):
-    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart"])
+    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart", "--model-type", "per_asset", "--no-tune-hyperparams"])
     rm.main(["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model",
-             "cryptobert", "--restart"])
+             "cryptobert", "--restart", "--model-type", "per_asset", "--no-tune-hyperparams"])
     econ_cp = _ckpt_dir(repo, "ECON") / "tickers" / "BTC.parquet"
     ecbt_cp = _ckpt_dir(repo, "ECON_CBT_F_cryptobert") / "tickers" / "BTC.parquet"
     assert econ_cp.exists() and ecbt_cp.exists()
@@ -198,7 +198,7 @@ def test_clear_checkpoints_only_affects_this_run(repo):
 
     # Clear only the C3 run.
     rm.main(["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model",
-             "cryptobert", "--restart", "--clear-checkpoints"])
+             "cryptobert", "--restart", "--clear-checkpoints", "--model-type", "per_asset", "--no-tune-hyperparams"])
     assert econ_cp.exists()
     assert os.path.getmtime(econ_cp) == econ_mtime, "other run's checkpoints untouched"
     assert ecbt_cp.exists()  # cleared then recomputed
@@ -211,7 +211,7 @@ def test_clear_checkpoints_only_affects_this_run(repo):
 def test_panel_writes_chunk_checkpoints(repo):
     rm.main(["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model", "cryptobert",
              "--model-type", "panel_logit", "--panel-mode", "pooled",
-             "--checkpoint-chunk-size", "10", "--restart"])
+             "--checkpoint-chunk-size", "10", "--restart", "--train-window", "expanding", "--no-tune-hyperparams"])
     cdir = _ckpt_dir(repo, "ECON_CBT_F_cryptobert_panel_pooled") / "chunks"
     chunks = sorted(cdir.glob("chunk_*.parquet"))
     assert len(chunks) >= 1
@@ -228,7 +228,7 @@ def test_panel_writes_chunk_checkpoints(repo):
 def test_panel_resume_skips_existing_chunks(repo):
     args = ["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model", "cryptobert",
             "--model-type", "panel_logit", "--panel-mode", "pooled",
-            "--checkpoint-chunk-size", "10", "--restart"]
+            "--checkpoint-chunk-size", "10", "--restart", "--train-window", "expanding", "--no-tune-hyperparams"]
     rm.main(args)
     cp = _ckpt_dir(repo, "ECON_CBT_F_cryptobert_panel_pooled") / "chunks" / "chunk_0000.parquet"
     mtime_before = os.path.getmtime(cp)
@@ -261,11 +261,11 @@ def test_panel_chunking_does_not_change_predictions(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_corrupt_ticker_checkpoint_is_recomputed(repo):
-    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart"])
+    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart", "--model-type", "per_asset", "--no-tune-hyperparams"])
     cp = _ckpt_dir(repo, "ECON") / "tickers" / "BTC.parquet"
     cp.write_bytes(b"garbage not parquet")  # corrupt it
     # Re-run with --restart (final ignored) → corrupt BTC recomputed, others reused.
-    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart"])
+    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart", "--model-type", "per_asset", "--no-tune-hyperparams"])
     rebuilt = ckpt.load_checkpoint(cp)
     assert rebuilt is not None and not rebuilt.empty
     final = pd.read_parquet(_final(repo, "ECON"))
@@ -277,11 +277,16 @@ def test_corrupt_ticker_checkpoint_is_recomputed(repo):
 # ---------------------------------------------------------------------------
 
 def test_hpo_checkpoint_path_isolated_from_fixed(repo):
+    # Both calls are per-asset so the checkpoint directory names match
+    # the legacy expectation (no `_panel_*_rw180d` suffix). The first
+    # establishes the FIXED dir; the second the HPO dir.
     rm.main(["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model",
-             "cryptobert", "--restart"])
+             "cryptobert", "--restart",
+             "--model-type", "per_asset", "--no-tune-hyperparams"])
     rm.main(["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model",
-             "cryptobert", "--tune-hyperparams", "--hpo-objective", "brier_score",
-             "--restart"])
+             "cryptobert", "--restart",
+             "--model-type", "per_asset",
+             "--tune-hyperparams", "--hpo-objective", "brier_score"])
     fixed_dir = _ckpt_dir(repo, "ECON_CBT_F_cryptobert")
     hpo_dir = _ckpt_dir(repo, "ECON_CBT_F_cryptobert_hpo_brier")
     assert fixed_dir.exists() and hpo_dir.exists()
@@ -298,7 +303,7 @@ def test_hpo_checkpoint_path_isolated_from_fixed(repo):
 def test_panel_modes_have_separate_checkpoints(repo):
     common = ["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model", "cryptobert",
               "--model-type", "panel_logit", "--checkpoint-chunk-size", "10",
-              "--restart"]
+              "--restart", "--train-window", "expanding", "--no-tune-hyperparams"]
     rm.main(common + ["--panel-mode", "pooled"])
     rm.main(common + ["--panel-mode", "ticker_fixed_effects"])
     assert _ckpt_dir(repo, "ECON_CBT_F_cryptobert_panel_pooled").exists()
@@ -310,7 +315,7 @@ def test_panel_modes_have_separate_checkpoints(repo):
 # ---------------------------------------------------------------------------
 
 def test_no_checkpoint_writes_no_checkpoints(repo):
-    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart", "--no-checkpoint"])
+    rm.main(["--horizon", "1d", "--set-id", "ECON", "--restart", "--no-checkpoint", "--model-type", "per_asset", "--no-tune-hyperparams"])
     assert not _ckpt_dir(repo, "ECON").exists()
     # Final signal file is still produced.
     assert _final(repo, "ECON").exists()

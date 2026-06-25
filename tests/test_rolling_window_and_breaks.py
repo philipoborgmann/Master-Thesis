@@ -141,14 +141,19 @@ def _build_synthetic_panel(n_timestamps=200, tickers=("BTC", "ETH", "SOL"), seed
 def test_rolling_window_filename_differs_from_expanding(tmp_path, monkeypatch):
     repo = _panel_repo(tmp_path)
     monkeypatch.chdir(repo)
+    # NB: v4 default is --train-window rolling_fixed --rolling-window-days 180,
+    # so to compare expanding vs. rolling filenames we must opt back into
+    # expanding explicitly. Both runs also opt out of HPO (default-on in v4)
+    # to keep this test focused on filename mechanics, not estimator depth.
     expanded = run_models_main(["--horizon", "1d", "--set-id", "ECON",
                                  "--model-type", "panel_logit", "--panel-mode", "pooled",
-                                 "--restart"])
+                                 "--train-window", "expanding",
+                                 "--no-tune-hyperparams", "--restart"])
     rolling = run_models_main(["--horizon", "1d", "--set-id", "ECON",
                                 "--model-type", "panel_logit", "--panel-mode", "pooled",
                                 "--train-window", "rolling_fixed",
                                 "--rolling-window-timestamps", "30",
-                                "--restart"])
+                                "--no-tune-hyperparams", "--restart"])
     assert expanded == 0 and rolling == 0
     assert (repo / "Outputs" / "Signals" / "1d" / "ECON_panel_pooled.parquet").exists()
     rolling_path = repo / "Outputs" / "Signals" / "1d" / "ECON_panel_pooled_rw30.parquet"
@@ -162,10 +167,13 @@ def test_rolling_window_filename_differs_from_expanding(tmp_path, monkeypatch):
 def test_checkpoint_manifest_refuses_reuse_when_window_changes(tmp_path, monkeypatch):
     repo = _panel_repo(tmp_path)
     monkeypatch.chdir(repo)
-    # Run 1: expanding window — checkpoints + manifest written.
+    # Run 1: expanding window — checkpoints + manifest written. v4 defaults
+    # would write to a different out_name (...rw180), so opt into expanding
+    # explicitly to test the same-out_name manifest-mismatch path.
     run_models_main(["--horizon", "1d", "--set-id", "ECON",
                      "--model-type", "panel_logit", "--panel-mode", "pooled",
-                     "--restart"])
+                     "--train-window", "expanding",
+                     "--no-tune-hyperparams", "--restart"])
     root = (repo / "Outputs" / "Checkpoints" / "Models" / "1d" / "ECON_panel_pooled")
     mf = ckpt.load_manifest(root)
     assert mf["train_window_mode"] == "expanding"
@@ -186,7 +194,8 @@ def test_checkpoint_manifest_refuses_reuse_when_window_changes(tmp_path, monkeyp
 
     run_models_main(["--horizon", "1d", "--set-id", "ECON",
                      "--model-type", "panel_logit", "--panel-mode", "pooled",
-                     "--restart"])
+                     "--train-window", "expanding",
+                     "--no-tune-hyperparams", "--restart"])
     # The chunk was rewritten (not silently reused).
     assert chunk.stat().st_mtime != mtime_before
 
@@ -194,9 +203,13 @@ def test_checkpoint_manifest_refuses_reuse_when_window_changes(tmp_path, monkeyp
 def test_panel_b1_runs_as_rolling_probability_benchmark(tmp_path, monkeypatch):
     repo = _panel_repo(tmp_path)
     monkeypatch.chdir(repo)
+    # Opt back into expanding + no-HPO so the legacy filename
+    # `NAIVE_FIXTURE_panel_pooled.parquet` is produced (the v4 default
+    # would add `_rw180` and `_hpo_logloss` suffixes).
     rc = run_models_main(["--horizon", "1d", "--set-id", "NAIVE_FIXTURE",
                           "--model-type", "panel_logit", "--panel-mode", "pooled",
-                          "--restart"])
+                          "--train-window", "expanding",
+                          "--no-tune-hyperparams", "--restart"])
     assert rc == 0
     out = repo / "Outputs" / "Signals" / "1d" / "NAIVE_FIXTURE_panel_pooled.parquet"
     assert out.exists(), "panel rolling-prob NAIVE_FIXTURE must be produced, not silently skipped"

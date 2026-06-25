@@ -509,11 +509,18 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
     (standalone ``python -m ...panel_logit`` invocation) it is resolved here
     from the CLI flags + ``configs/model_specs.yaml``.
     """
-    panel_mode = getattr(args, "panel_mode", "pooled") or "pooled"
+    panel_mode = getattr(args, "panel_mode", "ticker_fixed_effects") \
+                 or "ticker_fixed_effects"
     from .windowing import window_suffix as _window_suffix
-    train_window_mode = getattr(args, "train_window", "expanding") or "expanding"
+    train_window_mode = getattr(args, "train_window", "rolling_fixed") \
+                        or "rolling_fixed"
     rolling_window_timestamps = getattr(args, "rolling_window_timestamps", None)
-    rolling_window_days = getattr(args, "rolling_window_days", None)
+    rolling_window_days       = getattr(args, "rolling_window_days", None)
+    # The v4 default is rolling_window_days=180. A user who explicitly
+    # asks for a timestamp-count window must take priority — pass only
+    # the one they set so select_panel_train_window's mutex check passes.
+    if rolling_window_timestamps is not None and rolling_window_days is not None:
+        rolling_window_days = None
     if train_window_mode == "rolling_fixed" and (
         rolling_window_timestamps is None and rolling_window_days is None
     ):
@@ -521,7 +528,9 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
         # default window. Structural breaks are diagnostic only.
         print("  [ERROR] --train-window rolling_fixed requires "
               "--rolling-window-timestamps or --rolling-window-days "
-              "(no automatic default).")
+              "(v4 default is 180 calendar days; pass --rolling-window-days 0 "
+              "to disable explicitly is NOT supported — pass "
+              "--train-window expanding instead).")
         return 2
     win_suffix = _window_suffix(train_window_mode, rolling_window_timestamps,
                                 rolling_window_days)
@@ -529,7 +538,9 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
     from .hyperparameter_tuning import hpo_variant_label, load_hpo_config
     if hpo_cfg is None:
         hpo_cfg = load_hpo_config(
-            enabled_override=True if getattr(args, "tune_hyperparams", False) else None,
+            # v4: --tune-hyperparams defaults to True via BooleanOptionalAction.
+            # Forward the explicit bool so --no-tune-hyperparams really disables.
+            enabled_override=bool(getattr(args, "tune_hyperparams", True)),
             objective_override=getattr(args, "hpo_objective", None),
             c_grid=getattr(args, "hpo_grid_C", None),
             class_weight_grid=getattr(args, "hpo_class_weight", None),

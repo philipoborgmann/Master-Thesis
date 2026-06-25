@@ -1,18 +1,31 @@
-# Model specifications.
-# Values extracted from Run_Models.py.
+# Model specifications — v4 (Aufgabe 5).
+#
+# A bare ``python -m thesis_pipeline.cli run-models`` runs the canonical
+# v4 pipeline: panel-logit / ticker_fixed_effects / fixed rolling
+# 180-calendar-day training window / nested HPO ON / log_loss objective.
+# Pass --no-tune-hyperparams, --model-type per_asset, or --train-window
+# expanding to opt back into the historical behaviour. ``DEFAULT_C = 1.0``
+# is the fixed fallback when HPO is off.
 
 default_model:    "logistic_ridge"     # sklearn.linear_model.LogisticRegression(penalty='l2')
-benchmark_model:  "rolling_probability"
+benchmark_model:  "rolling_probability"  # NAIVE evaluation reference; not a v4 feature set.
 
-# Walk-forward configuration (Run_Models.py: INIT_TRAIN_FRAC, expanding-window).
+# Walk-forward configuration.
+# v4 default = panel-logit on a FIXED rolling 180-calendar-day training
+# window (the CLI's --rolling-window-days 180 + --train-window
+# rolling_fixed). The legacy expanding scheme remains available via
+# ``--train-window expanding``.
 walk_forward:
-  scheme: "expanding"
-  init_train_frac: 0.50          # first 50% of observations form the initial training window
-  min_init_train_obs: 30         # but never fewer than 30 observations
-  min_obs_per_window: 20         # skip step if training window has < 20 valid rows
-  min_classes: 2                 # skip step if both classes not present in training
+  scheme: "rolling_fixed"          # v4 default; "expanding" stays available
+  rolling_window_days: 180         # CALENDAR days; identical wall-clock
+                                   # across 1d/6h/1h horizons
+  init_train_frac: 0.50            # first 50% of obs form the initial
+                                   # per-asset window (per-asset fallback)
+  min_init_train_obs: 30           # but never fewer than 30 observations
+  min_obs_per_window: 20           # skip step if training window has < 20 valid rows
+  min_classes: 2                   # skip step if both classes not present in training
 
-# Logistic-ridge hyperparameters.
+# Logistic-ridge hyperparameters (used directly when --no-tune-hyperparams).
 logistic_ridge:
   penalty: "l2"
   C: 1.0
@@ -20,8 +33,8 @@ logistic_ridge:
   max_iter: 1000
   random_state: 42
 
-# Standardisation: a fresh StandardScaler is fit on each expanding training
-# window only (no leakage). Applied to all numeric features.
+# Standardisation: a fresh StandardScaler is fit on each training window only
+# (no leakage). Applied to all numeric features.
 scaler:
   type: "StandardScaler"
   fit_scope: "train_window_only"
@@ -35,13 +48,6 @@ probability_clip:
   high: 0.999999999999999      # 1 - 1e-15
 
 # Columns written to Outputs/Signals/<horizon>/<set_id>[...].parquet.
-#
-# The first block is always written. ``model_type`` / ``panel_mode`` are
-# written by the panel-logit family (per-asset files default to "per_asset" /
-# "-" on read). The HPO block is written by every run: tuned runs carry the
-# real values; fixed-C runs carry the sentinels hpo_enabled=False,
-# hpo_objective="-", hpo_variant="fixed". best_C / best_class_weight /
-# hpo_score / hpo_status are present only on tuned (HPO) signal files.
 output_columns:
   - timestamp
   - ticker
@@ -63,37 +69,49 @@ output_columns:
   - hpo_score
   - hpo_status
 
-# Hyperparameter tuning. Conservative, leakage-safe grid search nested inside
-# each walk-forward training window (see
-# src/thesis_pipeline/modeling/hyperparameter_tuning.py).
+# Hyperparameter tuning — conservative, leakage-safe nested grid search.
+# v4 default: ``enabled: true`` with ``objective: log_loss``. Log-loss
+# rewards well-calibrated probabilities, matching how the predictions
+# are reused downstream (threshold analysis, economic backtest).
 #
-# Default `enabled: false` so existing results stay reproducible — when
-# disabled the modelling behaviour is byte-for-byte identical to the pinned
-# C=1.0 estimator. `--tune-hyperparams` overrides `enabled` at runtime.
-#
-# Objectives: brier_score (default), log_loss, accuracy.
-#   brier_score → minimize, log_loss → minimize, accuracy → maximize.
-# Brier is the default because the predicted probabilities are reused for
-# threshold analysis and the economic backtest, so calibration matters.
+# class_weight grid is intentionally restricted to ``[null]``:
+# ``class_weight: balanced`` reweights observations away from their
+# empirical distribution, which degrades probability calibration under
+# a log-loss / Brier objective. Use it only as a documented robustness
+# variant (via --hpo-class-weight or this YAML), not in the production
+# grid.
 hyperparameter_tuning:
-  enabled: false
+  enabled: true                  # v4 default ON
   method: grid
-  objective: brier_score
-  validation_fraction: 0.2     # most-recent 20% of the train window = validation
-  min_train_obs: 60            # fall back to defaults below this inner-train size
-  min_validation_obs: 20       # fall back to defaults below this validation size
-  refit_on_full_train: true    # refit best params on the full window before predicting
+  objective: log_loss            # v4 default (was brier_score in v3)
+  validation_fraction: 0.2       # most-recent 20% of train window = validation
+  min_train_obs: 60              # fall back to defaults below this inner-train size
+  min_validation_obs: 20         # fall back to defaults below this validation size
+  refit_on_full_train: true      # refit best params on the full window before predicting
 
   search_space:
+    # Logarithmic C grid around 1.0 (the fixed-C fallback). Four points
+    # span two orders of magnitude in each direction.
     C:
       - 0.01
       - 0.1
       - 1.0
       - 10.0
-    # Conservative default: regularisation strength only. class_weight is left
-    # at [null] because class_weight="balanced" can degrade probability
-    # calibration, and the default objective (Brier) cares about calibration.
-    # Add ``- balanced`` here (or pass --hpo-class-weight none balanced) to
-    # explore it.
+    # v4: PRODUCTION grid is [null] only — see comment above.
     class_weight:
       - null
+
+# Documented "final" profile (Aufgabe 5.6).
+# The canonical configuration is already set via the CLI defaults; this
+# block exists so a reproducer can see the exact intended pipeline
+# settings in one place and so external tooling can pin against them
+# without parsing argparse signatures.
+profiles:
+  final:
+    model_type: panel_logit
+    panel_mode: ticker_fixed_effects
+    train_window: rolling_fixed
+    rolling_window_days: 180
+    tune_hyperparams: true
+    hpo_objective: log_loss
+    class_weight_grid: [null]

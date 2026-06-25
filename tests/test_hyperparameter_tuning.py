@@ -308,7 +308,10 @@ def test_panel_hpo_ticker_fe_runs():
 def test_load_hpo_config_defaults_disabled():
     cfg = hpt.load_hpo_config({"hyperparameter_tuning": {"enabled": False}})
     assert cfg["enabled"] is False
-    assert cfg["objective"] == "brier_score"
+    # v4 default objective is log_loss (was brier_score in v3). The
+    # `enabled: false` flag only flips the toggle — the objective stays
+    # at whatever the v4 _DEFAULT_HPO carries.
+    assert cfg["objective"] == "log_loss"
 
 
 def test_load_hpo_config_legacy_bool():

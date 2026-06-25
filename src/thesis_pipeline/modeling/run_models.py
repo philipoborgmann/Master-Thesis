@@ -1,21 +1,36 @@
-"""Modeling stage — Ridge logistic regression with expanding-window walk-forward.
+"""Modeling stage — Ridge logistic regression / panel-logit walk-forward.
 
-This module owns the **canonical** modeling logic. The original root-level
-``Run_Models.py`` is now a one-line legacy redirect; ``scripts/run_models.py``
-is a thin entry point on the same ``main()``; the package CLI
-(``thesis_pipeline.cli``) also calls this ``main()`` directly.
+This module owns the **canonical** modeling logic. The package CLI
+(``thesis_pipeline.cli``) and ``scripts/run_models.py`` are thin entry
+points that both invoke ``main()`` below.
 
-Validation design and methodology are unchanged from the previous root-level
-implementation:
+v4 canonical defaults (Aufgabe 5)
+---------------------------------
+A bare ``python -m thesis_pipeline.cli run-models`` runs the intended
+production pipeline:
 
-* Initial train split = first ``INIT_TRAIN_FRAC`` (50%) of chronologically
-  sorted observations per ticker.
-* Expanding walk-forward, step size 1; train on ``[0, t-1]``, predict at t.
+* ``--model-type panel_logit``
+* ``--panel-mode ticker_fixed_effects`` (coin dummies, shared slopes)
+* ``--train-window rolling_fixed`` with ``--rolling-window-days 180``
+  (180 CALENDAR days — identical wall-clock across 1d / 6h / 1h)
+* ``--tune-hyperparams`` (BooleanOptionalAction, default ON)
+* ``--hpo-objective log_loss``
+* Per-ticker / per-chunk checkpointing on (resume from prior runs).
+
+Pass ``--no-tune-hyperparams``, ``--model-type per_asset``, or
+``--train-window expanding`` to opt back into the historical behaviour.
+
+Validation invariants (unchanged from earlier versions)
+-------------------------------------------------------
+* Initial train split = first ``INIT_TRAIN_FRAC`` (50 %) of
+  chronologically sorted observations per ticker.
+* Walk-forward, step size 1; train on rows with ``timestamp < τ``, predict τ.
 * ``StandardScaler`` re-fit on every training window only.
-* Logistic regression with L2 penalty, ``C = DEFAULT_C`` (1.0),
-  ``random_state = 42``.
+* Logistic regression with L2 penalty, ``DEFAULT_C = 1.0`` as the fixed
+  fallback when ``--no-tune-hyperparams`` is set.
 * Benchmark sentinel ``__majority_class__`` is mapped to
-  ``__rolling_probability__`` and uses ``run_rolling_probability``.
+  ``__rolling_probability__`` and uses ``run_rolling_probability`` —
+  this is the NAIVE evaluation reference, not a v4 feature set.
 
 CLI is intentionally permissive about argument names so that
 
@@ -401,13 +416,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--C", type=float, default=DEFAULT_C,
                         help=f"Ridge regularisation strength (default: {DEFAULT_C})")
     parser.add_argument("--model-type", "--model_type", dest="model_type",
-                        default="per_asset", choices=["per_asset", "panel_logit"],
-                        help="per_asset (canonical, default) or panel_logit "
-                             "(pooled / ticker-FE panel regression).")
+                        default="panel_logit",
+                        choices=["per_asset", "panel_logit"],
+                        help="Default: panel_logit (v4 canonical pipeline). "
+                             "Use per_asset to opt back into the historical "
+                             "ticker-by-ticker logistic-ridge.")
     parser.add_argument("--panel-mode", "--panel_mode", dest="panel_mode",
-                        default="pooled", choices=["pooled", "ticker_fixed_effects"],
-                        help="Panel-logit variant (only used when "
-                             "--model-type panel_logit).")
+                        default="ticker_fixed_effects",
+                        choices=["pooled", "ticker_fixed_effects"],
+                        help="Default: ticker_fixed_effects (shared slopes + "
+                             "coin dummies). Use pooled for a single shared "
+                             "intercept across all coins.")
     parser.add_argument("--smoke", action="store_true",
                         help="Smoke mode: defaults to horizon=1d, coins=[BTC, ETH], set_id=ECON.")
     parser.add_argument("--dry-run", "--dry_run", dest="dry_run",
@@ -419,14 +438,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Ignore cached signal parquets and rerun every set.")
     # ── Hyperparameter tuning (conservative, leakage-safe grid search) ──
     parser.add_argument("--tune-hyperparams", "--tune_hyperparams",
-                        dest="tune_hyperparams", action="store_true",
-                        help="Enable nested grid-search HPO inside each "
-                             "walk-forward training window (overrides "
-                             "model_specs.yaml enabled).")
+                        dest="tune_hyperparams",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Run nested grid-search HPO inside each "
+                             "walk-forward training window (v4 default: ON). "
+                             "Use --no-tune-hyperparams to fall back to the "
+                             "fixed-C estimator.")
     parser.add_argument("--hpo-objective", "--hpo_objective",
-                        dest="hpo_objective", default=None,
+                        dest="hpo_objective", default="log_loss",
                         choices=["brier_score", "log_loss", "accuracy"],
-                        help="HPO selection metric (default from model_specs.yaml).")
+                        help="HPO selection metric (v4 default: log_loss).")
     parser.add_argument("--hpo-config", "--hpo_config", dest="hpo_config",
                         default=None,
                         help="Path to a YAML holding a hyperparameter_tuning "
@@ -459,15 +480,22 @@ def build_parser() -> argparse.ArgumentParser:
     # Manual rolling-window controls (panel-logit only); structural breaks are
     # diagnostic and never automatically set the rolling window length.
     parser.add_argument("--train-window", "--train_window",
-                        dest="train_window", default="expanding",
+                        dest="train_window", default="rolling_fixed",
                         choices=["expanding", "rolling_fixed"],
-                        help="Panel training window (default: expanding).")
+                        help="Panel training window (v4 default: "
+                             "rolling_fixed). Use expanding to opt back into "
+                             "the historical all-of-history training set.")
     parser.add_argument("--rolling-window-timestamps", "--rolling_window_timestamps",
                         dest="rolling_window_timestamps", type=int, default=None,
-                        help="Manual number of pre-tau unique timestamps.")
+                        help="Manual number of pre-tau unique timestamps. "
+                             "Mutually exclusive with --rolling-window-days.")
     parser.add_argument("--rolling-window-days", "--rolling_window_days",
-                        dest="rolling_window_days", type=float, default=None,
-                        help="Manual day-distance rolling window.")
+                        dest="rolling_window_days", type=float, default=180.0,
+                        help="Day-distance rolling window in CALENDAR DAYS "
+                             "(v4 default: 180). 180 days is identical "
+                             "wall-clock across 1d / 6h / 1h horizons — "
+                             "180 timestamps would mean ~180 days at 1d "
+                             "but only 45 days at 6h and 7.5 days at 1h.")
     return parser
 
 
@@ -586,7 +614,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     # ── Resolve hyperparameter-tuning config (shared by both families) ──
     from .hyperparameter_tuning import hpo_variant_label, load_hpo_config
     hpo_cfg = load_hpo_config(
-        enabled_override=True if getattr(args, "tune_hyperparams", False) else None,
+        # ``--tune-hyperparams`` is now BooleanOptionalAction with default
+        # True (v4). Forward the explicit bool so ``--no-tune-hyperparams``
+        # really disables HPO regardless of the YAML default.
+        enabled_override=bool(getattr(args, "tune_hyperparams", True)),
         objective_override=getattr(args, "hpo_objective", None),
         c_grid=getattr(args, "hpo_grid_C", None),
         class_weight_grid=getattr(args, "hpo_class_weight", None),
@@ -962,20 +993,31 @@ def run(*, horizon: str | None = None, set_id: str | None = None,
         force: bool = False, restart: bool = False,
         C: float | None = None,
         feature_config: str | None = None,
-        model_type: str = "per_asset",
-        panel_mode: str = "pooled",
-        tune_hyperparams: bool = False,
-        hpo_objective: str | None = None,
+        # v4 canonical defaults — match build_parser():
+        model_type: str = "panel_logit",
+        panel_mode: str = "ticker_fixed_effects",
+        tune_hyperparams: bool = True,
+        hpo_objective: str = "log_loss",
         hpo_config: str | None = None,
         hpo_grid_C: Sequence[float] | None = None,
         hpo_class_weight: Sequence[str] | None = None,
+        train_window: str = "rolling_fixed",
+        rolling_window_days: float | None = 180.0,
+        rolling_window_timestamps: int | None = None,
         checkpoint: bool = True,
         resume: bool = True,
         checkpoint_dir: str | None = None,
         checkpoint_chunk_size: int | None = None,
         clear_checkpoints: bool = False) -> int:
     """Programmatic entry point. Translates keyword arguments to argv for
-    :func:`main`. Prefer calling :func:`main` directly with an argv list."""
+    :func:`main`. Prefer calling :func:`main` directly with an argv list.
+
+    The defaults match the v4 CLI: panel-logit / ticker fixed effects /
+    rolling 180-calendar-day window / HPO on / log-loss objective.
+    Pass ``model_type="per_asset"``, ``tune_hyperparams=False``, or
+    ``train_window="expanding"`` to opt back into the historical
+    behaviour.
+    """
     argv: list[str] = []
     if horizon:
         argv += ["--horizon", horizon]
@@ -993,10 +1035,17 @@ def run(*, horizon: str | None = None, set_id: str | None = None,
         argv += ["--model-type", model_type]
     if panel_mode:
         argv += ["--panel-mode", panel_mode]
-    if tune_hyperparams:
-        argv.append("--tune-hyperparams")
+    # ``--tune-hyperparams`` is BooleanOptionalAction in v4: emit the
+    # explicit negative flag when the caller has turned it off.
+    argv += ["--tune-hyperparams"] if tune_hyperparams else ["--no-tune-hyperparams"]
     if hpo_objective:
         argv += ["--hpo-objective", hpo_objective]
+    if train_window:
+        argv += ["--train-window", train_window]
+    if rolling_window_timestamps is not None:
+        argv += ["--rolling-window-timestamps", str(rolling_window_timestamps)]
+    if rolling_window_days is not None and rolling_window_timestamps is None:
+        argv += ["--rolling-window-days", str(rolling_window_days)]
     if hpo_config:
         argv += ["--hpo-config", hpo_config]
     if hpo_grid_C:

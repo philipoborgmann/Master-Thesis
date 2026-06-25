@@ -177,11 +177,19 @@ def panel_repo(tmp_path, monkeypatch):
 # 5. Panel pooled full pipeline
 # ---------------------------------------------------------------------------
 
+# These integration tests check pre-v4 filename / metric semantics
+# (no `_rw180` / `_hpo_logloss` suffix on the panel signal parquet).
+# They opt into expanding + no-HPO so the methodology under test
+# (panel pooled vs ticker-FE, rolling-prob benchmark, metric columns)
+# is exercised without the v4 defaults that would change the filename.
+_LEGACY_PANEL = ["--train-window", "expanding", "--no-tune-hyperparams"]
+
+
 def test_full_pipeline_panel_pooled(panel_repo):
     rc = run_models_main([
         "--horizon", "1d", "--set-id", "ECON",
         "--model-type", "panel_logit", "--panel-mode", "pooled",
-        "--restart",
+        "--restart", *_LEGACY_PANEL,
     ])
     assert rc == 0
     out = panel_repo / "Outputs" / "Signals" / "1d" / "ECON_panel_pooled.parquet"
@@ -198,14 +206,17 @@ def test_full_pipeline_panel_pooled(panel_repo):
 
 
 def test_full_pipeline_panel_does_not_touch_per_asset_file(panel_repo):
-    # Run per-asset first, then panel — both must coexist.
-    run_models_main(["--horizon", "1d", "--set-id", "ECON", "--restart"])
+    # Run per-asset first, then panel — both must coexist. The per-asset
+    # call opts out of the v4 panel default; the panel call opts out of
+    # the v4 rolling/HPO defaults so the legacy filename layout holds.
+    run_models_main(["--horizon", "1d", "--set-id", "ECON", "--restart",
+                     "--model-type", "per_asset", "--no-tune-hyperparams"])
     per_asset = panel_repo / "Outputs" / "Signals" / "1d" / "ECON.parquet"
     assert per_asset.exists()
 
     run_models_main(["--horizon", "1d", "--set-id", "ECON",
                      "--model-type", "panel_logit", "--panel-mode", "pooled",
-                     "--restart"])
+                     "--restart", *_LEGACY_PANEL])
     panel = panel_repo / "Outputs" / "Signals" / "1d" / "ECON_panel_pooled.parquet"
     assert panel.exists()
     # The per-asset file is untouched and carries no panel columns.
@@ -221,7 +232,7 @@ def test_full_pipeline_panel_ticker_fe(panel_repo):
     rc = run_models_main([
         "--horizon", "1d", "--set-id", "ECON_VAD_L",
         "--model-type", "panel_logit", "--panel-mode", "ticker_fixed_effects",
-        "--restart",
+        "--restart", *_LEGACY_PANEL,
     ])
     assert rc == 0
     out = panel_repo / "Outputs" / "Signals" / "1d" / "ECON_VAD_L_vader_panel_ticker_fe.parquet"
@@ -232,18 +243,18 @@ def test_full_pipeline_panel_ticker_fe(panel_repo):
 
 
 # ---------------------------------------------------------------------------
-# 7. B1 is now run as a panel rolling-probability benchmark (no longer skipped)
+# 7. NAIVE_FIXTURE runs as a panel rolling-probability benchmark
 # ---------------------------------------------------------------------------
 
 def test_panel_b1_runs_as_rolling_probability_benchmark(panel_repo):
     rc = run_models_main([
         "--horizon", "1d", "--set-id", "NAIVE_FIXTURE",
         "--model-type", "panel_logit", "--panel-mode", "pooled",
-        "--restart",
+        "--restart", *_LEGACY_PANEL,
     ])
     assert rc == 0
-    # The panel rolling-probability benchmark now produces a signal file with
-    # the same naming scheme as the logistic models.
+    # The panel rolling-probability benchmark produces a signal file with
+    # the same naming scheme as the logistic models (no _rw / _hpo suffix).
     out = panel_repo / "Outputs" / "Signals" / "1d" / "NAIVE_FIXTURE_panel_pooled.parquet"
     assert out.exists()
     sdf = pd.read_parquet(out)
@@ -261,7 +272,7 @@ def test_panel_b1_runs_as_rolling_probability_benchmark(panel_repo):
 def test_metrics_summary_has_panel_columns(panel_repo):
     run_models_main(["--horizon", "1d", "--set-id", "ECON",
                      "--model-type", "panel_logit", "--panel-mode", "pooled",
-                     "--restart"])
+                     "--restart", *_LEGACY_PANEL])
     metrics = panel_repo / "Outputs" / "Signals" / "metrics_summary.csv"
     assert metrics.exists()
     m = pd.read_csv(metrics)

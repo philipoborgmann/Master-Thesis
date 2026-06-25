@@ -210,12 +210,22 @@ def test_run_walk_forward_returns_probabilities_consistent_with_predictions(synt
 # Section C — full pipeline integration
 # ---------------------------------------------------------------------------
 
+# Tests in this section exercise the historical PER-ASSET walk-forward
+# (one signal file per ticker × set), so they opt back into
+# `--model-type per_asset` and `--no-tune-hyperparams` rather than the
+# v4 canonical panel-logit + HPO defaults. The synthetic data is too
+# small (≈150 obs per ticker) for a meaningful HPO grid here, and the
+# v4 panel filename includes `_panel_ticker_fe_hpo_logloss_rw180`
+# suffixes that this section's filename-based assertions don't expect.
+_LEGACY_PER_ASSET = ["--model-type", "per_asset", "--no-tune-hyperparams"]
+
+
 def test_full_pipeline_writes_signal_parquet(synth_repo):
     rc = main([
         "--horizon", "1d",
         "--set-id", "SYN1",
         "--coins", "BTC", "ETH",
-        "--restart",
+        "--restart", *_LEGACY_PER_ASSET,
     ])
     assert rc == 0
 
@@ -238,7 +248,7 @@ def test_full_pipeline_writes_metrics_summary(synth_repo):
         "--horizon", "1d",
         "--set-id", "SYN1",
         "--coins", "BTC", "ETH",
-        "--restart",
+        "--restart", *_LEGACY_PER_ASSET,
     ])
     assert rc == 0
 
@@ -254,9 +264,9 @@ def test_full_pipeline_writes_metrics_summary(synth_repo):
 
 def test_syn1_outperforms_naive_benchmark(synth_repo):
     main(["--horizon", "1d", "--set-id", "NAIVE_FIXTURE",
-          "--coins", "BTC", "ETH", "--restart"])
+          "--coins", "BTC", "ETH", "--restart", *_LEGACY_PER_ASSET])
     main(["--horizon", "1d", "--set-id", "SYN1",
-          "--coins", "BTC", "ETH", "--restart"])
+          "--coins", "BTC", "ETH", "--restart", *_LEGACY_PER_ASSET])
 
     naive   = pd.read_parquet(synth_repo / "Outputs" / "Signals" / "1d" / "NAIVE_FIXTURE.parquet")
     syn1 = pd.read_parquet(synth_repo / "Outputs" / "Signals" / "1d" / "SYN1.parquet")
@@ -274,9 +284,9 @@ def test_syn_noise_does_not_meaningfully_beat_naive(synth_repo):
     """Pure-noise feature should not beat the rolling-probability benchmark
     by more than a small finite-sample margin."""
     main(["--horizon", "1d", "--set-id", "NAIVE_FIXTURE",
-          "--coins", "BTC", "ETH", "--restart"])
+          "--coins", "BTC", "ETH", "--restart", *_LEGACY_PER_ASSET])
     main(["--horizon", "1d", "--set-id", "SYN_NOISE",
-          "--coins", "BTC", "ETH", "--restart"])
+          "--coins", "BTC", "ETH", "--restart", *_LEGACY_PER_ASSET])
 
     naive    = pd.read_parquet(synth_repo / "Outputs" / "Signals" / "1d" / "NAIVE_FIXTURE.parquet")
     noise = pd.read_parquet(synth_repo / "Outputs" / "Signals" / "1d" / "SYN_NOISE.parquet")
@@ -287,7 +297,7 @@ def test_syn_noise_does_not_meaningfully_beat_naive(synth_repo):
     # SYN1 lift of ≥ 5 pp that we test above.
     assert acc_noise <= acc_naive + 0.05, (
         f"noise-feature SYN_NOISE acc={acc_noise:.3f} should not exceed "
-        f"B1 acc={acc_naive:.3f} + 0.05 — the noise feature carries no signal."
+        f"NAIVE acc={acc_naive:.3f} + 0.05 — the noise feature carries no signal."
     )
 
 
