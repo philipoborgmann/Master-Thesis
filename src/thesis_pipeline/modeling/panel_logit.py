@@ -33,9 +33,13 @@ There are **no time fixed effects**: a dummy for the test timestamp would be
 unidentified out-of-sample (it never appears in training), so time FE are
 intentionally excluded.
 
-B1 (``__rolling_probability__`` / ``__majority_class__``) is not a panel-logit
-model — for ``model_type=panel_logit`` such sets are skipped with a warning
-rather than crashing.
+The NAIVE rolling-probability path
+(``__rolling_probability__`` / ``__majority_class__``) is not a panel-logit
+model — under ``model_type=panel_logit`` a feature-set entry that resolves to
+the sentinel is skipped with a warning rather than crashing. Production v4
+runs generate NAIVE separately via
+:mod:`thesis_pipeline.modeling.naive_reference`, independent of the
+feature-set grid.
 """
 
 from __future__ import annotations

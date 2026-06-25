@@ -140,6 +140,13 @@ def _ols_cluster_robust(y: np.ndarray,
     }
 
 
+#: Below this number of clusters the cluster-robust inference is fragile;
+#: the test stays ``test_valid=True`` but the result carries
+#: ``small_cluster_warning=True`` so the consumer can flag it. For the
+#: thesis production setting with ~25 tickers the threshold is well clear.
+SMALL_CLUSTER_THRESHOLD = 10
+
+
 def cluster_robust_difference_in_improvement(
     d: np.ndarray,
     treatment: np.ndarray,
@@ -152,8 +159,8 @@ def cluster_robust_difference_in_improvement(
     Parameters
     ----------
     d
-        Observation-level improvement indicator (``aug_correct - econ_correct``),
-        any ∈ {−1, 0, +1}.
+        Observation-level improvement indicator
+        (``aug_correct - econ_correct``), any ∈ {−1, 0, +1}.
     treatment
         ``1`` for the *treatment* regime (e.g. high-vol), ``0`` for the
         *control* regime (e.g. low-vol). Observations with ``treatment``
@@ -164,16 +171,23 @@ def cluster_robust_difference_in_improvement(
         Cluster labels — typically the ticker. Pass anything hashable; the
         sandwich loops over the unique values.
     use_statsmodels
-        Delegate to ``statsmodels.api.OLS`` with ``cov_type='cluster'``
-        when available. Fall back to :func:`_ols_cluster_robust` otherwise.
+        Use ``statsmodels.api.OLS`` for the coefficient + covariance
+        estimation when available. The p-value is **always** recomputed
+        from ``Student-t(df = n_clusters - 1)`` so the two code paths
+        agree exactly — statsmodels' default cluster path returns an
+        asymptotic-normal p-value that this function intentionally
+        overrides for consistency with the pure-numpy fallback.
 
     Returns
     -------
     A dict with ``alpha`` (control mean), ``beta`` (treatment − control),
     ``se_beta``, ``t_beta``, ``p_beta``, ``n_control``, ``n_treatment``,
-    ``n_clusters``, ``dof``. Always non-empty; degenerate inputs collapse
-    to NaN test statistics with ``test_valid=False``.
+    ``n_clusters``, ``dof``, ``test_valid``, ``small_cluster_warning``.
+    Degenerate inputs collapse to NaN test statistics with
+    ``test_valid=False``.
     """
+    from scipy.stats import t as student_t
+
     d = np.asarray(d, dtype=float)
     treatment = np.asarray(treatment, dtype=float)
     cluster_ids = np.asarray(cluster_ids)
@@ -185,55 +199,72 @@ def cluster_robust_difference_in_improvement(
     n_control = int((t == 0).sum())
     n_treat   = int((t == 1).sum())
     n_clusters = int(pd.unique(c).size) if len(c) else 0
+    small_cluster = bool(0 < n_clusters < SMALL_CLUSTER_THRESHOLD)
 
     base = {
-        "alpha":       float("nan"),
-        "beta":        float("nan"),
-        "se_beta":     float("nan"),
-        "t_beta":      float("nan"),
-        "p_beta":      float("nan"),
-        "n_control":   n_control,
-        "n_treatment": n_treat,
-        "n_clusters":  n_clusters,
-        "dof":         max(n_clusters - 1, 0),
-        "test_valid":  False,
+        "alpha":                  float("nan"),
+        "beta":                   float("nan"),
+        "se_beta":                float("nan"),
+        "t_beta":                 float("nan"),
+        "p_beta":                 float("nan"),
+        "n_control":              n_control,
+        "n_treatment":            n_treat,
+        "n_clusters":             n_clusters,
+        "dof":                    max(n_clusters - 1, 0),
+        "test_valid":             False,
+        "small_cluster_warning":  small_cluster,
     }
     if n_control < 2 or n_treat < 2 or n_clusters < 2:
         return base
 
     X = np.column_stack([np.ones_like(t), t])
+    dof = n_clusters - 1
 
+    # ── Estimate coefficient + cluster-robust SE ─────────────────
+    beta = None
+    se_beta = None
     if use_statsmodels:
         try:
             import statsmodels.api as sm
             model = sm.OLS(d, X).fit(
-                cov_type="cluster", cov_kwds={"groups": c, "use_correction": True},
+                cov_type="cluster",
+                cov_kwds={"groups": c, "use_correction": True},
             )
-            return {
-                **base,
-                "alpha":      float(model.params[0]),
-                "beta":       float(model.params[1]),
-                "se_beta":    float(model.bse[1]),
-                "t_beta":     float(model.tvalues[1]),
-                "p_beta":     float(model.pvalues[1]),
-                "test_valid": True,
-            }
+            beta    = float(model.params[1])
+            se_beta = float(model.bse[1])
+            alpha   = float(model.params[0])
         except Exception as exc:  # noqa: BLE001 — fall back to the numpy version
             get_logger().warning(
                 "diff_in_improvement: statsmodels OLS cluster path failed (%s); "
                 "falling back to numpy sandwich.", exc,
             )
+            beta = None
 
-    res = _ols_cluster_robust(d, X, c, small_sample=True)
+    if beta is None:
+        res = _ols_cluster_robust(d, X, c, small_sample=True)
+        alpha   = float(res["beta"][0])
+        beta    = float(res["beta"][1])
+        se_beta = float(res["se"][1])
+
+    # ── ALWAYS recompute t / p from Student-t(dof = n_clusters - 1) ──
+    # Both paths share this convention so the statsmodels and numpy
+    # results match bit-for-bit downstream.
+    if se_beta > 0:
+        t_stat = float(beta / se_beta)
+    else:
+        t_stat = 0.0
+    p_value = float(2.0 * student_t.sf(abs(t_stat), df=dof))
+
     return {
         **base,
-        "alpha":      float(res["beta"][0]),
-        "beta":       float(res["beta"][1]),
-        "se_beta":    float(res["se"][1]),
-        "t_beta":     float(res["t"][1]),
-        "p_beta":     float(res["pvalue"][1]),
-        "dof":        int(res["dof"]),
-        "test_valid": True,
+        "alpha":                 alpha,
+        "beta":                  beta,
+        "se_beta":               se_beta,
+        "t_beta":                t_stat,
+        "p_beta":                p_value,
+        "dof":                   dof,
+        "test_valid":            True,
+        "small_cluster_warning": small_cluster,
     }
 
 
@@ -242,6 +273,24 @@ def cluster_robust_difference_in_improvement(
 # ---------------------------------------------------------------------------
 
 H_HYPOTHESIS_FAMILIES = ("H1_incremental", "H2_volatility", "H3_market_cap")
+
+
+#: Complete v4 model-family identity columns used to match augmented vs
+#: ECON signals before the diff-in-improvement regression. A mismatch on
+#: any one of these would silently mix incompatible runs (e.g. an
+#: expanding-window ECON vs a rolling-fixed combined), so the columns
+#: form a strict join key. ``hpo_objective`` is included so a model
+#: tuned with brier_score is never lifted against a log_loss ECON.
+H2H3_FAMILY_COLUMNS = (
+    "horizon",
+    "model_type",
+    "panel_mode",
+    "hpo_variant",
+    "hpo_objective",
+    "train_window_mode",
+    "rolling_window_days",
+    "rolling_window_timestamps",
+)
 
 
 def difference_in_improvement_table(
@@ -286,13 +335,18 @@ def difference_in_improvement_table(
     """
     columns = [
         "hypothesis_family", "horizon", "set_id", "sentiment_model",
-        "model_type", "panel_mode", "hpo_variant",
+        "model_type", "panel_mode", "hpo_variant", "hpo_objective",
+        "train_window_mode", "rolling_window_days", "rolling_window_timestamps",
         "benchmark_set_id", "regime_col",
         "control_value", "treatment_value",
+        "n_augmented", "n_econ", "n_matched",
+        "n_unmatched_augmented", "n_unmatched_econ",
+        "n_duplicate_augmented_keys", "n_duplicate_econ_keys",
+        "targets_identical",
         "n_control", "n_treatment", "n_clusters",
         "mean_d_control", "mean_d_treatment",
         "diff_in_improvement", "se_diff", "t_stat", "p_value",
-        "dof", "test_valid",
+        "dof", "test_valid", "small_cluster_warning", "skip_reason",
     ]
     if signals is None or signals.empty:
         return pd.DataFrame(columns=columns)
@@ -302,58 +356,94 @@ def difference_in_improvement_table(
     df = signals.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df = df.dropna(subset=["timestamp"])
-    df["__join_date__"] = df["timestamp"].dt.normalize()
 
-    look = regime_lookup.copy()
-    if "date" in look.columns:
-        look["__join_date__"] = pd.to_datetime(look["date"], utc=True, errors="coerce")
-        if look["__join_date__"].isna().any():
-            # Tolerant fallback for tz-naive dates.
-            naive = pd.to_datetime(look["date"], errors="coerce")
-            look["__join_date__"] = naive.dt.tz_localize("UTC", nonexistent="shift_forward")
-    elif "timestamp" in look.columns:
-        look["__join_date__"] = pd.to_datetime(look["timestamp"], utc=True, errors="coerce").dt.normalize()
-    else:
-        raise ValueError(
-            "difference_in_improvement_table: regime_lookup must have a "
-            "'date' or 'timestamp' column."
-        )
-    look = look[["ticker", "__join_date__", regime_col]].copy()
+    look = _prepare_regime_lookup(regime_lookup, regime_col)
+
+    df["ticker"] = df["ticker"].astype(str).str.upper()
     look["ticker"] = look["ticker"].astype(str).str.upper()
-    df["ticker"]   = df["ticker"].astype(str).str.upper()
-    look = look.dropna(subset=["__join_date__", regime_col])
 
     rows: list[dict] = []
-    group_cols = ["horizon", "set_id", "sentiment_model", "model_type",
-                  "panel_mode", "hpo_variant"]
+    # Group augmented signals by COMPLETE family identity (Section D).
+    # Every column in H2H3_FAMILY_COLUMNS must match between augmented
+    # and ECON; partial matches were previously possible if only
+    # (horizon, model_type, panel_mode, hpo_variant) lined up but the
+    # training-window configurations diverged.
+    group_cols = list(H2H3_FAMILY_COLUMNS) + ["set_id", "sentiment_model"]
+    # Fill missing family columns on the model side with NaN so the
+    # groupby never silently drops a row.
+    for c in H2H3_FAMILY_COLUMNS:
+        if c not in df.columns:
+            df[c] = np.nan
     augmented_ids = set(matched_benchmark.keys())
+    augmented = df[df["set_id"].astype(str).isin(augmented_ids)]
 
-    for keys, aug_grp in df[df["set_id"].astype(str).isin(augmented_ids)].groupby(
-            group_cols, dropna=False):
-        horizon, set_id, sm, model_type, panel_mode, hpo_variant = keys
-        bench_set_id = matched_benchmark[str(set_id)]
+    for keys, aug_grp in augmented.groupby(group_cols, dropna=False):
+        ident = dict(zip(group_cols, keys))
+        bench_set_id = matched_benchmark[str(ident["set_id"])]
 
-        cand = df[
-            (df["horizon"] == horizon)
-            & (df["model_type"] == model_type)
-            & (df["panel_mode"] == panel_mode)
-            & (df["hpo_variant"].astype(str) == str(hpo_variant))
-            & (df["set_id"] == bench_set_id)
-        ]
+        # ECON candidate must share the complete family identity.
+        cand_mask = (df["set_id"] == bench_set_id)
+        for fam_col in H2H3_FAMILY_COLUMNS:
+            cand_mask &= _series_eq_nan_safe(df[fam_col], ident.get(fam_col))
+        cand = df[cand_mask]
+
+        diag_row = _empty_row(columns, ident, bench_set_id, hypothesis_family,
+                              regime_col, control_value, treatment_value)
+        diag_row["n_augmented"] = int(len(aug_grp))
+        diag_row["n_econ"]      = int(len(cand))
+
         if cand.empty:
+            diag_row["skip_reason"] = "no_matched_econ_family"
+            rows.append(diag_row)
+            continue
+
+        # ── Duplicate-key guard (Section D) ─────────────────────
+        dup_aug  = int(aug_grp.duplicated(subset=["ticker", "timestamp"]).sum())
+        dup_econ = int(cand.duplicated(subset=["ticker", "timestamp"]).sum())
+        diag_row["n_duplicate_augmented_keys"] = dup_aug
+        diag_row["n_duplicate_econ_keys"]      = dup_econ
+        if dup_aug or dup_econ:
+            diag_row["skip_reason"] = "duplicate_keys_within_family"
+            rows.append(diag_row)
             continue
 
         d_frame = observation_improvement_indicator(aug_grp, cand)
+        diag_row["n_matched"] = int(len(d_frame))
+        diag_row["n_unmatched_augmented"] = int(len(aug_grp) - len(d_frame))
+        diag_row["n_unmatched_econ"]      = int(len(cand)    - len(d_frame))
+
         if d_frame.empty:
+            diag_row["skip_reason"] = "no_matched_observations"
+            rows.append(diag_row)
             continue
 
+        # ── Target-equality verification (Section D) ────────────
+        # observation_improvement_indicator preserves the augmented-side
+        # target. Compare per (ticker, ts) with the ECON-side target.
+        bench_for_check = cand.merge(
+            d_frame[["ticker", "timestamp"]].drop_duplicates(),
+            on=["ticker", "timestamp"], how="inner",
+        ).sort_values(["ticker", "timestamp"]).reset_index(drop=True)
+        aug_for_check = d_frame.sort_values(["ticker", "timestamp"]).reset_index(drop=True)
+        targets_identical = bool(
+            (aug_for_check["target"].astype(int).values
+             == bench_for_check["target"].astype(int).values).all()
+        )
+        diag_row["targets_identical"] = targets_identical
+        if not targets_identical:
+            diag_row["skip_reason"] = "target_mismatch"
+            rows.append(diag_row)
+            continue
+
+        # ── Regime join ─────────────────────────────────────────
         d_frame = d_frame.copy()
-        d_frame["__join_date__"] = pd.to_datetime(
-            d_frame["timestamp"], utc=True, errors="coerce",
-        ).dt.normalize()
-        d_frame["ticker"] = d_frame["ticker"].astype(str).str.upper()
+        d_frame["__join_date__"] = _join_date_for_signals(
+            d_frame["timestamp"], regime_col,
+        )
         joined = d_frame.merge(look, on=["ticker", "__join_date__"], how="left")
         if joined[regime_col].isna().all():
+            diag_row["skip_reason"] = "no_regime_match"
+            rows.append(diag_row)
             continue
 
         treatment = joined[regime_col].map(
@@ -366,31 +456,109 @@ def difference_in_improvement_table(
         )
         d_ctrl = joined.loc[joined[regime_col] == control_value,   "d"]
         d_trt  = joined.loc[joined[regime_col] == treatment_value, "d"]
-        rows.append({
-            "hypothesis_family":      hypothesis_family,
-            "horizon":                horizon,
-            "set_id":                 set_id,
-            "sentiment_model":        sm,
-            "model_type":             model_type,
-            "panel_mode":             panel_mode,
-            "hpo_variant":            hpo_variant,
-            "benchmark_set_id":       bench_set_id,
-            "regime_col":             regime_col,
-            "control_value":          control_value,
-            "treatment_value":        treatment_value,
-            "n_control":              res["n_control"],
-            "n_treatment":            res["n_treatment"],
-            "n_clusters":             res["n_clusters"],
-            "mean_d_control":         float(d_ctrl.mean()) if not d_ctrl.empty else float("nan"),
-            "mean_d_treatment":       float(d_trt.mean())  if not d_trt.empty  else float("nan"),
-            "diff_in_improvement":    res["beta"],
-            "se_diff":                res["se_beta"],
-            "t_stat":                 res["t_beta"],
-            "p_value":                res["p_beta"],
-            "dof":                    res["dof"],
-            "test_valid":             res["test_valid"],
+        diag_row.update({
+            "n_control":             res["n_control"],
+            "n_treatment":           res["n_treatment"],
+            "n_clusters":            res["n_clusters"],
+            "mean_d_control":        float(d_ctrl.mean()) if not d_ctrl.empty else float("nan"),
+            "mean_d_treatment":      float(d_trt.mean())  if not d_trt.empty  else float("nan"),
+            "diff_in_improvement":   res["beta"],
+            "se_diff":               res["se_beta"],
+            "t_stat":                res["t_beta"],
+            "p_value":               res["p_beta"],
+            "dof":                   res["dof"],
+            "test_valid":            res["test_valid"],
+            "small_cluster_warning": res["small_cluster_warning"],
+            "skip_reason":           "" if res["test_valid"] else "too_few_clusters_or_obs",
         })
+        rows.append(diag_row)
     return pd.DataFrame(rows, columns=columns)
+
+
+def _series_eq_nan_safe(s: pd.Series, value) -> pd.Series:
+    """Elementwise equality that treats NaN==NaN as True (so a missing
+    rolling_window_timestamps on both sides counts as a match)."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return s.isna() | (s.astype(str).str.lower() == "nan")
+    try:
+        return s == value
+    except Exception:  # noqa: BLE001
+        return s.astype(str) == str(value)
+
+
+def _join_date_for_signals(timestamps: pd.Series, regime_col: str) -> pd.Series:
+    """Compute the regime-lookup join key from prediction timestamps.
+
+    The default for v4 regime lookups (volatility, market-cap) is daily.
+    To honour the "no future regime info enters earlier intraday
+    predictions" rule (Aufgabe 6 follow-up G), every prediction at time
+    t joins the regime from the **previous** calendar day's lookup —
+    the daily regime is known fully by 00:00 UTC of the next day, the
+    same convention used by the market-cap availability offset.
+    """
+    ts = pd.to_datetime(timestamps, utc=True, errors="coerce")
+    # Strict-as-of-yesterday: subtract one day before normalising, so
+    # an intraday 1h prediction on day D pairs with the regime from
+    # day D-1.
+    return (ts - pd.Timedelta(days=1)).dt.normalize()
+
+
+def _prepare_regime_lookup(regime_lookup: pd.DataFrame,
+                           regime_col: str) -> pd.DataFrame:
+    """Standardise the regime lookup to ``(ticker, __join_date__, regime_col)``.
+
+    The lookup is expected to carry a ``date`` (or ``timestamp``) column;
+    the helper normalises to tz-aware UTC midnight so the join key matches
+    :func:`_join_date_for_signals` exactly.
+    """
+    look = regime_lookup.copy()
+    if "date" in look.columns:
+        join_date = pd.to_datetime(look["date"], utc=True, errors="coerce")
+        if join_date.isna().any():
+            naive = pd.to_datetime(look["date"], errors="coerce")
+            join_date = naive.dt.tz_localize("UTC", nonexistent="shift_forward")
+        look["__join_date__"] = join_date.dt.normalize()
+    elif "timestamp" in look.columns:
+        look["__join_date__"] = pd.to_datetime(
+            look["timestamp"], utc=True, errors="coerce"
+        ).dt.normalize()
+    else:
+        raise ValueError(
+            "difference_in_improvement_table: regime_lookup must have a "
+            "'date' or 'timestamp' column."
+        )
+    look = look[["ticker", "__join_date__", regime_col]].copy()
+    return look.dropna(subset=["__join_date__", regime_col])
+
+
+def _empty_row(columns: list[str], ident: dict, bench_set_id,
+               hypothesis_family: str, regime_col: str,
+               control_value: str, treatment_value: str) -> dict:
+    """Default-zero / NaN diagnostic row that is later overwritten."""
+    row = {col: None for col in columns}
+    for k in ("set_id", "sentiment_model", "horizon", "model_type",
+              "panel_mode", "hpo_variant", "hpo_objective",
+              "train_window_mode", "rolling_window_days",
+              "rolling_window_timestamps"):
+        row[k] = ident.get(k)
+    row["hypothesis_family"] = hypothesis_family
+    row["benchmark_set_id"]  = bench_set_id
+    row["regime_col"]        = regime_col
+    row["control_value"]     = control_value
+    row["treatment_value"]   = treatment_value
+    for k in ("n_augmented", "n_econ", "n_matched",
+              "n_unmatched_augmented", "n_unmatched_econ",
+              "n_duplicate_augmented_keys", "n_duplicate_econ_keys",
+              "n_control", "n_treatment", "n_clusters", "dof"):
+        row[k] = 0
+    for k in ("mean_d_control", "mean_d_treatment", "diff_in_improvement",
+              "se_diff", "t_stat", "p_value"):
+        row[k] = float("nan")
+    row["targets_identical"]      = False
+    row["test_valid"]              = False
+    row["small_cluster_warning"]  = False
+    row["skip_reason"]             = ""
+    return row
 
 
 # ---------------------------------------------------------------------------

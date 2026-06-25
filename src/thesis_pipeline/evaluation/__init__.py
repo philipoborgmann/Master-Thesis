@@ -12,7 +12,7 @@ helpers:
 * :mod:`.metrics`        — pooled + per-ticker metrics + confusion diagnostics
 * :mod:`.thresholds`     — high-conviction threshold analysis
 * :mod:`.volatility`     — Garman-Klass daily variance + regime stratification
-* :mod:`.significance`   — continuity-corrected McNemar vs benchmark B1
+* :mod:`.significance`   — continuity-corrected McNemar vs the v4 matched ECON benchmark
 * :mod:`.reporting`      — Excel writer + CSV writer + console summary
 
 The top-level coordinator is :func:`evaluate_signals.main`.

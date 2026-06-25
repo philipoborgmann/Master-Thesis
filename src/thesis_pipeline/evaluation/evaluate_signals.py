@@ -7,7 +7,7 @@ modules so that each piece is independently testable:
 * :mod:`.metrics`        — pooled + per-ticker metrics + confusion diagnostics
 * :mod:`.thresholds`     — high-conviction threshold analysis + lift vs benchmark
 * :mod:`.volatility`     — Garman-Klass + tertile regime stratification
-* :mod:`.significance`   — continuity-corrected McNemar vs B1 / B2
+* :mod:`.significance`   — continuity-corrected McNemar vs ECON
 * :mod:`.market_cap`     — daily cross-sectional cap tertiles + interaction
 * :mod:`.economic`       — turnover/cost-aware backtest with risk metrics
 * :mod:`.reporting`      — Excel + CSV + console summary
@@ -108,8 +108,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Skip the turnover/cost-aware backtest step.")
     parser.add_argument("--no-regime-mcnemar", "--no_regime_mcnemar",
                         dest="no_regime_mcnemar", action="store_true",
-                        help="Skip the regime-specific (volatility / market-cap / "
-                             "interaction) McNemar tests.")
+                        help="Skip the SUPPLEMENTARY within-regime McNemar tests. "
+                             "Does NOT disable the H2/H3 headline "
+                             "difference-in-improvement layer — use "
+                             "--no-diff-in-improvement for that.")
+    parser.add_argument("--no-diff-in-improvement", "--no_diff_in_improvement",
+                        dest="no_diff_in_improvement", action="store_true",
+                        help="Skip the HEADLINE H2/H3 cluster-robust "
+                             "difference-in-improvement layer. Default ON when "
+                             "the corresponding regime lookup is available; "
+                             "independent of --no-regime-mcnemar.")
     parser.add_argument("--strict-feature-set-ids", "--strict_feature_set_ids",
                         dest="strict_feature_set_ids", action="store_true",
                         help="Only evaluate signal groups whose set_id appears in "
@@ -141,6 +149,7 @@ def run(*, horizon: str | None = None,
         force: bool = False, no_volatility: bool = False,
         no_market_cap: bool = False, no_economic: bool = False,
         no_regime_mcnemar: bool = False,
+        no_diff_in_improvement: bool = False,
         strict_feature_set_ids: bool = False,
         feature_config: str | None = None,
         backtest_config: str | None = None,
@@ -171,6 +180,8 @@ def run(*, horizon: str | None = None,
         argv.append("--no-economic")
     if no_regime_mcnemar:
         argv.append("--no-regime-mcnemar")
+    if no_diff_in_improvement:
+        argv.append("--no-diff-in-improvement")
     if strict_feature_set_ids:
         argv.append("--strict-feature-set-ids")
     return main(argv)
@@ -297,7 +308,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     threshold_df      = threshold_analysis_table(signals)
     threshold_lift_df = threshold_lift_table(signals, benchmarks=DEFAULT_BENCHMARKS)
 
-    # ── 5. McNemar significance vs B1 and B2 ────────────────────
+    # ── 5. McNemar significance vs the v4 matched benchmark (ECON) ──
     mcnemar_df_long = mcnemar_table(signals, benchmarks=DEFAULT_BENCHMARKS)
     mcnemar_wide_df = mcnemar_wide(mcnemar_df_long, benchmarks=DEFAULT_BENCHMARKS)
     if not pooled.empty and not mcnemar_wide_df.empty:
@@ -387,11 +398,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # ── 7c. H2 / H3 difference-in-improvement (Aufgabe 6.4) ─────
     # Cluster-robust regression of d_{i,t} = 1(aug correct) - 1(ECON correct)
-    # on a regime dummy, clustered by ticker. McNemar within regime stays
-    # in the supplementary table above; this block is the HEADLINE H2/H3
-    # test. BH correction runs within each family (H1, H2, H3) separately.
+    # on a regime dummy, clustered by ticker. The HEADLINE H2/H3 test is
+    # independent of the SUPPLEMENTARY within-regime McNemar block above:
+    # --no-regime-mcnemar suppresses ONLY the supplementary tests, while
+    # --no-diff-in-improvement suppresses this headline block. By default
+    # H2 runs whenever the volatility lookup is non-empty and H3 runs
+    # whenever the market-cap lookup is non-empty.
     diff_in_improvement_df = pd.DataFrame()
-    if not args.no_regime_mcnemar:
+    if not getattr(args, "no_diff_in_improvement", False):
         h_blocks: list[pd.DataFrame] = []
         if not vol_lookup.empty:
             vol_lk = vol_lookup.copy()
@@ -482,7 +496,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Append per-benchmark lift columns (sharpe / cumulative_return).
         if not economic_df.empty:
             economic_df = attach_benchmark_lifts(
-                economic_df, bcfg.get("benchmark_ids", ["B1", "B2"]),
+                economic_df, bcfg.get("benchmark_ids", ["ECON"]),
             )
 
     # ── 8b. Incremental sentiment value vs matched economic benchmark ──
@@ -582,7 +596,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         regime_mcnemar_summary=(regime_mcnemar_summary_df
                                 if not args.no_regime_mcnemar else None),
         diff_in_improvement=(diff_in_improvement_df
-                              if not args.no_regime_mcnemar else None),
+                              if not getattr(args, "no_diff_in_improvement",
+                                             False) else None),
         incremental_sentiment=incremental_df,
     )
     xlsx = write_excel_report(
@@ -601,7 +616,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         regime_mcnemar_summary=(regime_mcnemar_summary_df
                                 if not args.no_regime_mcnemar else None),
         diff_in_improvement=(diff_in_improvement_df
-                              if not args.no_regime_mcnemar else None),
+                              if not getattr(args, "no_diff_in_improvement",
+                                             False) else None),
         incremental_sentiment=incremental_df,
     )
     logger.info("evaluate-signals: wrote Excel report %s", xlsx)
