@@ -32,13 +32,23 @@ Validation invariants (unchanged from earlier versions)
   ``__rolling_probability__`` and uses ``run_rolling_probability`` —
   this is the NAIVE evaluation reference, not a v4 feature set.
 
-CLI is intentionally permissive about argument names so that
+CLI is intentionally permissive about argument names — both dashed and
+underscored spellings work, and the singular legacy ``--ticker`` /
+``--coin`` aliases route to the same destination as ``--coins``. All
+three of the following are equivalent and run the v4 canonical
+pipeline against the ECON feature set:
 
-    python Run_Models.py        --set_id B1 --ticker BTC
-    python scripts/run_models.py --set-id B1 --coins BTC ETH
-    python -m thesis_pipeline.cli run-models --set-id B1 --coins BTC ETH
+    python -m thesis_pipeline.modeling.run_models --set_id ECON --ticker BTC
+    python scripts/run_models.py                  --set-id ECON --coins BTC ETH
+    python -m thesis_pipeline.cli run-models      --set-id ECON --coins BTC ETH
 
-all work.
+The historical ``B1`` set was the rolling-probability benchmark; it is
+no longer a feature set in v4. ``B1`` was removed from the registry
+(see :data:`thesis_pipeline.features.feature_registry.REMOVED_SET_IDS`)
+and any ``--set-id B1`` invocation now raises a clear migration error —
+do not try to run ``--set-id B1``; the rolling-probability behaviour
+moved to the NAIVE evaluation reference in
+:mod:`thesis_pipeline.modeling.benchmarks`.
 """
 
 from __future__ import annotations
@@ -212,7 +222,11 @@ def run_walk_forward(df_ticker: pd.DataFrame,
             PER_ASSET, hpo_row_columns, predict_proba, tune_logistic_hyperparams,
         )
         hpo_config = hpo_config or {}
-        objective = hpo_config.get("objective", "brier_score")
+        # v4 canonical objective is log_loss. A caller that passes an
+        # `hpo_config` with no `objective` key (e.g. an old YAML, or a
+        # synthetic dict in a test) inherits the same v4 default as
+        # `load_hpo_config()` — never the v3 "brier_score" sentinel.
+        objective = hpo_config.get("objective", "log_loss")
         search_space = hpo_config.get("search_space", {})
 
     results = []
@@ -818,9 +832,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             # ── Benchmark: rolling probability ────────────────
             if is_benchmark:
                 # Rolling probability is not a tuned model; under --tune-hyperparams
-                # skip it so the fixed-C B1 parquet is never overwritten or
-                # mislabelled. The tuned families compare against the (tuned)
-                # logistic benchmark B2 instead, when present.
+                # skip it so the fixed-C benchmark parquet (the NAIVE evaluation
+                # reference produced by run_rolling_probability) is never
+                # overwritten or mislabelled. The tuned families are compared
+                # against the panel-logit ECON baseline in the v4 evaluation
+                # pipeline; the old B1/B2 sentinel comparisons no longer exist.
                 if tune_on:
                     print("→ SKIP (rolling-probability benchmark is not tuned)")
                     continue
