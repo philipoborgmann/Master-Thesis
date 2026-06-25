@@ -1,21 +1,22 @@
 """Matched economic-benchmark comparison for combined feature sets.
 
 The thesis asks whether sentiment adds **incremental** predictive value beyond
-the corresponding economic backbone. The simple B1 benchmark only answers
-"better than a lag-feature baseline". For every combined feature set C1–C6 we
-also need the stricter "did sentiment help **on top of** the economic-only
-predictors it shares with this combined set" comparison.
+the corresponding economic backbone. The v4 17-set registry holds exactly one
+economic-only benchmark — ``ECON`` — and every combined set
+(``ECON_VAD_*`` / ``ECON_CBT_*``) shares that backbone identically. The
+nested comparison is therefore "did the sentiment block help **on top of**
+the ECON core?" and the matched benchmark is always ``ECON``.
 
 This module is a **pure evaluation layer** — no model is retrained. We re-use
-the signal frames that ``run-models`` already produced for the economic
-benchmark sets E2 / E4 and inner-join them with the combined-set signal frames
-on ``(horizon, timestamp, ticker)`` within the same model family (same
-``model_type``, ``panel_mode``, training-window configuration and HPO
-variant).
+the signal frames that ``run-models`` already produced for ``ECON`` and the
+combined sets, inner-join them on ``(horizon, timestamp, ticker)`` within
+the same model family (same ``model_type`` / ``panel_mode`` / training-
+window configuration / HPO variant), and compute the McNemar test plus
+accuracy / Brier / log-loss lifts.
 
-The mapping is intentionally explicit (Option A in the spec): the C-set design
-is fixed and transparent, and a static dict makes the comparison auditable
-without an additional XLSX round-trip.
+This is the **primary H1 path** in v4 (Aufgabe 6.1). The legacy "vs B1 /
+vs B2" comparison was removed — ``B1`` is now the NAIVE evaluation reference
+(see :mod:`thesis_pipeline.modeling.benchmarks`), not a feature set.
 """
 
 from __future__ import annotations
@@ -35,30 +36,57 @@ from .significance import SIGNIFICANCE_ALPHA, mcnemar_continuity_corrected
 # Mapping
 # ---------------------------------------------------------------------------
 
-#: Matched economic-only benchmark for every combined / multi feature set.
-#:
-#: After the family refactor (with FinBERT removed), each combined / multi set
-#: ``X_k`` pairs benchmark level ``k`` with sentiment level ``k`` (using the
-#: hierarchical mapping from ``feature_sets.xlsx``), so the matched benchmark
-#: is simply ``B_k``:
-#:
-#: * ``C_k``  (Benchmark + CryptoBERT)         → ``B_k``
-#: * ``CV_k`` (Benchmark + VADER)              → ``B_k``
-#: * ``M_k``  (Benchmark + CryptoBERT + VADER) → ``B_k``
+#: Matched economic-only benchmark for every combined feature set in the
+#: v4 registry. Every ``ECON_{VAD,CBT}_{L,LD,DA,F}`` shares the same
+#: ``ECON`` core, so the matched benchmark is identical for the whole
+#: combined family — making the incremental-value comparison transparent
+#: ("did the sentiment block add information beyond ECON?").
 MATCHED_ECONOMIC_BENCHMARK: dict[str, str] = {
-    **{f"C{k}":  f"B{k}" for k in range(1, 7)},
-    **{f"CV{k}": f"B{k}" for k in range(1, 7)},
-    **{f"M{k}":  f"B{k}" for k in range(1, 7)},
+    **{f"ECON_VAD_{block}": "ECON" for block in ("L", "LD", "DA", "F")},
+    **{f"ECON_CBT_{block}": "ECON" for block in ("L", "LD", "DA", "F")},
 }
 
 
 def matched_economic_benchmark_for_combined(set_id: str) -> str | None:
     """Return the matched economic-only benchmark set_id for a combined set.
 
-    Returns ``None`` when ``set_id`` is not one of C1–C6 so the caller can
-    skip the row silently rather than crash.
+    Returns ``None`` when ``set_id`` is not one of the v4 ``ECON_*`` sets,
+    so the caller can skip the row silently rather than crash.
     """
     return MATCHED_ECONOMIC_BENCHMARK.get(str(set_id))
+
+
+# ---------------------------------------------------------------------------
+# NAIVE — separate evaluation reference (Aufgabe 6.3)
+# ---------------------------------------------------------------------------
+
+#: Canonical label for the historical-majority rolling-probability benchmark.
+#: NAIVE is a separate **evaluation reference** in v4 — never a feature set
+#: in :data:`~thesis_pipeline.features.feature_registry.SET_ID_PATTERN`. It
+#: answers a different question ("does the model beat the no-information
+#: rule?") from the H1 nested test ("does sentiment beat ECON?"). The two
+#: are reported side by side, never pooled.
+NAIVE_REFERENCE_LABEL = "NAIVE"
+
+
+def is_naive_signal_row(row: pd.Series) -> bool:
+    """True iff ``row`` is part of a rolling-probability NAIVE signal frame.
+
+    Two markers count:
+
+    * ``set_id`` is the canonical ``NAIVE`` label, or
+    * a ``benchmark_model`` column is present with a
+      ``"rolling_probability"`` substring (panel rolling-prob writes
+      ``"ticker_rolling_probability_with_pooled_fallback"``; per-asset
+      rolling-prob currently writes no such column but is identifiable
+      from its set_id label upstream).
+    """
+    if row is None:
+        return False
+    if str(row.get("set_id", "")).upper() == NAIVE_REFERENCE_LABEL:
+        return True
+    bm = str(row.get("benchmark_model", "") or "")
+    return "rolling_probability" in bm
 
 
 # ---------------------------------------------------------------------------

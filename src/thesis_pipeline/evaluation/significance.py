@@ -1,4 +1,4 @@
-"""Continuity-corrected McNemar test against one or more benchmarks.
+"""Continuity-corrected McNemar test against the v4 ECON benchmark.
 
 For every non-benchmark signal in categories ``{sentiment, combined}`` we
 match observations against the benchmark by ``(timestamp, ticker)`` and
@@ -10,9 +10,14 @@ compute:
 * p-value   = χ² survival function with 1 df
 * ``b + c == 0`` → ``p_value = 1.0``
 
-The thesis compares each candidate against both **B1** (rolling-probability
-benchmark) and **B2** (logistic on ``log_return_t`` only) to disambiguate
-"beats naive" from "beats minimal logistic".
+v4 (Aufgabe 6.1) uses a **single matched benchmark — ``ECON``** — for the
+primary H1 test ("does the sentiment block add information beyond the
+shared ECON core?"). The legacy ``B1 / B2`` comparison was removed:
+``B1`` is now the NAIVE evaluation reference, ``B2`` is folded into the
+v4 ECON information set, and neither is a v4 feature set. The
+``DEFAULT_BENCHMARKS`` tuple is therefore a single-element ``("ECON",)``.
+Callers that build synthetic benchmark frames (unit tests) can still pass
+any ``set_id`` they like via the ``benchmarks=`` kwarg.
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ from scipy.stats import chi2
 from ..logging_utils import get_logger
 from .metrics import GROUP_KEYS, FRONT_META, _front_order, ensure_group_columns
 
-DEFAULT_BENCHMARKS: tuple[str, ...] = ("B1", "B2")
+DEFAULT_BENCHMARKS: tuple[str, ...] = ("ECON",)
 # Categories eligible for benchmark comparisons (McNemar, threshold-lift,
 # economic-lift). After the family refactor + FinBERT removal:
 #
@@ -45,8 +50,8 @@ ELIGIBLE_CATEGORIES = (
 )
 SIGNIFICANCE_ALPHA = 0.05
 
-# Back-compat: some external callers still reference this name.
-BENCHMARK_SET_ID = "B1"
+# Single matched benchmark for the v4 primary H1 test.
+BENCHMARK_SET_ID = "ECON"
 
 # Columns identifying a model family. Benchmark matching is confined to a
 # single family so a panel-logit (or HPO) model is never silently compared
@@ -158,9 +163,10 @@ def mcnemar_table(signals: pd.DataFrame,
     (horizon × model_type × panel_mode × set × benchmark).
 
     The benchmark itself is excluded from the rows it benchmarks (you don't
-    test B1 against B1). Rows whose ``category`` is not in
-    :data:`ELIGIBLE_CATEGORIES` are skipped — i.e. economic-only sets do not
-    appear because the thesis question is about sentiment-augmented sets.
+    test ECON against ECON). Rows whose ``category`` is not in
+    :data:`ELIGIBLE_CATEGORIES` are skipped — i.e. ECON itself never appears
+    on the model side because the thesis H1 question is whether sentiment
+    adds value on top of ECON, not whether ECON beats itself.
 
     Benchmark matching is **confined to the same model family**
     (horizon + model_type + panel_mode). A panel-logit model is therefore

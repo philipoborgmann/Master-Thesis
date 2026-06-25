@@ -203,7 +203,7 @@ def _matched_lift(model_grp: pd.DataFrame,
 
 
 def threshold_lift_table(signals: pd.DataFrame,
-                         benchmarks: tuple[str, ...] = ("B1", "B2"),
+                         benchmarks: tuple[str, ...] = ("ECON",),
                          thresholds: tuple[float, ...] = DEFAULT_THRESHOLDS,
                          allow_cross_model_benchmark: bool = False,
                          ) -> pd.DataFrame:
@@ -236,7 +236,11 @@ def threshold_lift_table(signals: pd.DataFrame,
                 continue
             cats = grp["category"].dropna().astype(str)
             category = cats.iloc[0] if not cats.empty else ""
-            if category.lower() not in ("sentiment", "combined"):
+            # v4 categories: sentiment_vader / sentiment_cryptobert /
+            # combined_vader / combined_cryptobert / multi (and the legacy
+            # "sentiment" / "combined" literals from pre-v4 fixtures).
+            from .significance import ELIGIBLE_CATEGORIES
+            if category.lower() not in ELIGIBLE_CATEGORIES:
                 continue
             n_obs = int(len(grp))
             for t in thresholds:

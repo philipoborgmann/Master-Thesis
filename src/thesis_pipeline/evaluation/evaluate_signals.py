@@ -54,6 +54,12 @@ from .significance import (
     DEFAULT_BENCHMARKS, build_regime_mcnemar_summary,
     mcnemar_table, mcnemar_wide, regime_mcnemar_table,
 )
+from .diff_in_improvement import (
+    adjust_pvalues_bh_within_family,
+    difference_in_improvement_table,
+    H_HYPOTHESIS_FAMILIES,
+)
+from .incremental import MATCHED_ECONOMIC_BENCHMARK
 from .thresholds import threshold_analysis_table, threshold_lift_table
 from .volatility import build_regime_lookup, volatility_stratification_table
 
@@ -301,10 +307,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "panel_mode", "hpo_variant"],
             how="left",
         )
-    if "mcnemar_pval_vs_b1" in pooled.columns and "mcnemar_pval" not in pooled.columns:
-        pooled["mcnemar_stat"]              = pooled["mcnemar_stat_vs_b1"]
-        pooled["mcnemar_pval"]              = pooled["mcnemar_pval_vs_b1"]
-        pooled["significant_vs_benchmark"]  = pooled.get("significant_vs_b1", False)
+    # Back-compat aliases for downstream consumers that grep on the bare
+    # ``mcnemar_*`` columns. v4 uses ECON as the single matched benchmark,
+    # but we still mirror the disambiguated columns under the bare names
+    # (mirroring whatever benchmark the wide pivot actually populated).
+    _bench_alias_source = None
+    for _bid in DEFAULT_BENCHMARKS:
+        _src = f"mcnemar_pval_vs_{_bid.lower()}"
+        if _src in pooled.columns:
+            _bench_alias_source = _bid.lower()
+            break
+    if _bench_alias_source is not None and "mcnemar_pval" not in pooled.columns:
+        pooled["mcnemar_stat"]             = pooled[f"mcnemar_stat_vs_{_bench_alias_source}"]
+        pooled["mcnemar_pval"]             = pooled[f"mcnemar_pval_vs_{_bench_alias_source}"]
+        pooled["significant_vs_benchmark"] = pooled.get(
+            f"significant_vs_{_bench_alias_source}", False,
+        )
 
     tickers = sorted(signals["ticker"].dropna().astype(str).str.upper().unique())
 
@@ -366,6 +384,49 @@ def main(argv: Sequence[str] | None = None) -> int:
                 benchmarks=DEFAULT_BENCHMARKS,
             )
             regime_mcnemar_summary_df = build_regime_mcnemar_summary(regime_mcnemar_df)
+
+    # ── 7c. H2 / H3 difference-in-improvement (Aufgabe 6.4) ─────
+    # Cluster-robust regression of d_{i,t} = 1(aug correct) - 1(ECON correct)
+    # on a regime dummy, clustered by ticker. McNemar within regime stays
+    # in the supplementary table above; this block is the HEADLINE H2/H3
+    # test. BH correction runs within each family (H1, H2, H3) separately.
+    diff_in_improvement_df = pd.DataFrame()
+    if not args.no_regime_mcnemar:
+        h_blocks: list[pd.DataFrame] = []
+        if not vol_lookup.empty:
+            vol_lk = vol_lookup.copy()
+            if "regime" in vol_lk.columns and "vol_regime" not in vol_lk.columns:
+                vol_lk = vol_lk.rename(columns={"regime": "vol_regime"})
+            h_blocks.append(difference_in_improvement_table(
+                signals=signals,
+                matched_benchmark=MATCHED_ECONOMIC_BENCHMARK,
+                regime_lookup=vol_lk,
+                regime_col="vol_regime",
+                treatment_value="high",
+                control_value="low",
+                hypothesis_family="H2_volatility",
+            ))
+        if not mcap_lookup.empty:
+            mc_lk = mcap_lookup.copy()
+            if "regime" in mc_lk.columns and "mcap_regime" not in mc_lk.columns:
+                mc_lk = mc_lk.rename(columns={"regime": "mcap_regime"})
+            h_blocks.append(difference_in_improvement_table(
+                signals=signals,
+                matched_benchmark=MATCHED_ECONOMIC_BENCHMARK,
+                regime_lookup=mc_lk,
+                regime_col="mcap_regime",
+                treatment_value="small",
+                control_value="large",
+                hypothesis_family="H3_market_cap",
+            ))
+        if h_blocks:
+            diff_in_improvement_df = pd.concat(
+                [b for b in h_blocks if not b.empty], ignore_index=True,
+            )
+            if not diff_in_improvement_df.empty:
+                diff_in_improvement_df = adjust_pvalues_bh_within_family(
+                    diff_in_improvement_df,
+                )
 
     # ── 8. Economic / backtest layer ────────────────────────────
     economic_df      = pd.DataFrame()
@@ -520,6 +581,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         regime_mcnemar=(regime_mcnemar_df if not args.no_regime_mcnemar else None),
         regime_mcnemar_summary=(regime_mcnemar_summary_df
                                 if not args.no_regime_mcnemar else None),
+        diff_in_improvement=(diff_in_improvement_df
+                              if not args.no_regime_mcnemar else None),
         incremental_sentiment=incremental_df,
     )
     xlsx = write_excel_report(
@@ -537,6 +600,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         regime_mcnemar=(regime_mcnemar_df if not args.no_regime_mcnemar else None),
         regime_mcnemar_summary=(regime_mcnemar_summary_df
                                 if not args.no_regime_mcnemar else None),
+        diff_in_improvement=(diff_in_improvement_df
+                              if not args.no_regime_mcnemar else None),
         incremental_sentiment=incremental_df,
     )
     logger.info("evaluate-signals: wrote Excel report %s", xlsx)
