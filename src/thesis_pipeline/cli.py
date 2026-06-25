@@ -146,6 +146,14 @@ def _add_run_models_args(parser: argparse.ArgumentParser) -> None:
                         dest="rolling_window_days", type=float, default=180.0,
                         help="Rolling window in CALENDAR days (v4 default: "
                              "180). Identical wall-clock across 1d/6h/1h.")
+    parser.add_argument("--generate-naive-reference",
+                        "--generate_naive_reference",
+                        dest="generate_naive_reference",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Generate the NAIVE rolling-probability "
+                             "reference signal once per (horizon, family, "
+                             "window) configuration, independently of the "
+                             "feature-set grid (v4 default: ON).")
 
 
 # ---------------------------------------------------------------------------
@@ -361,8 +369,15 @@ def cmd_run_models(args: argparse.Namespace) -> int:
         argv += ["--model-type", args.model_type]
     if getattr(args, "panel_mode", None):
         argv += ["--panel-mode", args.panel_mode]
-    if getattr(args, "tune_hyperparams", False):
-        argv.append("--tune-hyperparams")
+    # ``--tune-hyperparams`` is BooleanOptionalAction with v4 default True.
+    # Forward the explicit positive OR negative form so the user's choice
+    # propagates through to modeling.run_models (rather than letting the
+    # downstream parser silently reapply its own default).
+    argv += (["--tune-hyperparams"] if getattr(args, "tune_hyperparams", True)
+             else ["--no-tune-hyperparams"])
+    argv += (["--generate-naive-reference"]
+             if getattr(args, "generate_naive_reference", True)
+             else ["--no-generate-naive-reference"])
     if getattr(args, "hpo_objective", None):
         argv += ["--hpo-objective", args.hpo_objective]
     if getattr(args, "hpo_config", None):

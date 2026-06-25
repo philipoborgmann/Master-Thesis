@@ -510,6 +510,18 @@ def build_parser() -> argparse.ArgumentParser:
                              "wall-clock across 1d / 6h / 1h horizons — "
                              "180 timestamps would mean ~180 days at 1d "
                              "but only 45 days at 6h and 7.5 days at 1h.")
+    # ── NAIVE reference auto-generation (Task 6 follow-up) ─────
+    parser.add_argument(
+        "--generate-naive-reference", "--generate_naive_reference",
+        dest="generate_naive_reference",
+        action=argparse.BooleanOptionalAction, default=True,
+        help="Generate the NAIVE rolling-probability reference signal once "
+             "per (horizon, model_type, panel_mode, training-window) "
+             "configuration, independently of the feature-set grid. "
+             "Default ON; use --no-generate-naive-reference to suppress. "
+             "NAIVE is never tuned and is never written into "
+             "feature_sets.xlsx.",
+    )
     return parser
 
 
@@ -642,6 +654,38 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # ── Alternative model family: delegate to the panel-logit module ──
     # The per-asset logic below is unchanged; panel_logit is purely additive.
+    # ── NAIVE auto-generation (Aufgabe 6 follow-up A) ─────────────
+    # NAIVE is never tuned and never lives in feature_sets.xlsx. Generate
+    # it once per (horizon × family × window) before the per-set loop so
+    # the evaluation layer can compare each ECON_* model to it as a
+    # separate absolute reference.
+    if (getattr(args, "generate_naive_reference", True)
+            and not getattr(args, "dry_run", False)):
+        from .naive_reference import generate_naive_reference
+        from ..logging_utils import get_logger
+        log = get_logger()
+        _horizons_to_naive = ([args.horizon] if args.horizon else list(HORIZONS))
+        for _hz in _horizons_to_naive:
+            try:
+                _written = generate_naive_reference(
+                    horizon=_hz,
+                    model_type=getattr(args, "model_type", "panel_logit") or "panel_logit",
+                    panel_mode=getattr(args, "panel_mode", "ticker_fixed_effects") or "ticker_fixed_effects",
+                    train_window_mode=getattr(args, "train_window", "rolling_fixed") or "rolling_fixed",
+                    rolling_window_timestamps=getattr(args, "rolling_window_timestamps", None),
+                    rolling_window_days=getattr(args, "rolling_window_days", 180.0),
+                    coins=getattr(args, "coins", None),
+                    output_dir=SIGNAL_DIR,
+                    resume=bool(getattr(args, "resume", True)),
+                    restart=bool(getattr(args, "restart", False)),
+                )
+                if _written is None:
+                    log.info("NAIVE reference cached or skipped for horizon=%s", _hz)
+                else:
+                    log.info("NAIVE reference written: %s", _written)
+            except Exception as exc:  # noqa: BLE001 — never break the main run
+                log.warning("NAIVE generation failed for horizon=%s: %s", _hz, exc)
+
     if getattr(args, "model_type", "per_asset") == "panel_logit":
         from .panel_logit import _run_panel
         return _run_panel(args, hpo_cfg=hpo_cfg)
@@ -1024,7 +1068,8 @@ def run(*, horizon: str | None = None, set_id: str | None = None,
         resume: bool = True,
         checkpoint_dir: str | None = None,
         checkpoint_chunk_size: int | None = None,
-        clear_checkpoints: bool = False) -> int:
+        clear_checkpoints: bool = False,
+        generate_naive_reference: bool = True) -> int:
     """Programmatic entry point. Translates keyword arguments to argv for
     :func:`main`. Prefer calling :func:`main` directly with an argv list.
 
@@ -1054,6 +1099,9 @@ def run(*, horizon: str | None = None, set_id: str | None = None,
     # ``--tune-hyperparams`` is BooleanOptionalAction in v4: emit the
     # explicit negative flag when the caller has turned it off.
     argv += ["--tune-hyperparams"] if tune_hyperparams else ["--no-tune-hyperparams"]
+    # ``--generate-naive-reference`` is also BooleanOptionalAction.
+    argv += (["--generate-naive-reference"] if generate_naive_reference
+             else ["--no-generate-naive-reference"])
     if hpo_objective:
         argv += ["--hpo-objective", hpo_objective]
     if train_window:
