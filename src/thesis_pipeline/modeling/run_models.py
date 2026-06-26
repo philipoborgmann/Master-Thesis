@@ -614,10 +614,37 @@ def _checkpointed_ticker_loop(tickers, df_all, compute_fn, *,
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
+def apply_smoke_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    """Resolve smoke-mode defaults in place — once, immediately after parse.
+
+    Aufgabe 6 follow-up B: this MUST run before any downstream resolution
+    (HPO config, NAIVE generation, dry-run logging, panel/per-asset
+    dispatch, filename construction, checkpoint construction). A bare
+    ``--smoke`` invocation must never iterate the full coin universe or
+    all horizons. Explicit user values always win over the smoke
+    defaults — only fields the user left empty are filled in.
+    """
+    if not getattr(args, "smoke", False):
+        return args
+    if not getattr(args, "horizon", None):
+        args.horizon = "1d"
+    if not getattr(args, "coins", None):
+        args.coins = ["BTC", "ETH"]
+    if not getattr(args, "set_id", None):
+        args.set_id = "ECON"
+    return args
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point used by the legacy ``Run_Models.py``, ``scripts/run_models.py``
     and the package CLI. Returns 0 on success."""
     args = build_parser().parse_args(argv)
+
+    # ── Smoke defaults FIRST (Aufgabe 6 follow-up B) ─────────────────
+    # Resolve --smoke before any HPO / NAIVE / dispatch / dry-run logic
+    # so a smoke run never leaks the full coin universe into NAIVE,
+    # checkpoint directories, or stage-header output.
+    args = apply_smoke_defaults(args)
 
     # ── Legacy-ID guard (v4 17-set registry refactor) ────────────────
     # The v4 registry replaces the old B/E/S/SV/C/CV/M/SC/SF families with
@@ -690,14 +717,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         from .panel_logit import _run_panel
         return _run_panel(args, hpo_cfg=hpo_cfg)
 
-    # ── Smoke defaults ──────────────────────────────────────────
-    if args.smoke:
-        if not args.horizon:
-            args.horizon = "1d"
-        if not args.coins:
-            args.coins = ["BTC", "ETH"]
-        if not args.set_id:
-            args.set_id = "ECON"
+    # Smoke defaults are already resolved by apply_smoke_defaults at the
+    # top of main(); no further per-asset-only smoke handling needed.
 
     # ── Checkpointing config ────────────────────────────────────
     ckpt_on   = bool(getattr(args, "checkpoint", True))

@@ -274,8 +274,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     # ── 2b. Optional strict feature-set-id filter ───────────────
     # Without the flag we evaluate every signal file on disk and let
     # economic_diagnostics.csv flag stale/legacy set_ids. With it, only
-    # set_ids registered in the active feature_sets.xlsx survive — useful
-    # when comparing across a fixed registry version.
+    # set_ids registered in the active feature_sets.xlsx (PLUS the
+    # documented evaluation references — NAIVE) survive. Aufgabe 6
+    # follow-up C: NAIVE is intentionally NOT a feature set in
+    # SET_ID_PATTERN, but it IS an explicitly allowed evaluation
+    # reference and must survive the filter alongside the 17-set grid.
     if args.strict_feature_set_ids:
         if "set_id" not in feature_sets.columns or feature_sets["set_id"].empty:
             logger.warning(
@@ -284,16 +287,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "would drop everything; ignoring the flag."
             )
         else:
+            from .incremental import NAIVE_REFERENCE_LABEL
             registered = set(feature_sets["set_id"].dropna().astype(str))
+            evaluation_refs = {NAIVE_REFERENCE_LABEL}
+            allowed = registered | evaluation_refs
             before_n = len(signals)
             present  = set(signals["set_id"].astype(str).unique())
-            stale    = sorted(present - registered)
-            signals  = signals[signals["set_id"].astype(str).isin(registered)]
+            stale    = sorted(present - allowed)
+            signals  = signals[signals["set_id"].astype(str).isin(allowed)]
             logger.info(
                 "evaluate-signals: --strict-feature-set-ids kept %d / %d rows "
-                "(%d set_ids in registry, %d dropped: %s)",
-                len(signals), before_n, len(registered), len(stale),
-                ", ".join(stale) if stale else "(none)",
+                "(%d registered feature-set IDs, %d evaluation references: %s, "
+                "%d stale IDs dropped: %s)",
+                len(signals), before_n, len(registered),
+                len(evaluation_refs), ", ".join(sorted(evaluation_refs)),
+                len(stale), ", ".join(stale) if stale else "(none)",
             )
             if signals.empty:
                 logger.warning("evaluate-signals: no signal rows survive strict "

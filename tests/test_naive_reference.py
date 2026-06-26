@@ -29,33 +29,42 @@ from thesis_pipeline.modeling import naive_reference as nr
 # ---------------------------------------------------------------------------
 
 def test_naive_output_name_per_asset_no_suffix():
-    assert nr.naive_output_name(model_type="per_asset") == "NAIVE"
+    h = nr.coin_universe_hash(["BTC", "ETH"])
+    assert nr.naive_output_name(
+        model_type="per_asset", coin_universe=["BTC", "ETH"],
+    ) == f"NAIVE_u_{h}"
 
 
 def test_naive_output_name_panel_pooled_expanding():
+    h = nr.coin_universe_hash(["BTC", "ETH"])
     assert nr.naive_output_name(
         model_type="panel_logit",
         panel_mode="pooled",
         train_window_mode="expanding",
-    ) == "NAIVE_panel_pooled"
+        coin_universe=["BTC", "ETH"],
+    ) == f"NAIVE_panel_pooled_u_{h}"
 
 
 def test_naive_output_name_panel_ticker_fe_rolling_180_days():
+    h = nr.coin_universe_hash(["BTC", "ETH"])
     assert nr.naive_output_name(
         model_type="panel_logit",
         panel_mode="ticker_fixed_effects",
         train_window_mode="rolling_fixed",
         rolling_window_days=180,
-    ) == "NAIVE_panel_ticker_fe_rw180d"
+        coin_universe=["BTC", "ETH"],
+    ) == f"NAIVE_panel_ticker_fe_rw180d_u_{h}"
 
 
 def test_naive_output_name_panel_pooled_rolling_timestamps():
+    h = nr.coin_universe_hash(["BTC", "ETH"])
     assert nr.naive_output_name(
         model_type="panel_logit",
         panel_mode="pooled",
         train_window_mode="rolling_fixed",
         rolling_window_timestamps=30,
-    ) == "NAIVE_panel_pooled_rw30"
+        coin_universe=["BTC", "ETH"],
+    ) == f"NAIVE_panel_pooled_rw30_u_{h}"
 
 
 def test_naive_output_name_does_not_carry_hpo_suffix():
@@ -67,6 +76,7 @@ def test_naive_output_name_does_not_carry_hpo_suffix():
         panel_mode="ticker_fixed_effects",
         train_window_mode="rolling_fixed",
         rolling_window_days=180,
+        coin_universe=["BTC", "ETH", "SOL"],
     )
     assert "hpo" not in name
 
@@ -121,7 +131,10 @@ def test_generate_naive_reference_writes_canonical_panel_signal(tmp_path):
         resume=True, restart=False,
     )
     assert out is not None and out.exists()
-    assert out.name == "NAIVE_panel_ticker_fe_rw180d.parquet"
+    expected = ("NAIVE_panel_ticker_fe_rw180d_u_"
+                + nr.coin_universe_hash(["BTC", "ETH", "SOL"])
+                + ".parquet")
+    assert out.name == expected
 
     sig = pd.read_parquet(out)
     assert not sig.empty
