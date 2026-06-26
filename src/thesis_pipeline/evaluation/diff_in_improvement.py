@@ -146,6 +146,14 @@ def _ols_cluster_robust(y: np.ndarray,
 #: thesis production setting with ~25 tickers the threshold is well clear.
 SMALL_CLUSTER_THRESHOLD = 10
 
+#: Numerical tolerance below which a cluster-robust SE is treated as
+#: zero (Section F). Anything below 1e-12 cannot be told apart from
+#: floating-point noise on real data, so we collapse it onto the
+#: exact-zero branch. Real cluster-robust SEs on the thesis data sit in
+#: the 1e-3 — 1e-1 range, so the tolerance is comfortably out of the
+#: way.
+ZERO_SE_TOLERANCE = 1e-12
+
 
 def cluster_robust_difference_in_improvement(
     d: np.ndarray,
@@ -213,8 +221,10 @@ def cluster_robust_difference_in_improvement(
         "dof":                    max(n_clusters - 1, 0),
         "test_valid":             False,
         "small_cluster_warning":  small_cluster,
+        "inference_skip_reason":  "",
     }
     if n_control < 2 or n_treat < 2 or n_clusters < 2:
+        base["inference_skip_reason"] = "too_few_clusters_or_obs"
         return base
 
     X = np.column_stack([np.ones_like(t), t])
@@ -246,14 +256,60 @@ def cluster_robust_difference_in_improvement(
         beta    = float(res["beta"][1])
         se_beta = float(res["se"][1])
 
-    # ── ALWAYS recompute t / p from Student-t(dof = n_clusters - 1) ──
-    # Both paths share this convention so the statsmodels and numpy
-    # results match bit-for-bit downstream.
-    if se_beta > 0:
-        t_stat = float(beta / se_beta)
+    # ── Zero / invalid SE policy (Section F) ─────────────────────
+    # The previous implementation mapped EVERY non-positive SE to
+    # (t=0, p=1), which is only correct when the effect is exactly
+    # zero too. We now split the cases honestly:
+    #
+    # * NaN / negative / infinite SE → not a valid test;
+    #   ``inference_skip_reason="invalid_cluster_robust_se"``.
+    # * SE == 0 (within tol) AND beta == 0 → exact null;
+    #   t=0, p=1 with ``test_valid=True``.
+    # * SE == 0 (within tol) AND beta != 0 → degenerate but informative
+    #   regression; we refuse to emit a t/p because Student-t is
+    #   undefined; ``inference_skip_reason="zero_cluster_robust_se_nonzero_effect"``.
+    # * Otherwise: t = beta / se, p from Student-t(df=n_clusters - 1).
+    #
+    # The tolerance is fixed at 1e-12 (well below any real cluster-
+    # robust SE on real data) — surfaced via ``ZERO_SE_TOLERANCE``.
+    inference_skip_reason = ""
+    if (se_beta is None
+            or (isinstance(se_beta, float) and not np.isfinite(se_beta))
+            or se_beta < 0.0):
+        return {
+            **base,
+            "alpha":                 alpha,
+            "beta":                  float(beta) if beta is not None else float("nan"),
+            "se_beta":               float(se_beta) if se_beta is not None else float("nan"),
+            "t_beta":                float("nan"),
+            "p_beta":                float("nan"),
+            "dof":                   dof,
+            "test_valid":            False,
+            "small_cluster_warning": small_cluster,
+            "inference_skip_reason": "invalid_cluster_robust_se",
+        }
+    if np.isclose(se_beta, 0.0, atol=ZERO_SE_TOLERANCE):
+        if np.isclose(beta, 0.0, atol=ZERO_SE_TOLERANCE):
+            t_stat  = 0.0
+            p_value = 1.0
+            test_valid = True
+        else:
+            return {
+                **base,
+                "alpha":                 alpha,
+                "beta":                  float(beta),
+                "se_beta":               float(se_beta),
+                "t_beta":                float("nan"),
+                "p_beta":                float("nan"),
+                "dof":                   dof,
+                "test_valid":            False,
+                "small_cluster_warning": small_cluster,
+                "inference_skip_reason": "zero_cluster_robust_se_nonzero_effect",
+            }
     else:
-        t_stat = 0.0
-    p_value = float(2.0 * student_t.sf(abs(t_stat), df=dof))
+        t_stat = float(beta / se_beta)
+        p_value = float(2.0 * student_t.sf(abs(t_stat), df=dof))
+        test_valid = True
 
     return {
         **base,
@@ -263,8 +319,9 @@ def cluster_robust_difference_in_improvement(
         "t_beta":                t_stat,
         "p_beta":                p_value,
         "dof":                   dof,
-        "test_valid":            True,
+        "test_valid":            test_valid,
         "small_cluster_warning": small_cluster,
+        "inference_skip_reason": inference_skip_reason,
     }
 
 
@@ -352,6 +409,9 @@ def difference_in_improvement_table(
         "share_unmatched_regime",
         "median_regime_lag_days",
         "min_regime_lag_days", "max_regime_lag_days",
+        "share_regime_lag_gt_1_day",
+        # Cluster-robust inference diagnostics (Section F).
+        "inference_skip_reason",
         "skip_reason",
     ]
     if signals is None or signals.empty:
@@ -456,31 +516,9 @@ def difference_in_improvement_table(
             d_frame["timestamp"], utc=True, errors="coerce",
         )
         joined = _asof_join_regime(d_frame, look, regime_col)
-        n_matched_regime = int(joined[regime_col].notna().sum())
-        share_unmatched = (
-            float(1.0 - n_matched_regime / max(len(joined), 1))
-            if len(joined) else 1.0
-        )
+        from .regime_join import regime_lag_summary
         diag_row["regime_match_strategy"] = "asof_backward_strict"
-        diag_row["share_unmatched_regime"] = share_unmatched
-        if n_matched_regime:
-            lag = (joined["timestamp"]
-                   - joined["regime_available_at"]).dt.total_seconds() / 86400.0
-            lag = lag.dropna()
-            diag_row["median_regime_lag_days"] = float(lag.median()) if len(lag) else float("nan")
-            diag_row["min_regime_lag_days"]    = float(lag.min())    if len(lag) else float("nan")
-            diag_row["max_regime_lag_days"]    = float(lag.max())    if len(lag) else float("nan")
-            # Strict-< availability assertion: every matched row must
-            # have the regime available strictly before the prediction
-            # timestamp. ``allow_exact_matches=False`` enforces this in
-            # the merge, but we re-assert here so a future refactor cannot
-            # silently relax the invariant.
-            matched_mask = joined[regime_col].notna()
-            assert (joined.loc[matched_mask, "regime_available_at"]
-                    < joined.loc[matched_mask, "timestamp"]).all(), (
-                "diff_in_improvement: regime_available_at must be strictly "
-                "before prediction timestamp for every matched row"
-            )
+        diag_row.update(regime_lag_summary(joined, regime_col=regime_col))
         if joined[regime_col].isna().all():
             diag_row["skip_reason"] = "no_regime_match"
             rows.append(diag_row)
@@ -496,6 +534,13 @@ def difference_in_improvement_table(
         )
         d_ctrl = joined.loc[joined[regime_col] == control_value,   "d"]
         d_trt  = joined.loc[joined[regime_col] == treatment_value, "d"]
+        # Propagate the inference-skip reason (Section F) so the CSV
+        # surfaces zero-SE / NaN-SE / negative-SE / infinite-SE / too-few-
+        # clusters cases distinctly instead of collapsing them all into
+        # the generic "too_few_clusters_or_obs" label.
+        inference_skip = res.get("inference_skip_reason", "") or ""
+        if not res["test_valid"] and not inference_skip:
+            inference_skip = "too_few_clusters_or_obs"
         diag_row.update({
             "n_control":             res["n_control"],
             "n_treatment":           res["n_treatment"],
@@ -509,7 +554,8 @@ def difference_in_improvement_table(
             "dof":                   res["dof"],
             "test_valid":            res["test_valid"],
             "small_cluster_warning": res["small_cluster_warning"],
-            "skip_reason":           "" if res["test_valid"] else "too_few_clusters_or_obs",
+            "inference_skip_reason": inference_skip,
+            "skip_reason":           "" if res["test_valid"] else inference_skip,
         })
         rows.append(diag_row)
     return pd.DataFrame(rows, columns=columns)
@@ -564,34 +610,13 @@ def _prepare_regime_lookup(regime_lookup: pd.DataFrame,
 def _asof_join_regime(signals: pd.DataFrame,
                       lookup: pd.DataFrame,
                       regime_col: str) -> pd.DataFrame:
-    """Availability-based as-of join: signal ⨝ latest regime with
-    ``regime_available_at < timestamp`` (strict ``<``).
-
-    Implements Section E of the v4 cleanup: replaces the fixed D-1
-    calendar shift with a per-ticker ``pd.merge_asof`` keyed on the
-    regime row's wall-clock availability timestamp.
+    """Thin wrapper around the shared
+    :func:`thesis_pipeline.evaluation.regime_join.attach_regime_asof`
+    helper (commit 3 Section E). Kept as a module-local symbol for the
+    diff-in-improvement tests that monkey-patch it.
     """
-    sig = signals.copy()
-    sig["timestamp"] = pd.to_datetime(sig["timestamp"], utc=True,
-                                       errors="coerce")
-    sig["ticker"] = sig["ticker"].astype(str).str.upper()
-    look = lookup.copy()
-    look["ticker"] = look["ticker"].astype(str).str.upper()
-    # ``merge_asof`` requires BOTH sides to be sorted by the ``on`` key
-    # globally; the ``by`` key only secondary-groups the comparison.
-    look = look.sort_values("regime_available_at").reset_index(drop=True)
-    sig_sorted = sig.sort_values("timestamp").reset_index()
-    joined = pd.merge_asof(
-        sig_sorted, look,
-        left_on="timestamp", right_on="regime_available_at",
-        by="ticker",
-        direction="backward",
-        allow_exact_matches=False,
-    )
-    # Restore the original signal-frame ordering so downstream alignment
-    # (the diff series ``d`` etc.) is not silently permuted.
-    joined = joined.sort_values("index").drop(columns=["index"]).reset_index(drop=True)
-    return joined
+    from .regime_join import attach_regime_asof
+    return attach_regime_asof(signals, lookup, regime_col=regime_col)
 
 
 def _empty_row(columns: list[str], ident: dict, bench_set_id,
@@ -618,12 +643,14 @@ def _empty_row(columns: list[str], ident: dict, bench_set_id,
               "se_diff", "t_stat", "p_value",
               "share_unmatched_regime",
               "median_regime_lag_days",
-              "min_regime_lag_days", "max_regime_lag_days"):
+              "min_regime_lag_days", "max_regime_lag_days",
+              "share_regime_lag_gt_1_day"):
         row[k] = float("nan")
     row["targets_identical"]      = False
     row["test_valid"]              = False
     row["small_cluster_warning"]  = False
     row["regime_match_strategy"]   = "asof_backward_strict"
+    row["inference_skip_reason"]   = ""
     row["skip_reason"]             = ""
     return row
 

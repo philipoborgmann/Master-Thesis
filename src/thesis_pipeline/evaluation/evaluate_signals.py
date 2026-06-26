@@ -225,6 +225,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         outputs.append(out_root / "regime_mcnemar_tests.csv")
         outputs.append(out_root / "regime_mcnemar_summary.csv")
 
+    # Universe-aware diagnostics for the dry-run (commit 3 Section H).
+    from .naive_comparison import (
+        NAIVE_IDENTITY_COLUMNS as _abs_identity,
+        HYPOTHESIS_FAMILY as _abs_family,
+        ABSOLUTE_BENCHMARK_ROLE as _abs_role,
+    )
     log_stage_header(
         "evaluate_signals",
         mode="dry-run" if args.dry_run else ("smoke" if args.smoke else "full"),
@@ -240,8 +246,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             "no_diff_in_improvement": getattr(args, "no_diff_in_improvement", False),
             "strict_feature_set_ids": args.strict_feature_set_ids,
             "strict_filter_keeps_naive": True,
+            # Section E — every regime consumer is on the shared
+            # availability-based strict-< as-of join.
+            "regime_join_strategy": "availability-based strict backward as-of",
             "regime_match_strategy": "asof_backward_strict",
-            "absolute_vs_naive_csv": str(out_root / "absolute_vs_naive.csv"),
+            # Section H — surface the absolute_vs_naive identity columns
+            # AND the legacy-fallback flag in the dry-run so users can see
+            # the exact contract upfront.
+            "absolute_vs_naive_csv":        str(out_root / "absolute_vs_naive.csv"),
+            "absolute_vs_naive_hypothesis_family": _abs_family,
+            "absolute_vs_naive_benchmark_role":   _abs_role,
+            "absolute_vs_naive_identity_columns": ",".join(_abs_identity),
+            "legacy_universe_fallback_enabled":   True,
             "transaction_cost_bps":  args.transaction_cost_bps or "(from config)",
             "backtest_config":       args.backtest_config or "(default)",
             "force":                 args.force,

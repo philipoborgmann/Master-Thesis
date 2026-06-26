@@ -116,10 +116,74 @@ NAIVE_BENCHMARK_PER_ASSET = "per_asset_rolling_probability"
 #: giving a 32-bit collision space.
 COIN_UNIVERSE_HASH_LEN = 8
 
+#: Cache-format version embedded in every sidecar JSON. Bump this when
+#: the sidecar schema changes so older caches are invalidated
+#: automatically on the next run. Schema v2 (this version) introduced
+#: the requested-vs-realized ticker split.
+CACHE_SCHEMA_VERSION = 2
+
+#: Label written onto every NAIVE signal row identifying the source of
+#: its universe identity. Production NAIVE signals always carry
+#: ``"requested_metadata"`` — the universe is fixed by the run config,
+#: not inferred from the rows that happened to materialise. The
+#: ``"legacy_realized_tickers_fallback"`` value is reserved for
+#: backwards-compatibility paths in the evaluation layer.
+UNIVERSE_IDENTITY_SOURCE_REQUESTED = "requested_metadata"
+UNIVERSE_IDENTITY_SOURCE_LEGACY = "legacy_realized_tickers_fallback"
+
 
 # ---------------------------------------------------------------------------
 # Coin universe + identity helpers
 # ---------------------------------------------------------------------------
+
+def stamp_universe_metadata(df: pd.DataFrame,
+                            *,
+                            requested_universe: Iterable[str] | None,
+                            source: str = UNIVERSE_IDENTITY_SOURCE_REQUESTED,
+                            ) -> pd.DataFrame:
+    """Stamp the requested-vs-realized universe identity onto every row.
+
+    Used by both the NAIVE generator and the production model writers
+    so the same hashing helper (and the same column layout) feeds the
+    matching identity downstream in
+    :mod:`thesis_pipeline.evaluation.naive_comparison`.
+
+    Parameters
+    ----------
+    df
+        Long-form signal frame. Must carry ``ticker``.
+    requested_universe
+        The universe resolved from ``--coins`` (or the feature-frame
+        ticker set when no coin filter was given). ``None`` is allowed
+        only for legacy-fallback callers.
+    source
+        Provenance label written into ``universe_identity_source``.
+        Production v4 outputs always use ``"requested_metadata"``; the
+        ``"legacy_realized_tickers_fallback"`` value is reserved for
+        evaluation-time inference on historical files.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    requested_tuple = (
+        normalize_coin_universe(requested_universe)
+        if requested_universe is not None else tuple()
+    )
+    realized_tuple = normalize_coin_universe(
+        out["ticker"].astype(str).unique() if "ticker" in out.columns else []
+    )
+    req_hash = coin_universe_hash(requested_tuple) if requested_tuple else ""
+    rea_hash = coin_universe_hash(realized_tuple) if realized_tuple else ""
+    out["coin_universe_hash"]            = req_hash or rea_hash
+    out["requested_coin_universe_hash"]  = req_hash
+    out["n_requested_tickers"]           = int(len(requested_tuple))
+    out["requested_tickers"]             = "|".join(requested_tuple)
+    out["realized_coin_universe_hash"]   = rea_hash
+    out["n_realized_tickers"]            = int(len(realized_tuple))
+    out["realized_tickers"]              = "|".join(realized_tuple)
+    out["universe_identity_source"]      = source
+    return out
+
 
 def normalize_coin_universe(tickers: Iterable[str] | None) -> tuple[str, ...]:
     """Canonical sorted-set tuple of uppercase ticker symbols.
@@ -274,7 +338,14 @@ def _attach_naive_metadata(sig: pd.DataFrame,
                            rolling_window_timestamps: int | None,
                            rolling_window_days: float | None,
                            coin_universe_tuple: tuple[str, ...]) -> pd.DataFrame:
-    """Stamp the canonical NAIVE metadata columns onto a signal frame."""
+    """Stamp the canonical NAIVE metadata columns onto a signal frame.
+
+    Each row carries BOTH the requested-universe identity (immutable —
+    derived from ``--coins`` or the feature-frame universe) and the
+    realized-universe identity (the tickers actually present in the
+    output). The ``coin_universe_hash`` column aliases the requested
+    hash so existing consumers keep matching by request identity.
+    """
     out = sig.copy()
     out["set_id"]          = NAIVE_SET_ID
     out["sentiment_model"] = NAIVE_SENTIMENT_MODEL
@@ -285,13 +356,6 @@ def _attach_naive_metadata(sig: pd.DataFrame,
     out["hpo_objective"]   = "-"
     out["hpo_variant"]     = NAIVE_HPO_VARIANT
     out["train_window_mode"] = train_window_mode
-    # Only stamp the REQUESTED rolling window when the per-row window meta
-    # is actually rolling_fixed. The per-asset path returns the actual
-    # window used per row; we mirror that into the rolling_* columns
-    # rather than blindly broadcasting the request (Aufgabe 6 follow-up D).
-    if "train_window_mode" in sig.columns and (sig["train_window_mode"] == train_window_mode).all():
-        # Per-row metadata already correct from select_panel_train_window.
-        pass
     if rolling_window_days is not None:
         out["rolling_window_days"] = rolling_window_days
     else:
@@ -300,9 +364,21 @@ def _attach_naive_metadata(sig: pd.DataFrame,
         out["rolling_window_timestamps"] = rolling_window_timestamps
     if "benchmark_model" not in out.columns:
         out["benchmark_model"] = NAIVE_BENCHMARK_PANEL
-    out["coin_universe_hash"]  = coin_universe_hash(coin_universe_tuple)
-    out["n_requested_tickers"] = int(len(coin_universe_tuple))
-    out["requested_tickers"]   = "|".join(coin_universe_tuple)
+    # Requested-universe identity (immutable).
+    requested_hash = coin_universe_hash(coin_universe_tuple)
+    out["coin_universe_hash"]            = requested_hash
+    out["requested_coin_universe_hash"]  = requested_hash
+    out["n_requested_tickers"]           = int(len(coin_universe_tuple))
+    out["requested_tickers"]             = "|".join(coin_universe_tuple)
+    # Realized-universe identity (derived from the produced rows).
+    realized = normalize_coin_universe(
+        out["ticker"].astype(str).unique() if "ticker" in out.columns else []
+    )
+    realized_hash = coin_universe_hash(realized) if realized else ""
+    out["realized_coin_universe_hash"] = realized_hash
+    out["n_realized_tickers"]          = int(len(realized))
+    out["realized_tickers"]            = "|".join(realized)
+    out["universe_identity_source"]    = UNIVERSE_IDENTITY_SOURCE_REQUESTED
     return out
 
 
@@ -310,20 +386,45 @@ def _build_identity_payload(*, horizon: str, model_type: str,
                             panel_mode: str, train_window_mode: str,
                             rolling_window_days: float | None,
                             rolling_window_timestamps: int | None,
-                            coin_universe_tuple: tuple[str, ...]) -> dict:
+                            coin_universe_tuple: tuple[str, ...],
+                            realized_universe_tuple: tuple[str, ...] | None = None,
+                            ) -> dict:
+    """Schema-v2 sidecar payload (Section A + G).
+
+    Distinguishes the REQUESTED universe (immutable, derived from
+    ``--coins`` or the feature-frame ticker set) from the REALIZED
+    universe (tickers that actually produced predictions — may be a
+    proper subset of requested when a coin lacked training data).
+
+    ``coin_universe_hash`` is retained as an alias for
+    ``requested_coin_universe_hash`` so older readers keep working.
+    """
+    requested = tuple(coin_universe_tuple)
+    realized = tuple(realized_universe_tuple) if realized_universe_tuple is not None else ()
     return {
-        "horizon": str(horizon),
-        "model_type": str(model_type),
-        "panel_mode": str(panel_mode) if str(model_type) == "panel_logit" else "-",
-        "train_window_mode": str(train_window_mode),
-        "rolling_window_days": (None if rolling_window_days is None
-                                 else float(rolling_window_days)),
+        "cache_schema_version":     CACHE_SCHEMA_VERSION,
+        "horizon":                  str(horizon),
+        "model_type":               str(model_type),
+        "panel_mode":               (str(panel_mode)
+                                     if str(model_type) == "panel_logit" else "-"),
+        "train_window_mode":        str(train_window_mode),
+        "rolling_window_days":      (None if rolling_window_days is None
+                                     else float(rolling_window_days)),
         "rolling_window_timestamps": (None if rolling_window_timestamps is None
                                        else int(rolling_window_timestamps)),
-        "coin_universe": list(coin_universe_tuple),
-        "coin_universe_hash": coin_universe_hash(coin_universe_tuple),
-        "n_requested_tickers": int(len(coin_universe_tuple)),
-        "set_id": NAIVE_SET_ID,
+        # Requested universe — the cache key proper.
+        "requested_tickers":            list(requested),
+        "requested_coin_universe_hash": coin_universe_hash(requested),
+        "n_requested_tickers":          int(len(requested)),
+        # Realized universe — recorded for validation against the parquet.
+        "realized_tickers":            list(realized),
+        "realized_coin_universe_hash": coin_universe_hash(realized) if realized else "",
+        "n_realized_tickers":          int(len(realized)),
+        # Legacy aliases (alias the REQUESTED side).
+        "coin_universe":      list(requested),
+        "coin_universe_hash": coin_universe_hash(requested),
+        # Constants.
+        "set_id":      NAIVE_SET_ID,
         "hpo_variant": NAIVE_HPO_VARIANT,
     }
 
@@ -350,12 +451,26 @@ def _atomic_write_json(payload: dict, path: Path) -> None:
 
 
 def _cache_is_valid(parquet_path: Path, expected: dict) -> bool:
-    """Reuse the cached NAIVE parquet only if its sidecar metadata and
-    stored ticker set match the request EXACTLY.
+    """Strict schema-v2 NAIVE cache validation (Section A + G).
 
-    Any mismatch — missing sidecar, hash mismatch, drifted ticker set,
-    incompatible window config, corrupted parquet — invalidates the
-    cache and forces a recompute.
+    A cached NAIVE parquet is reusable only when EVERY check below
+    passes:
+
+    1. parquet file exists and is readable + non-empty;
+    2. sidecar metadata exists and parses as JSON;
+    3. ``cache_schema_version`` matches :data:`CACHE_SCHEMA_VERSION`;
+    4. all identity fields (horizon, model_type, panel_mode, training
+       window configuration) match the request;
+    5. the stored REQUESTED ticker set equals the expected requested
+       set, and the stored requested hash matches the expected hash;
+    6. the parquet's actual ticker set equals the stored REALIZED set
+       AND is a subset of the expected requested set.
+
+    Importantly, the cache is NOT considered valid merely because the
+    stored and requested ticker sets overlap (the previous tautological
+    rule). A realized subset of the requested universe is allowed —
+    some tickers may legitimately produce no signals — but the stored
+    requested set must equal the expected requested set exactly.
     """
     if not parquet_path.exists():
         return False
@@ -366,32 +481,60 @@ def _cache_is_valid(parquet_path: Path, expected: dict) -> bool:
         stored = json.loads(meta_path.read_text())
     except Exception:  # noqa: BLE001
         return False
+    if int(stored.get("cache_schema_version", 0)) != CACHE_SCHEMA_VERSION:
+        return False
     for key in ("horizon", "model_type", "panel_mode", "train_window_mode",
-                "rolling_window_days", "rolling_window_timestamps",
-                "coin_universe_hash"):
+                "rolling_window_days", "rolling_window_timestamps"):
         if stored.get(key) != expected.get(key):
             return False
-    if sorted(map(str, stored.get("coin_universe", []))) != sorted(
-            map(str, expected.get("coin_universe", []))):
+    # ── Requested universe must match exactly ──────────────────
+    stored_requested = set(map(str, stored.get("requested_tickers", []) or []))
+    expected_requested = set(map(str, expected.get("requested_tickers", []) or []))
+    if not expected_requested:
+        # Defensive: the helper should never produce an empty requested
+        # universe in practice — fail safe to recompute.
         return False
-    # Re-open the parquet to make sure it isn't corrupted.
+    if stored_requested != expected_requested:
+        return False
+    if stored.get("requested_coin_universe_hash") != expected.get(
+            "requested_coin_universe_hash"):
+        return False
+    # ── Re-open the parquet to detect corruption ───────────────
     try:
         df = pd.read_parquet(parquet_path)
     except Exception:  # noqa: BLE001
         return False
-    if df.empty:
+    if df.empty or "ticker" not in df.columns:
         return False
-    # The stored ticker set must agree with the parquet contents — defends
-    # against a metadata file that's been tampered with.
     actual_tickers = set(df["ticker"].astype(str).str.upper().unique())
-    expected_tickers = set(map(str, expected.get("coin_universe", [])))
-    if expected_tickers and not actual_tickers.issubset(
-            expected_tickers | actual_tickers
-    ):  # tautology guards against pandas oddities, kept for clarity
+    if not actual_tickers:
         return False
-    if expected_tickers and not actual_tickers.intersection(expected_tickers):
+    # ── Realized universe MUST be a subset of requested ────────
+    if not actual_tickers.issubset(expected_requested):
+        return False
+    # ── Sidecar's realized set must agree with the parquet ─────
+    stored_realized = set(map(str, stored.get("realized_tickers", []) or []))
+    if stored_realized != actual_tickers:
         return False
     return True
+
+
+def _purge_stale_tmp_files(parquet_path: Path) -> None:
+    """Remove any leftover ``*.tmp`` files next to a cache target.
+
+    Atomic-replace failures from earlier runs (or interrupted writes)
+    can leave ``<stem>.parquet.tmp`` / ``<stem>.meta.json.tmp`` behind;
+    they never block a fresh write but are nice to scrub before
+    rewriting.
+    """
+    for tmp in (
+        parquet_path.with_suffix(parquet_path.suffix + ".tmp"),
+        _meta_path_for(parquet_path).with_suffix(".json.tmp"),
+    ):
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -468,7 +611,11 @@ def generate_naive_reference(*,
     )
     out_path = out_dir / f"{name}.parquet"
 
-    expected_identity = _build_identity_payload(
+    # ── Cache validation (Section A + G) ───────────────────────
+    # The expected_identity payload used for validation only carries
+    # the requested universe; we rebuild it with the realized universe
+    # once the run produces signals so the sidecar records both sides.
+    expected_for_validation = _build_identity_payload(
         horizon=horizon, model_type=model_type, panel_mode=panel_mode,
         train_window_mode=train_window_mode,
         rolling_window_days=rolling_window_days,
@@ -476,9 +623,12 @@ def generate_naive_reference(*,
         coin_universe_tuple=requested,
     )
 
-    # ── Cache validation (Section G) ───────────────────────────
-    if not restart and resume and _cache_is_valid(out_path, expected_identity):
+    if not restart and resume and _cache_is_valid(out_path, expected_for_validation):
         return None  # cache hit; caller decides what to log
+
+    # Stale partial-write residue (if any) is scrubbed before the
+    # recompute. Atomic replace is still the primary guarantee.
+    _purge_stale_tmp_files(out_path)
 
     # ── Run the appropriate rolling-probability path ───────────
     if str(model_type) == "panel_logit":
@@ -512,6 +662,19 @@ def generate_naive_reference(*,
         rolling_window_days=rolling_window_days,
         coin_universe_tuple=requested,
     )
+    realized = normalize_coin_universe(
+        out["ticker"].astype(str).unique() if "ticker" in out.columns else []
+    )
+    # Final sidecar carries BOTH the requested universe (cache key) and
+    # the realized universe (validated against the parquet on hit).
+    sidecar = _build_identity_payload(
+        horizon=horizon, model_type=model_type, panel_mode=panel_mode,
+        train_window_mode=train_window_mode,
+        rolling_window_days=rolling_window_days,
+        rolling_window_timestamps=rolling_window_timestamps,
+        coin_universe_tuple=requested,
+        realized_universe_tuple=realized,
+    )
     _atomic_write_parquet(out, out_path)
-    _atomic_write_json(expected_identity, _meta_path_for(out_path))
+    _atomic_write_json(sidecar, _meta_path_for(out_path))
     return out_path

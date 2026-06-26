@@ -749,6 +749,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             if tune_on:
                 _base = f"{_base}_{hpo_variant}"
             out_name_example = f"Outputs/Signals/{args.horizon or '<horizon>'}/{_base}.parquet"
+        # Universe identity preview (commit 3 Section H). Resolve the
+        # requested universe up-front so the dry-run reports the same
+        # hash + expected NAIVE filename the real run would produce.
+        from .naive_reference import (
+            normalize_coin_universe as _nu,
+            coin_universe_hash as _nu_hash,
+            naive_output_name as _nu_name,
+            CACHE_SCHEMA_VERSION as _nu_cache_v,
+        )
+        _req_universe = _nu(args.coins) if args.coins else tuple()
+        _req_hash = _nu_hash(_req_universe) if _req_universe else "(resolved at run-time)"
+        _naive_name = _nu_name(
+            model_type=getattr(args, "model_type", "panel_logit") or "panel_logit",
+            panel_mode=getattr(args, "panel_mode", "ticker_fixed_effects") or "ticker_fixed_effects",
+            train_window_mode=getattr(args, "train_window", "rolling_fixed") or "rolling_fixed",
+            rolling_window_timestamps=getattr(args, "rolling_window_timestamps", None),
+            rolling_window_days=getattr(args, "rolling_window_days", 180.0),
+            coin_universe=_req_universe or None,
+        )
+
         log_stage_header(
             "run_models",
             mode="dry-run" if args.dry_run else ("smoke" if args.smoke else "full"),
@@ -758,6 +778,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "horizon":         args.horizon or "(all)",
                 "set_id":          args.set_id or "(all)",
                 "coins":           list(args.coins) if args.coins else "(all)",
+                "requested_tickers":            list(_req_universe) or "(all from features)",
+                "requested_coin_universe_hash": _req_hash,
+                "expected_naive_filename":      f"{_naive_name}.parquet",
+                "naive_cache_schema_version":   _nu_cache_v,
                 "sentiment_model": args.sentiment_model or "(per set_id default)",
                 "C":               args.C,
                 "restart":         args.restart,
@@ -925,6 +949,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
                 if all_signals:
                     signals = pd.concat(all_signals, ignore_index=True)
+                    # Universe identity stamp (commit 3 Section B).
+                    from .naive_reference import stamp_universe_metadata
+                    signals = stamp_universe_metadata(
+                        signals, requested_universe=tickers,
+                    )
                     signals.to_parquet(out_path, index=False, engine="pyarrow")
                     if ckpt_on:
                         mf = ckpt.load_manifest(root)
@@ -995,6 +1024,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # so the concat (whether freshly computed or rebuilt purely from
                 # checkpoints) is the complete final signal frame.
                 signals = pd.concat(all_signals, ignore_index=True)
+                # Universe identity stamp (commit 3 Section B).
+                from .naive_reference import stamp_universe_metadata
+                signals = stamp_universe_metadata(
+                    signals, requested_universe=tickers,
+                )
                 signals.to_parquet(out_path, index=False, engine="pyarrow")
                 if ckpt_on:
                     mf = ckpt.load_manifest(root)

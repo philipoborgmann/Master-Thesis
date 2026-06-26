@@ -288,34 +288,52 @@ def _attach_date(signals: pd.DataFrame) -> pd.DataFrame:
 
 def attach_regimes(signals: pd.DataFrame,
                    regime_lookup: pd.DataFrame) -> pd.DataFrame:
-    """Left-merge ``regime`` onto signals via ``(ticker, date)``.
+    """Availability-based per-ticker as-of join (commit 3 Section E).
 
-    Both sides are normalised to UTC midnight (``datetime64[ns, UTC]``) so the
-    join is dtype-stable. Logs a warning when the join produces zero matches
-    despite the lookup being non-empty — that is the symptom the user hit on
-    real data.
+    Delegates to the shared :func:`thesis_pipeline.evaluation
+    .regime_join.attach_regime_asof` helper so every production regime
+    consumer uses the same strict-< availability semantics. The
+    diagnostics columns (source date, availability instant, effective
+    lag) are prefixed with ``vol`` so an enriched frame can also carry
+    market-cap diagnostics under the ``mcap`` prefix without collision.
+
+    The returned frame keeps the legacy ``regime`` column name — callers
+    that historically read ``regime`` keep working — while exposing the
+    same data via ``vol_regime`` for the supplementary McNemar path.
     """
+    from .regime_join import attach_regime_asof
+
     if signals.empty:
         return signals
-    if regime_lookup is None or regime_lookup.empty:
-        out = _attach_date(signals)
-        out["regime"] = np.nan
-        return out
     sig = _attach_date(signals)
+    if regime_lookup is None or regime_lookup.empty:
+        out = sig.copy()
+        out["regime"] = np.nan
+        out["vol_regime"] = np.nan
+        out["vol_regime_source_date"]  = pd.NaT
+        out["vol_regime_available_at"] = pd.NaT
+        out["vol_regime_lag_days"]     = np.nan
+        return out
 
-    rl = regime_lookup[["ticker", "date", "regime"]].copy()
-    rl["ticker"] = rl["ticker"].astype(str).str.upper()
-    # Force both sides to the same datetime64[ns, UTC] dtype.
-    rl["date"] = pd.to_datetime(rl["date"], utc=True, errors="coerce").dt.normalize()
-
-    out = sig.merge(rl, on=["ticker", "date"], how="left")
+    lk = regime_lookup.copy()
+    if "regime" in lk.columns and "vol_regime" not in lk.columns:
+        lk = lk.rename(columns={"regime": "vol_regime"})
+    elif "vol_regime" not in lk.columns:
+        raise ValueError("attach_regimes: lookup must carry either "
+                         "'regime' or 'vol_regime'")
+    out = attach_regime_asof(
+        sig, lk, regime_col="vol_regime", column_prefix="vol",
+    )
+    # Legacy alias — downstream code that reads ``regime`` keeps working.
+    out["regime"] = out["vol_regime"]
     matched = int(out["regime"].notna().sum())
     if matched == 0:
         get_logger().warning(
-            "evaluate-signals: regime join produced 0 matches "
+            "evaluate-signals: regime as-of join produced 0 matches "
             "(signals=%d rows, lookup=%d rows). Common causes: "
-            "ticker/date dtype mismatch or empty regime values.",
-            len(sig), len(rl),
+            "ticker mismatch, dtype mismatch, or every signal "
+            "predates the first regime availability instant.",
+            len(sig), len(regime_lookup),
         )
     return out
 

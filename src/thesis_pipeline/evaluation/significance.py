@@ -528,7 +528,11 @@ def regime_mcnemar_table(signals: pd.DataFrame,
     # ── Volatility regimes ──────────────────────────────────────
     if has_vol:
         enr = attach_regimes(signals, vol_lookup)
-        if "regime" in enr.columns:
+        # ``attach_regimes`` already emits ``vol_regime`` (and a legacy
+        # ``regime`` alias). The rename used to handle older lookups
+        # that only carried ``regime``; do it only when the alias is
+        # the sole regime column to avoid creating duplicate names.
+        if "vol_regime" not in enr.columns and "regime" in enr.columns:
             enr = enr.rename(columns={"regime": "vol_regime"})
         enr = enr[enr.get("vol_regime").notna()] if "vol_regime" in enr.columns else enr.iloc[0:0]
         if not enr.empty:
@@ -562,7 +566,11 @@ def regime_mcnemar_table(signals: pd.DataFrame,
     # ── Interaction regimes ─────────────────────────────────────
     if has_vol and has_mcap:
         enr = attach_regimes(signals, vol_lookup)
-        if "regime" in enr.columns:
+        # ``attach_regimes`` already emits ``vol_regime`` (and a legacy
+        # ``regime`` alias). The rename used to handle older lookups
+        # that only carried ``regime``; do it only when the alias is
+        # the sole regime column to avoid creating duplicate names.
+        if "vol_regime" not in enr.columns and "regime" in enr.columns:
             enr = enr.rename(columns={"regime": "vol_regime"})
         enr = attach_market_cap_regimes(enr, mcap_lookup)
         keep = (("vol_regime" in enr.columns) and ("mcap_regime" in enr.columns))

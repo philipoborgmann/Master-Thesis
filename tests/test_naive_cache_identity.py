@@ -201,8 +201,9 @@ def test_missing_sidecar_triggers_recompute(tmp_path):
 
 
 def test_drifted_ticker_set_triggers_recompute(tmp_path):
-    """If the cached parquet's actual ticker set doesn't intersect the
-    requested universe, the cache is invalid."""
+    """If the cached parquet's actual ticker set is not a subset of the
+    requested universe, the cache must invalidate (Section A — no
+    overlap-tautology fallback)."""
     feats = _features(tickers=("BTC", "ETH"))
     out = nr.generate_naive_reference(
         horizon="1d", features_df=feats,
@@ -210,7 +211,8 @@ def test_drifted_ticker_set_triggers_recompute(tmp_path):
     )
     assert out is not None
     # Corrupt the parquet so it carries only DOGE — a ticker not in the
-    # request. Cache must invalidate.
+    # request. Cache must invalidate even though the requested universe
+    # was correctly stored in the sidecar.
     bad = pd.read_parquet(out).copy()
     bad["ticker"] = "DOGE"
     bad.to_parquet(out, index=False)
@@ -225,6 +227,184 @@ def test_drifted_ticker_set_triggers_recompute(tmp_path):
         ),
     )
     assert not valid
+
+
+# ---------------------------------------------------------------------------
+# Section A — requested-vs-realized validation
+# ---------------------------------------------------------------------------
+
+def _expected_payload(coins=("BTC", "ETH"), realized=("BTC", "ETH")):
+    return nr._build_identity_payload(
+        horizon="1d", model_type="panel_logit",
+        panel_mode="ticker_fixed_effects",
+        train_window_mode="rolling_fixed",
+        rolling_window_days=180.0,
+        rolling_window_timestamps=None,
+        coin_universe_tuple=tuple(coins),
+        realized_universe_tuple=tuple(realized),
+    )
+
+
+def test_cache_schema_version_is_stamped_on_sidecar(tmp_path):
+    feats = _features(tickers=("BTC", "ETH"))
+    out = nr.generate_naive_reference(
+        horizon="1d", features_df=feats,
+        output_dir=tmp_path, coins=["BTC", "ETH"],
+    )
+    assert out is not None
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    assert meta["cache_schema_version"] == nr.CACHE_SCHEMA_VERSION
+    assert meta["cache_schema_version"] >= 2
+
+
+def test_old_cache_schema_version_invalidates(tmp_path):
+    feats = _features(tickers=("BTC", "ETH"))
+    out = nr.generate_naive_reference(
+        horizon="1d", features_df=feats,
+        output_dir=tmp_path, coins=["BTC", "ETH"],
+    )
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    meta["cache_schema_version"] = 1
+    out.with_suffix(".meta.json").write_text(json.dumps(meta))
+    assert not nr._cache_is_valid(out, _expected_payload())
+
+
+def test_cache_valid_when_realized_subset_of_requested(tmp_path):
+    """A requested universe of BTC + ETH where only BTC produced enough
+    training data still validates: realized ⊆ requested and the sidecar's
+    realized set matches the parquet."""
+    feats = _features(tickers=("BTC", "ETH"), n=160)
+    out = nr.generate_naive_reference(
+        horizon="1d", features_df=feats,
+        output_dir=tmp_path, coins=["BTC", "ETH"],
+    )
+    assert out is not None
+    # Tamper: keep only BTC rows, then rewrite the sidecar so realized=BTC.
+    sig = pd.read_parquet(out)
+    sig_btc = sig[sig["ticker"] == "BTC"]
+    sig_btc.to_parquet(out, index=False)
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    meta["realized_tickers"] = ["BTC"]
+    meta["realized_coin_universe_hash"] = nr.coin_universe_hash(["BTC"])
+    meta["n_realized_tickers"] = 1
+    out.with_suffix(".meta.json").write_text(json.dumps(meta))
+    assert nr._cache_is_valid(out, _expected_payload(
+        coins=("BTC", "ETH"), realized=("BTC", "ETH"),
+    ))
+
+
+def test_cache_invalid_when_realized_ticker_outside_requested(tmp_path):
+    """Section A — requested BTC/ETH, but parquet contains BTC/DOGE.
+    Partial overlap MUST NOT validate (kills the old tautology)."""
+    feats = _features(tickers=("BTC", "ETH"))
+    out = nr.generate_naive_reference(
+        horizon="1d", features_df=feats,
+        output_dir=tmp_path, coins=["BTC", "ETH"],
+    )
+    sig = pd.read_parquet(out)
+    # Flip ETH rows to DOGE so the parquet now mixes BTC + DOGE.
+    sig.loc[sig["ticker"] == "ETH", "ticker"] = "DOGE"
+    sig.to_parquet(out, index=False)
+    assert not nr._cache_is_valid(out, _expected_payload())
+
+
+def test_cache_invalid_when_sidecar_realized_set_diverges_from_parquet(tmp_path):
+    """Tampered sidecar (claims realized=BTC,ETH) but parquet only has
+    BTC must invalidate."""
+    feats = _features(tickers=("BTC", "ETH"))
+    out = nr.generate_naive_reference(
+        horizon="1d", features_df=feats,
+        output_dir=tmp_path, coins=["BTC", "ETH"],
+    )
+    sig = pd.read_parquet(out)
+    sig[sig["ticker"] == "BTC"].to_parquet(out, index=False)
+    # Sidecar still claims realized=BTC,ETH → mismatch with parquet.
+    assert not nr._cache_is_valid(out, _expected_payload(
+        coins=("BTC", "ETH"), realized=("BTC", "ETH"),
+    ))
+
+
+def test_cache_invalid_when_requested_set_mismatch(tmp_path):
+    feats = _features(tickers=("BTC", "ETH"))
+    out = nr.generate_naive_reference(
+        horizon="1d", features_df=feats,
+        output_dir=tmp_path, coins=["BTC", "ETH"],
+    )
+    # Expect a request for BTC + ETH + SOL → previously cached BTC + ETH
+    # sidecar must NOT validate (filename differs in production; here we
+    # exercise the validator directly).
+    assert not nr._cache_is_valid(out, _expected_payload(
+        coins=("BTC", "ETH", "SOL"),
+        realized=("BTC", "ETH"),
+    ))
+
+
+def test_cache_invalid_when_requested_metadata_missing(tmp_path):
+    feats = _features(tickers=("BTC", "ETH"))
+    out = nr.generate_naive_reference(
+        horizon="1d", features_df=feats,
+        output_dir=tmp_path, coins=["BTC", "ETH"],
+    )
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    # Strip the explicit requested-universe fields.
+    meta.pop("requested_tickers", None)
+    meta.pop("requested_coin_universe_hash", None)
+    out.with_suffix(".meta.json").write_text(json.dumps(meta))
+    assert not nr._cache_is_valid(out, _expected_payload())
+
+
+def test_cache_invalid_when_realized_metadata_missing(tmp_path):
+    feats = _features(tickers=("BTC", "ETH"))
+    out = nr.generate_naive_reference(
+        horizon="1d", features_df=feats,
+        output_dir=tmp_path, coins=["BTC", "ETH"],
+    )
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    meta.pop("realized_tickers", None)
+    out.with_suffix(".meta.json").write_text(json.dumps(meta))
+    # Sidecar realized_tickers defaults to [] → parquet has BTC, ETH →
+    # mismatch → invalid.
+    assert not nr._cache_is_valid(out, _expected_payload())
+
+
+def test_cache_invalid_when_sidecar_corrupted(tmp_path):
+    feats = _features(tickers=("BTC", "ETH"))
+    out = nr.generate_naive_reference(
+        horizon="1d", features_df=feats,
+        output_dir=tmp_path, coins=["BTC", "ETH"],
+    )
+    out.with_suffix(".meta.json").write_text("{not valid json")
+    assert not nr._cache_is_valid(out, _expected_payload())
+
+
+def test_cache_invalid_when_parquet_corrupted(tmp_path):
+    feats = _features(tickers=("BTC", "ETH"))
+    out = nr.generate_naive_reference(
+        horizon="1d", features_df=feats,
+        output_dir=tmp_path, coins=["BTC", "ETH"],
+    )
+    out.write_bytes(b"not parquet data")
+    assert not nr._cache_is_valid(out, _expected_payload())
+
+
+def test_restart_overwrites_invalid_cache(tmp_path):
+    feats = _features(tickers=("BTC", "ETH"))
+    out = nr.generate_naive_reference(
+        horizon="1d", features_df=feats,
+        output_dir=tmp_path, coins=["BTC", "ETH"],
+    )
+    # Tamper with the sidecar so the cache is now invalid.
+    out.with_suffix(".meta.json").write_text("{}")
+    again = nr.generate_naive_reference(
+        horizon="1d", features_df=feats,
+        output_dir=tmp_path, coins=["BTC", "ETH"],
+        restart=True,
+    )
+    assert again is not None
+    # Sidecar is rewritten with all required fields.
+    meta = json.loads(again.with_suffix(".meta.json").read_text())
+    assert meta["cache_schema_version"] == nr.CACHE_SCHEMA_VERSION
+    assert sorted(meta["requested_tickers"]) == ["BTC", "ETH"]
 
 
 def test_restart_overwrites_compatible_cache(tmp_path):

@@ -237,27 +237,40 @@ def build_market_cap_lookup(mcap_path: str | Path | None = None,
 
 def attach_market_cap_regimes(signals: pd.DataFrame,
                               mcap_lookup: pd.DataFrame) -> pd.DataFrame:
-    """Left-merge ``mcap_regime`` onto signals via (ticker, date)."""
+    """Availability-based per-ticker as-of join (commit 3 Section E).
+
+    Delegates to the shared :func:`thesis_pipeline.evaluation
+    .regime_join.attach_regime_asof` helper so every production market-
+    cap consumer uses the same strict-< availability semantics. The
+    diagnostics columns are prefixed with ``mcap`` so callers can attach
+    BOTH volatility and market-cap regimes side-by-side without
+    collisions.
+    """
+    from .regime_join import attach_regime_asof
+
     if signals.empty:
         return signals
-    if mcap_lookup is None or mcap_lookup.empty:
-        out = _attach_date(signals)
-        out["mcap_regime"] = np.nan
-        return out
     sig = _attach_date(signals)
     sig["ticker"] = sig["ticker"].astype(str).map(_normalise_ticker)
-
-    rl = mcap_lookup[["ticker", "date", "mcap_regime"]].copy()
+    if mcap_lookup is None or mcap_lookup.empty:
+        out = sig.copy()
+        out["mcap_regime"] = np.nan
+        out["mcap_regime_source_date"]  = pd.NaT
+        out["mcap_regime_available_at"] = pd.NaT
+        out["mcap_regime_lag_days"]     = np.nan
+        return out
+    rl = mcap_lookup.copy()
     rl["ticker"] = rl["ticker"].astype(str).map(_normalise_ticker)
-    rl["date"] = pd.to_datetime(rl["date"], utc=True, errors="coerce").dt.normalize()
-
-    out = sig.merge(rl, on=["ticker", "date"], how="left")
+    out = attach_regime_asof(
+        sig, rl, regime_col="mcap_regime", column_prefix="mcap",
+    )
     matched = int(out["mcap_regime"].notna().sum())
-    if matched == 0 and not rl.empty:
+    if matched == 0 and not mcap_lookup.empty:
         get_logger().warning(
-            "evaluate-signals: market-cap join produced 0 matches "
-            "(signals=%d, lookup=%d). Check ticker/date dtypes.",
-            len(sig), len(rl),
+            "evaluate-signals: market-cap as-of join produced 0 matches "
+            "(signals=%d, lookup=%d). Check ticker normalization and "
+            "regime_available_at coverage.",
+            len(sig), len(mcap_lookup),
         )
     return out
 

@@ -633,10 +633,15 @@ def test_volatility_regime_join_dtype_stable(tmp_path):
     # date column must be tz-aware datetime64
     assert pd.api.types.is_datetime64_any_dtype(out["date"])
 
-    # Build a fake regime lookup
+    # Build a fake regime lookup. We add one leading row so the
+    # availability-based as-of join (commit 3 Section E) can match the
+    # very first signal — strict-< excludes same-instant availability.
+    lookup_dates = pd.DatetimeIndex(
+        [start - pd.Timedelta(days=1)]
+    ).append(pd.DatetimeIndex(out["date"]))
     lookup = pd.DataFrame({
-        "ticker": "BTC", "date": out["date"],
-        "regime": (["low"] * 20) + (["mid"] * 20) + (["high"] * 20),
+        "ticker": "BTC", "date": lookup_dates,
+        "regime": ["low"] + (["low"] * 20) + (["mid"] * 20) + (["high"] * 20),
     })
 
     # Signals with naive timestamps — attach_regimes must still join.

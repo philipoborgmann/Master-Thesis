@@ -788,6 +788,14 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                 signals["hpo_enabled"]   = False
                 signals["hpo_objective"] = "-"
                 signals["hpo_variant"]   = "fixed"
+            # Universe identity (commit 3 Section B). Stamp the requested
+            # universe alongside the realized ticker set so the
+            # absolute_vs_naive evaluation can match by requested-hash
+            # without inferring from realized tickers later.
+            from .naive_reference import stamp_universe_metadata
+            signals = stamp_universe_metadata(
+                signals, requested_universe=tickers,
+            )
             signals.to_parquet(out_path, index=False, engine="pyarrow")
 
             from .hyperparameter_tuning import summarize_hpo_columns
