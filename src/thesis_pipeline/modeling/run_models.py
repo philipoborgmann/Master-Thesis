@@ -560,6 +560,28 @@ def _attach_per_asset_meta(sig: pd.DataFrame, *, set_id, sentiment_model,
     return sig
 
 
+def _guard_checkpoint_universe(ckpt_module, root, manifest_base: dict) -> None:
+    """Clear the run's checkpoint directory when its persisted manifest
+    disagrees with the new run's requested universe (commit 4 A.4).
+
+    The same guard exists in :mod:`panel_logit`; per-asset runs need it
+    too so a BTC/ETH smoke checkpoint can never silently feed a BTC/ETH/SOL
+    production run.
+    """
+    existing = ckpt_module.load_manifest(root)
+    if not existing:
+        return
+    for k in ("requested_coin_universe_hash", "requested_tickers",
+              "horizon", "set_id", "sentiment_model", "model_type",
+              "panel_mode", "hpo_variant", "hpo_objective",
+              "feature_cols"):
+        if existing.get(k) != manifest_base.get(k):
+            print(f"  [INFO] Existing checkpoint manifest is incompatible "
+                  f"({k} changed) — clearing.")
+            ckpt_module.clear_run_checkpoints(root)
+            return
+
+
 def _checkpointed_ticker_loop(tickers, df_all, compute_fn, *,
                               root, ckpt_on: bool, resume: bool,
                               set_id, sentiment_model, horizon, tune_on: bool,
@@ -851,9 +873,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             continue
 
         tickers = sorted(df_all["ticker"].unique())
-        if args.coins:
-            wanted = set(args.coins)
-            tickers = [t for t in tickers if t in wanted]
+        # Universe resolution (commit 4 A.1). REQUESTED is immutable per
+        # run; AVAILABLE is the subset present in the feature frame;
+        # estimation runs on AVAILABLE.
+        from .naive_reference import (
+            coin_universe_hash as _cu_hash,
+            resolve_universes as _resolve_universes,
+        )
+        uni = _resolve_universes(args.coins, tickers)
+        requested_tickers = list(uni["requested"])
+        available_tickers = list(uni["available"])
+        requested_hash    = uni["requested_hash"]
+        tickers = available_tickers
         print(f"  Tickers: {len(tickers)} — {', '.join(tickers)}")
         if tune_on:
             print(f"  Model: LogisticRegression(L2) + grid-search HPO "
@@ -880,7 +911,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             # File naming. Tuned (non-benchmark) runs get a variant suffix so
             # they never overwrite the fixed-C parquet (and caching/restart
-            # keys on the variant-specific path).
+            # keys on the variant-specific path). The REQUESTED-universe
+            # hash suffix (commit 4 A.2) guarantees smoke and full grids
+            # never collide on disk.
             if sent_model and str(sent_model) != "-" and str(sent_model) != "nan":
                 out_name = f"{set_id}_{sent_model}"
             else:
@@ -888,14 +921,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sent_model = "-"
             if tune_on and not is_benchmark:
                 out_name = f"{out_name}_{hpo_variant}"
+            if requested_hash:
+                out_name = f"{out_name}_u_{requested_hash}"
 
             out_path = os.path.join(hz_dir, f"{out_name}.parquet")
 
-            # ── Checkpoint: skip if already computed ──────────
+            # ── Cache validation (commit 4 A.3) ───────────────
+            # A legacy cache without requested-universe metadata is
+            # NEVER reused by a v4 production run. The cache is only
+            # honoured when the parquet carries the right requested
+            # hash AND its realized tickers are a subset of the
+            # requested set.
             if os.path.isfile(out_path) and not args.restart:
                 try:
                     from .hyperparameter_tuning import summarize_hpo_columns
                     cached = pd.read_parquet(out_path)
+                    cached_hash = (
+                        str(cached.get("requested_coin_universe_hash",
+                                        pd.Series([""])).iat[0])
+                        if not cached.empty else ""
+                    )
+                    realized = set(cached["ticker"].astype(str).str.upper().unique()) \
+                        if "ticker" in cached.columns and not cached.empty else set()
+                    if (not cached_hash) or cached_hash != requested_hash:
+                        print(f"\n  ── {out_name} ({label}) → legacy/incompatible "
+                              "cache (no requested-universe metadata or hash "
+                              "mismatch); recomputing")
+                        raise ValueError("legacy_cache")
+                    if not realized.issubset(set(requested_tickers)):
+                        print(f"\n  ── {out_name} ({label}) → cache realized "
+                              "tickers escape requested universe; recomputing")
+                        raise ValueError("realized_escapes_requested")
                     m = compute_metrics(cached, "pooled")
                     m.update({"horizon": hz, "set_id": set_id,
                               "sentiment_model": sent_model, "label": label,
@@ -939,7 +995,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "model_type": "per_asset", "panel_mode": "-",
                     "hpo_variant": "fixed", "hpo_objective": "-",
                     "feature_cols": ["__rolling_probability__"],
+                    # Universe identity (commit 4 A.4).
+                    "requested_tickers":            list(requested_tickers),
+                    "requested_coin_universe_hash": requested_hash,
+                    "n_requested_tickers":          len(requested_tickers),
                 }
+                _guard_checkpoint_universe(ckpt, root, manifest_base)
                 all_signals, n_loaded, n_written = _checkpointed_ticker_loop(
                     tickers, df_all, run_rolling_probability,
                     root=root, ckpt_on=ckpt_on, resume=resume,
@@ -949,10 +1010,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
                 if all_signals:
                     signals = pd.concat(all_signals, ignore_index=True)
-                    # Universe identity stamp (commit 3 Section B).
+                    # Universe identity stamp (commit 3 Section B + 4 A.5).
                     from .naive_reference import stamp_universe_metadata
                     signals = stamp_universe_metadata(
-                        signals, requested_universe=tickers,
+                        signals,
+                        requested_universe=requested_tickers,
+                        available_universe=available_tickers,
                     )
                     signals.to_parquet(out_path, index=False, engine="pyarrow")
                     if ckpt_on:
@@ -1006,7 +1069,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "hpo_variant": hpo_variant if tune_on else "fixed",
                 "hpo_objective": hpo_cfg["objective"] if tune_on else "-",
                 "feature_cols": feature_cols,
+                # Universe identity (commit 4 A.4).
+                "requested_tickers":            list(requested_tickers),
+                "requested_coin_universe_hash": requested_hash,
+                "n_requested_tickers":          len(requested_tickers),
             }
+            _guard_checkpoint_universe(ckpt, root, manifest_base)
             all_signals, n_loaded, n_written = _checkpointed_ticker_loop(
                 tickers, df_all,
                 lambda df_t: run_walk_forward(df_t, feature_cols, C=args.C,
@@ -1024,10 +1092,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # so the concat (whether freshly computed or rebuilt purely from
                 # checkpoints) is the complete final signal frame.
                 signals = pd.concat(all_signals, ignore_index=True)
-                # Universe identity stamp (commit 3 Section B).
+                # Universe identity stamp (commit 3 Section B + 4 A.5).
                 from .naive_reference import stamp_universe_metadata
                 signals = stamp_universe_metadata(
-                    signals, requested_universe=tickers,
+                    signals,
+                    requested_universe=requested_tickers,
+                    available_universe=available_tickers,
                 )
                 signals.to_parquet(out_path, index=False, engine="pyarrow")
                 if ckpt_on:

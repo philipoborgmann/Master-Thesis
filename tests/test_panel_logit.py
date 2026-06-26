@@ -185,6 +185,19 @@ def panel_repo(tmp_path, monkeypatch):
 _LEGACY_PANEL = ["--train-window", "expanding", "--no-tune-hyperparams"]
 
 
+def _resolve_signal(d, stem_prefix):
+    """Locate a signal parquet that starts with ``stem_prefix``.
+
+    The v4 universe-hash suffix (``_u_<8-hex>``) is appended after the
+    legacy stem; we look up files via a glob so tests do not have to
+    know the exact universe of the surrounding test repo.
+    """
+    cands = sorted(d.glob(f"{stem_prefix}.parquet")) \
+        + sorted(d.glob(f"{stem_prefix}_u_*.parquet"))
+    assert cands, f"no signal parquet matched {stem_prefix}* under {d}"
+    return cands[0]
+
+
 def test_full_pipeline_panel_pooled(panel_repo):
     rc = run_models_main([
         "--horizon", "1d", "--set-id", "ECON",
@@ -192,7 +205,8 @@ def test_full_pipeline_panel_pooled(panel_repo):
         "--restart", *_LEGACY_PANEL,
     ])
     assert rc == 0
-    out = panel_repo / "Outputs" / "Signals" / "1d" / "ECON_panel_pooled.parquet"
+    out = _resolve_signal(panel_repo / "Outputs" / "Signals" / "1d",
+                            "ECON_panel_pooled")
     assert out.exists()
     sdf = pd.read_parquet(out)
     assert not sdf.empty
@@ -211,13 +225,15 @@ def test_full_pipeline_panel_does_not_touch_per_asset_file(panel_repo):
     # the v4 rolling/HPO defaults so the legacy filename layout holds.
     run_models_main(["--horizon", "1d", "--set-id", "ECON", "--restart",
                      "--model-type", "per_asset", "--no-tune-hyperparams"])
-    per_asset = panel_repo / "Outputs" / "Signals" / "1d" / "ECON.parquet"
+    per_asset = _resolve_signal(panel_repo / "Outputs" / "Signals" / "1d",
+                                  "ECON")
     assert per_asset.exists()
 
     run_models_main(["--horizon", "1d", "--set-id", "ECON",
                      "--model-type", "panel_logit", "--panel-mode", "pooled",
                      "--restart", *_LEGACY_PANEL])
-    panel = panel_repo / "Outputs" / "Signals" / "1d" / "ECON_panel_pooled.parquet"
+    panel = _resolve_signal(panel_repo / "Outputs" / "Signals" / "1d",
+                              "ECON_panel_pooled")
     assert panel.exists()
     # The per-asset file is untouched and carries no panel columns.
     pa = pd.read_parquet(per_asset)
@@ -235,7 +251,8 @@ def test_full_pipeline_panel_ticker_fe(panel_repo):
         "--restart", *_LEGACY_PANEL,
     ])
     assert rc == 0
-    out = panel_repo / "Outputs" / "Signals" / "1d" / "ECON_VAD_L_vader_panel_ticker_fe.parquet"
+    out = _resolve_signal(panel_repo / "Outputs" / "Signals" / "1d",
+                            "ECON_VAD_L_vader_panel_ticker_fe")
     assert out.exists()
     sdf = pd.read_parquet(out)
     assert not sdf.empty
@@ -255,7 +272,8 @@ def test_panel_b1_runs_as_rolling_probability_benchmark(panel_repo):
     assert rc == 0
     # The panel rolling-probability benchmark produces a signal file with
     # the same naming scheme as the logistic models (no _rw / _hpo suffix).
-    out = panel_repo / "Outputs" / "Signals" / "1d" / "NAIVE_FIXTURE_panel_pooled.parquet"
+    out = _resolve_signal(panel_repo / "Outputs" / "Signals" / "1d",
+                            "NAIVE_FIXTURE_panel_pooled")
     assert out.exists()
     sdf = pd.read_parquet(out)
     assert not sdf.empty

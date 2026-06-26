@@ -139,9 +139,10 @@ UNIVERSE_IDENTITY_SOURCE_LEGACY = "legacy_realized_tickers_fallback"
 def stamp_universe_metadata(df: pd.DataFrame,
                             *,
                             requested_universe: Iterable[str] | None,
+                            available_universe: Iterable[str] | None = None,
                             source: str = UNIVERSE_IDENTITY_SOURCE_REQUESTED,
                             ) -> pd.DataFrame:
-    """Stamp the requested-vs-realized universe identity onto every row.
+    """Stamp the requested/available/realized universe identity onto every row.
 
     Used by both the NAIVE generator and the production model writers
     so the same hashing helper (and the same column layout) feeds the
@@ -156,6 +157,10 @@ def stamp_universe_metadata(df: pd.DataFrame,
         The universe resolved from ``--coins`` (or the feature-frame
         ticker set when no coin filter was given). ``None`` is allowed
         only for legacy-fallback callers.
+    available_universe
+        Subset of requested actually present in the feature frame for
+        the current horizon. Defaults to ``requested_universe`` when
+        omitted.
     source
         Provenance label written into ``universe_identity_source``.
         Production v4 outputs always use ``"requested_metadata"``; the
@@ -169,20 +174,52 @@ def stamp_universe_metadata(df: pd.DataFrame,
         normalize_coin_universe(requested_universe)
         if requested_universe is not None else tuple()
     )
+    available_tuple = (
+        normalize_coin_universe(available_universe)
+        if available_universe is not None else requested_tuple
+    )
     realized_tuple = normalize_coin_universe(
         out["ticker"].astype(str).unique() if "ticker" in out.columns else []
     )
     req_hash = coin_universe_hash(requested_tuple) if requested_tuple else ""
+    avl_hash = coin_universe_hash(available_tuple) if available_tuple else ""
     rea_hash = coin_universe_hash(realized_tuple) if realized_tuple else ""
+    # ``coin_universe_hash`` is the public alias for the REQUESTED hash —
+    # downstream matching (absolute_vs_naive, checkpoints) keys off it.
     out["coin_universe_hash"]            = req_hash or rea_hash
     out["requested_coin_universe_hash"]  = req_hash
     out["n_requested_tickers"]           = int(len(requested_tuple))
     out["requested_tickers"]             = "|".join(requested_tuple)
+    out["available_coin_universe_hash"]  = avl_hash
+    out["n_available_tickers"]           = int(len(available_tuple))
+    out["available_tickers"]             = "|".join(available_tuple)
     out["realized_coin_universe_hash"]   = rea_hash
     out["n_realized_tickers"]            = int(len(realized_tuple))
     out["realized_tickers"]              = "|".join(realized_tuple)
     out["universe_identity_source"]      = source
     return out
+
+
+def resolve_universes(args_coins: Iterable[str] | None,
+                      df_all_tickers: Iterable[str]) -> dict:
+    """Resolve the three v4 universe tuples for one (horizon, args).
+
+    Returns a dict with ``requested``, ``available`` and per-side hashes.
+    Both are normalized via :func:`normalize_coin_universe` so the
+    hashes coincide with NAIVE's.
+    """
+    feature_tickers = normalize_coin_universe(df_all_tickers)
+    if args_coins:
+        requested = normalize_coin_universe(args_coins)
+    else:
+        requested = feature_tickers
+    available = tuple(t for t in requested if t in set(feature_tickers))
+    return {
+        "requested":      requested,
+        "available":      available,
+        "requested_hash": coin_universe_hash(requested) if requested else "",
+        "available_hash": coin_universe_hash(available) if available else "",
+    }
 
 
 def normalize_coin_universe(tickers: Iterable[str] | None) -> tuple[str, ...]:

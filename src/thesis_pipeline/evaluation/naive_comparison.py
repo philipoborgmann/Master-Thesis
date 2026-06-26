@@ -257,51 +257,66 @@ def absolute_vs_naive_table(signals: pd.DataFrame) -> pd.DataFrame:
     if model_df.empty:
         return _empty_output()
 
-    # Group on the SHORT model key first; downstream we then verify
-    # internal constancy of all v4 identity columns within the group.
-    short_group_cols = ["horizon", "set_id", "sentiment_model",
-                        "model_type", "panel_mode", "hpo_variant",
-                        "hpo_objective"]
+    # Group DIRECTLY by the complete identity (commit 4 Section B.1).
+    # Two valid runs with the same set_id but different rolling windows
+    # / HPO objectives / requested universes are now KEPT APART
+    # naturally — no short-key collapse, no consistency-flagging of
+    # legitimate parallel runs.
     rows: list[dict] = []
-    for keys, m_grp in model_df.groupby(short_group_cols, dropna=False):
-        (horizon, set_id, sm, model_type, panel_mode,
-         hpo_variant, hpo_objective) = keys
+    # Ensure the grouping columns exist (NaN is a valid value).
+    for col in MODEL_GROUP_COLUMNS:
+        if col not in model_df.columns:
+            model_df[col] = np.nan
 
-        # Resolve the model's universe hash + provenance.
-        m_hash, universe_src = _coin_universe_hash_from_signals(m_grp)
-        ident_values = {
-            "horizon":                  horizon,
-            "model_type":               model_type,
-            "panel_mode":               panel_mode,
-            "train_window_mode":        _first_constant(m_grp, "train_window_mode"),
-            "rolling_window_days":      _first_constant(m_grp, "rolling_window_days"),
-            "rolling_window_timestamps": _first_constant(m_grp, "rolling_window_timestamps"),
-            "coin_universe_hash":       m_hash,
-        }
+    # Diagnostic-only metadata: must be constant within one complete-
+    # identity group. If it varies the row is flagged invalid (B.2).
+    DIAGNOSTIC_META_COLUMNS = [
+        "requested_tickers", "n_requested_tickers", "universe_identity_source",
+        "available_coin_universe_hash",
+    ]
+
+    for keys, m_grp in model_df.groupby(MODEL_GROUP_COLUMNS, dropna=False):
+        (horizon, set_id, sm, model_type, panel_mode,
+         hpo_variant, hpo_objective,
+         train_window_mode, rolling_window_days, rolling_window_timestamps,
+         m_hash) = keys
+
+        # Resolve universe-identity provenance from any row in the group
+        # (NAIVE-generator runs stamp "requested_metadata"; legacy frames
+        # without a coin_universe_hash fall back to realised tickers).
+        _, universe_src = _coin_universe_hash_from_signals(m_grp)
 
         base = _identity_row(
             horizon=horizon, set_id=set_id, sentiment_model=sm,
             model_type=model_type, panel_mode=panel_mode,
             hpo_variant=hpo_variant,
             hpo_objective=hpo_objective,
-            train_window_mode=ident_values["train_window_mode"],
-            rolling_window_days=ident_values["rolling_window_days"],
-            rolling_window_timestamps=ident_values["rolling_window_timestamps"],
-            coin_universe_hash=m_hash,
+            train_window_mode=train_window_mode,
+            rolling_window_days=rolling_window_days,
+            rolling_window_timestamps=rolling_window_timestamps,
+            coin_universe_hash=m_hash if m_hash is not None and not (
+                isinstance(m_hash, float) and np.isnan(m_hash)) else None,
             universe_identity_source=universe_src,
             n_model=int(len(m_grp)),
         )
 
-        # ── Group-consistency guard (Section C) ───────────────────
-        # Every column in MODEL_GROUP_COLUMNS must be constant inside
-        # this short-key group. Otherwise the row is flagged invalid
-        # rather than silently collapsed.
-        nonconst = _non_constant_columns(m_grp,
-                                          [c for c in MODEL_GROUP_COLUMNS
-                                           if c not in short_group_cols])
+        ident_values = {
+            "horizon":                   horizon,
+            "model_type":                model_type,
+            "panel_mode":                panel_mode,
+            "train_window_mode":         train_window_mode,
+            "rolling_window_days":       rolling_window_days,
+            "rolling_window_timestamps": rolling_window_timestamps,
+            "coin_universe_hash":        m_hash,
+        }
+
+        # ── Identity-metadata consistency guard (Section B.2) ─────
+        # Non-grouping metadata must be constant inside the group;
+        # otherwise the row is flagged invalid.
+        nonconst = _non_constant_columns(m_grp, DIAGNOSTIC_META_COLUMNS)
         if nonconst:
             base["status"]       = "invalid_model_identity"
-            base["skip_reason"]  = "non_constant_identity_columns"
+            base["skip_reason"]  = "non_constant_identity_metadata"
             base["non_constant_columns"] = ",".join(nonconst)
             rows.append(base)
             continue

@@ -83,10 +83,12 @@ def test_hpo_run_does_not_overwrite_fixed_filename(repo):
              "cryptobert", "--restart",
              "--model-type", "per_asset",
              "--tune-hyperparams", "--hpo-objective", "brier_score"])
-    fixed = _sig_dir(repo) / "ECON_CBT_F_cryptobert.parquet"
-    hpo = _sig_dir(repo) / "ECON_CBT_F_cryptobert_hpo_brier.parquet"
-    assert fixed.exists()
-    assert hpo.exists()
+    # v4 universe-hash suffix (commit 4 A.2): glob the new name pattern.
+    fixed_cands = sorted(_sig_dir(repo).glob("ECON_CBT_F_cryptobert_u_*.parquet"))
+    hpo_cands   = sorted(_sig_dir(repo).glob("ECON_CBT_F_cryptobert_hpo_brier_u_*.parquet"))
+    assert fixed_cands, "fixed parquet missing"
+    assert hpo_cands, "HPO parquet missing"
+    fixed, hpo = fixed_cands[0], hpo_cands[0]
     # Distinct files; the fixed one has no HPO objective.
     f = pd.read_parquet(fixed)
     h = pd.read_parquet(hpo)
@@ -109,7 +111,9 @@ def test_hpo_filename_objective_suffix(repo, objective, suffix):
              "cryptobert", "--model-type", "per_asset",
              "--tune-hyperparams", "--hpo-objective", objective,
              "--restart"])
-    assert (_sig_dir(repo) / f"ECON_CBT_F_cryptobert_{suffix}.parquet").exists()
+    assert sorted(_sig_dir(repo).glob(
+        f"ECON_CBT_F_cryptobert_{suffix}_u_*.parquet")), \
+        f"expected ECON_CBT_F_cryptobert_{suffix}_u_*.parquet"
 
 
 # ---------------------------------------------------------------------------
@@ -124,14 +128,16 @@ def test_panel_hpo_filenames(repo):
              "pooled", "--train-window", "expanding",
              "--tune-hyperparams", "--hpo-objective", "brier_score",
              "--restart"])
-    assert (_sig_dir(repo) / "ECON_CBT_F_cryptobert_panel_pooled_hpo_brier.parquet").exists()
+    assert sorted(_sig_dir(repo).glob(
+        "ECON_CBT_F_cryptobert_panel_pooled_hpo_brier_u_*.parquet"))
 
     rm.main(["--horizon", "1d", "--set-id", "ECON_CBT_F", "--sentiment-model",
              "cryptobert", "--model-type", "panel_logit", "--panel-mode",
              "ticker_fixed_effects", "--train-window", "expanding",
              "--tune-hyperparams", "--hpo-objective",
              "brier_score", "--restart"])
-    assert (_sig_dir(repo) / "ECON_CBT_F_cryptobert_panel_ticker_fe_hpo_brier.parquet").exists()
+    assert sorted(_sig_dir(repo).glob(
+        "ECON_CBT_F_cryptobert_panel_ticker_fe_hpo_brier_u_*.parquet"))
 
 
 def test_metrics_summary_has_hpo_variant_aggregate(repo):

@@ -229,8 +229,10 @@ def test_full_pipeline_writes_signal_parquet(synth_repo):
     ])
     assert rc == 0
 
-    out = synth_repo / "Outputs" / "Signals" / "1d" / "SYN1.parquet"
-    assert out.exists(), f"expected SYN1 output at {out}"
+    sig_dir = synth_repo / "Outputs" / "Signals" / "1d"
+    cands = sorted(sig_dir.glob("SYN1_u_*.parquet"))
+    assert cands, f"expected SYN1_u_*.parquet under {sig_dir}"
+    out = cands[0]
     df = pd.read_parquet(out)
     assert not df.empty
     assert set(df["ticker"].astype(str).unique()) == {"BTC", "ETH"}
@@ -268,8 +270,12 @@ def test_syn1_outperforms_naive_benchmark(synth_repo):
     main(["--horizon", "1d", "--set-id", "SYN1",
           "--coins", "BTC", "ETH", "--restart", *_LEGACY_PER_ASSET])
 
-    naive   = pd.read_parquet(synth_repo / "Outputs" / "Signals" / "1d" / "NAIVE_FIXTURE.parquet")
-    syn1 = pd.read_parquet(synth_repo / "Outputs" / "Signals" / "1d" / "SYN1.parquet")
+    sig_dir = synth_repo / "Outputs" / "Signals" / "1d"
+    naive_cands = sorted(sig_dir.glob("NAIVE_FIXTURE_u_*.parquet"))
+    syn1_cands  = sorted(sig_dir.glob("SYN1_u_*.parquet"))
+    assert naive_cands and syn1_cands
+    naive = pd.read_parquet(naive_cands[0])
+    syn1  = pd.read_parquet(syn1_cands[0])
 
     acc_naive   = float((naive["prediction"]   == naive["target"]).mean())
     acc_syn1 = float((syn1["prediction"] == syn1["target"]).mean())
@@ -288,8 +294,12 @@ def test_syn_noise_does_not_meaningfully_beat_naive(synth_repo):
     main(["--horizon", "1d", "--set-id", "SYN_NOISE",
           "--coins", "BTC", "ETH", "--restart", *_LEGACY_PER_ASSET])
 
-    naive    = pd.read_parquet(synth_repo / "Outputs" / "Signals" / "1d" / "NAIVE_FIXTURE.parquet")
-    noise = pd.read_parquet(synth_repo / "Outputs" / "Signals" / "1d" / "SYN_NOISE.parquet")
+    sig_dir = synth_repo / "Outputs" / "Signals" / "1d"
+    naive_cands = sorted(sig_dir.glob("NAIVE_FIXTURE_u_*.parquet"))
+    noise_cands = sorted(sig_dir.glob("SYN_NOISE_u_*.parquet"))
+    assert naive_cands and noise_cands
+    naive = pd.read_parquet(naive_cands[0])
+    noise = pd.read_parquet(noise_cands[0])
     acc_naive    = float((naive["prediction"]    == naive["target"]).mean())
     acc_noise = float((noise["prediction"] == noise["target"]).mean())
 

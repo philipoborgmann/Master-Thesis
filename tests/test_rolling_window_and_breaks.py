@@ -155,10 +155,13 @@ def test_rolling_window_filename_differs_from_expanding(tmp_path, monkeypatch):
                                 "--rolling-window-timestamps", "30",
                                 "--no-tune-hyperparams", "--restart"])
     assert expanded == 0 and rolling == 0
-    assert (repo / "Outputs" / "Signals" / "1d" / "ECON_panel_pooled.parquet").exists()
-    rolling_path = repo / "Outputs" / "Signals" / "1d" / "ECON_panel_pooled_rw30.parquet"
-    assert rolling_path.exists(), \
+    sig_dir = repo / "Outputs" / "Signals" / "1d"
+    assert sorted(sig_dir.glob("ECON_panel_pooled_u_*.parquet")), \
+        "expanding output missing"
+    rolling_cands = sorted(sig_dir.glob("ECON_panel_pooled_rw30_u_*.parquet"))
+    assert rolling_cands, \
         "rolling-window run must NOT overwrite the expanding filename"
+    rolling_path = rolling_cands[0]
     sig = pd.read_parquet(rolling_path)
     assert (sig["train_window_mode"] == "rolling_fixed").all()
     assert (sig["train_window_timestamps"] <= 30).all()
@@ -174,7 +177,9 @@ def test_checkpoint_manifest_refuses_reuse_when_window_changes(tmp_path, monkeyp
                      "--model-type", "panel_logit", "--panel-mode", "pooled",
                      "--train-window", "expanding",
                      "--no-tune-hyperparams", "--restart"])
-    root = (repo / "Outputs" / "Checkpoints" / "Models" / "1d" / "ECON_panel_pooled")
+    ckpt_root_d = repo / "Outputs" / "Checkpoints" / "Models" / "1d"
+    cands = sorted(ckpt_root_d.glob("ECON_panel_pooled_u_*"))
+    root = cands[0] if cands else (ckpt_root_d / "ECON_panel_pooled")
     mf = ckpt.load_manifest(root)
     assert mf["train_window_mode"] == "expanding"
     chunk = ckpt.chunk_checkpoint_path(root, 0)
@@ -211,8 +216,10 @@ def test_panel_b1_runs_as_rolling_probability_benchmark(tmp_path, monkeypatch):
                           "--train-window", "expanding",
                           "--no-tune-hyperparams", "--restart"])
     assert rc == 0
-    out = repo / "Outputs" / "Signals" / "1d" / "NAIVE_FIXTURE_panel_pooled.parquet"
-    assert out.exists(), "panel rolling-prob NAIVE_FIXTURE must be produced, not silently skipped"
+    sig_dir = repo / "Outputs" / "Signals" / "1d"
+    cands = sorted(sig_dir.glob("NAIVE_FIXTURE_panel_pooled_u_*.parquet"))
+    assert cands, "panel rolling-prob NAIVE_FIXTURE must be produced, not silently skipped"
+    out = cands[0]
     sig = pd.read_parquet(out)
     assert not sig.empty
     assert (sig["benchmark_model"]

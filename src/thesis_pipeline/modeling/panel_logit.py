@@ -419,14 +419,21 @@ def _mode_suffix(panel_mode: str) -> str:
 
 def panel_output_name(set_id: str, sentiment_model: str, panel_mode: str,
                       hpo_variant: str = "fixed",
-                      window_suffix: str = "") -> str:
-    """``{set_id}[_{sentiment_model}]_{panel_pooled|panel_ticker_fe}[_{hpo_variant}][_rw{N}]``.
+                      window_suffix: str = "",
+                      coin_universe: "Iterable[str] | None" = None) -> str:
+    """``{set_id}[_{sentiment_model}]_{panel_pooled|panel_ticker_fe}[_{hpo_variant}][_rw{N}][_u_{hash}]``.
 
     A tuned run appends the HPO variant (e.g. ``..._panel_pooled_hpo_brier``)
     so tuned and fixed-C panel signals never share a filename. A rolling-window
     run appends ``_rw{N}`` (or ``_rw{D}d``) — see
     :func:`thesis_pipeline.modeling.windowing.window_suffix`. Expanding runs
-    keep the historical filenames unchanged.
+    keep the legacy unsuffixed window section.
+
+    When ``coin_universe`` is provided the requested-universe hash is
+    appended as ``_u_{8-hex}`` (commit 4 Section A.2). The hash is
+    produced by :func:`thesis_pipeline.modeling.naive_reference
+    .coin_universe_hash` — the exact same helper NAIVE uses, so a model
+    and its matched NAIVE share the suffix on disk.
     """
     suffix = _mode_suffix(panel_mode)
     if sentiment_model and str(sentiment_model) not in ("-", "nan"):
@@ -437,6 +444,11 @@ def panel_output_name(set_id: str, sentiment_model: str, panel_mode: str,
         base = f"{base}_{hpo_variant}"
     if window_suffix:
         base = f"{base}{window_suffix}"
+    if coin_universe is not None:
+        from .naive_reference import coin_universe_hash
+        h = coin_universe_hash(coin_universe)
+        if h:
+            base = f"{base}_u_{h}"
     return base
 
 
@@ -643,9 +655,14 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
             continue
 
         tickers = sorted(df_all["ticker"].unique())
-        if args.coins:
-            wanted = set(args.coins)
-            tickers = [t for t in tickers if t in wanted]
+        # Universe resolution — REQUESTED is immutable per-run, AVAILABLE is
+        # the subset present in the feature frame (commit 4 Section A.1).
+        from .naive_reference import resolve_universes
+        uni = resolve_universes(args.coins, tickers)
+        requested_tickers = list(uni["requested"])
+        available_tickers = list(uni["available"])
+        # Estimation runs on the AVAILABLE subset.
+        tickers = available_tickers
         print(f"  Tickers: {len(tickers)} — {', '.join(tickers)}")
 
         hz_dir = os.path.join(SIGNAL_DIR, hz)
@@ -660,8 +677,11 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
             if not (sent_model and str(sent_model) not in ("-", "nan")):
                 sent_model = "-"
 
+            # Output filename embeds the REQUESTED-universe hash so smoke
+            # and full-grid runs never share a parquet (commit 4 A.2).
             out_name = panel_output_name(set_id, sent_model, panel_mode,
-                                         hpo_variant, win_suffix)
+                                         hpo_variant, win_suffix,
+                                         coin_universe=requested_tickers)
             out_path = os.path.join(hz_dir, f"{out_name}.parquet")
 
             # Panel-compatible benchmark: ticker-rolling probability with pooled
@@ -723,19 +743,26 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                 "rolling_window_timestamps": rolling_window_timestamps,
                 "rolling_window_days":       rolling_window_days,
                 "benchmark":                 bool(is_benchmark),
+                # Universe identity (commit 4 A.4). Checkpoints created
+                # for a smaller universe must NOT resume a larger run.
+                "requested_tickers":            list(requested_tickers),
+                "requested_coin_universe_hash": uni["requested_hash"],
+                "n_requested_tickers":          len(requested_tickers),
             }
             if ckpt_on:
                 # Refuse to reuse checkpoints when the run's window mode,
-                # rolling-window size, feature list, HPO objective, panel mode
-                # or panel-mode/benchmark identity differs.
+                # rolling-window size, feature list, HPO objective, panel mode,
+                # benchmark identity, OR requested coin universe differs.
                 existing = ckpt.load_manifest(root)
                 guard_keys = ("train_window_mode", "rolling_window_timestamps",
                               "rolling_window_days", "feature_cols",
-                              "hpo_objective", "panel_mode", "benchmark")
+                              "hpo_objective", "panel_mode", "benchmark",
+                              "requested_coin_universe_hash",
+                              "requested_tickers")
                 if existing and any(existing.get(k) != manifest_base.get(k)
                                     for k in guard_keys):
                     print("  [INFO] Existing checkpoint manifest is incompatible "
-                          "(window/feature/hpo/panel-mode changed) — clearing.")
+                          "(window/feature/hpo/panel-mode/universe changed) — clearing.")
                     ckpt.clear_run_checkpoints(root)
                 if clear_ckpt:
                     ckpt.clear_run_checkpoints(root)
@@ -788,13 +815,16 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                 signals["hpo_enabled"]   = False
                 signals["hpo_objective"] = "-"
                 signals["hpo_variant"]   = "fixed"
-            # Universe identity (commit 3 Section B). Stamp the requested
-            # universe alongside the realized ticker set so the
-            # absolute_vs_naive evaluation can match by requested-hash
+            # Universe identity (commit 3 Section B + commit 4 A.5).
+            # Stamp the REQUESTED universe (immutable) alongside the
+            # AVAILABLE subset and the REALIZED ticker set so the
+            # absolute_vs_naive evaluation matches by requested-hash
             # without inferring from realized tickers later.
             from .naive_reference import stamp_universe_metadata
             signals = stamp_universe_metadata(
-                signals, requested_universe=tickers,
+                signals,
+                requested_universe=requested_tickers,
+                available_universe=available_tickers,
             )
             signals.to_parquet(out_path, index=False, engine="pyarrow")
 

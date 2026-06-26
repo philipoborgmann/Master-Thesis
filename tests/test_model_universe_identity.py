@@ -141,9 +141,11 @@ def test_absolute_vs_naive_uses_requested_hash_not_realized():
     assert out.iloc[0]["status"] in ("ok", "no_overlap")
 
 
-def test_absolute_vs_naive_flags_invalid_when_identity_columns_differ():
-    """Two rows tagged with the same short key but different rolling
-    windows must flag invalid_model_identity, not be silently collapsed."""
+def test_absolute_vs_naive_keeps_distinct_windows_as_separate_rows():
+    """Two valid runs sharing set_id but differing in rolling window must
+    each produce their own row (commit 4 Section B.1). Direct grouping by
+    the complete identity tuple ensures we never collapse + invalidate
+    legitimate parallel runs."""
     a = stamp_universe_metadata(
         _model_rows(rolling_window_days=180.0),
         requested_universe=("BTC", "ETH"),
@@ -156,10 +158,12 @@ def test_absolute_vs_naive_flags_invalid_when_identity_columns_differ():
         coin_universe_hash(("BTC", "ETH")),
     )], ignore_index=True)
     out = nc.absolute_vs_naive_table(sig)
-    assert (out["status"] == "invalid_model_identity").any()
-    bad_row = out[out["status"] == "invalid_model_identity"].iloc[0]
-    assert bad_row["skip_reason"] == "non_constant_identity_columns"
-    assert "rolling_window_days" in str(bad_row["non_constant_columns"])
+    # Two distinct complete identities → two rows.
+    assert len(out) == 2
+    assert set(out["rolling_window_days"].astype(float).tolist()) == {60.0, 180.0}
+    # No row is invalid because identity columns are constant within
+    # each complete-identity group.
+    assert (out["status"] != "invalid_model_identity").all()
 
 
 def test_absolute_vs_naive_two_universes_kept_distinct():
@@ -232,6 +236,67 @@ def test_absolute_vs_naive_ambiguous_naive_flagged():
 # ---------------------------------------------------------------------------
 # Legacy realized-fallback labelling
 # ---------------------------------------------------------------------------
+
+def test_parallel_rolling_windows_produce_two_valid_rows():
+    """rolling 180d and rolling 60d coexist as two valid rows."""
+    a = stamp_universe_metadata(
+        _model_rows(rolling_window_days=180.0),
+        requested_universe=("BTC", "ETH"),
+    )
+    b = stamp_universe_metadata(
+        _model_rows(rolling_window_days=60.0),
+        requested_universe=("BTC", "ETH"),
+    )
+    naive_a = _naive_rows(coin_universe_hash(("BTC", "ETH")))
+    naive_a["rolling_window_days"] = 180.0
+    naive_b = _naive_rows(coin_universe_hash(("BTC", "ETH")))
+    naive_b["rolling_window_days"] = 60.0
+    sig = pd.concat([a, b, naive_a, naive_b], ignore_index=True)
+    out = nc.absolute_vs_naive_table(sig)
+    assert len(out) == 2
+    assert set(out["rolling_window_days"].astype(float).tolist()) == {60.0, 180.0}
+
+
+def test_parallel_expanding_and_rolling_produce_two_rows():
+    a = stamp_universe_metadata(
+        _model_rows(rolling_window_days=180.0),
+        requested_universe=("BTC", "ETH"),
+    )
+    b = stamp_universe_metadata(
+        _model_rows(rolling_window_days=180.0),
+        requested_universe=("BTC", "ETH"),
+    )
+    b["train_window_mode"] = "expanding"
+    b["rolling_window_days"] = np.nan
+    naive_r = _naive_rows(coin_universe_hash(("BTC", "ETH")))
+    naive_e = _naive_rows(coin_universe_hash(("BTC", "ETH")))
+    naive_e["train_window_mode"] = "expanding"
+    naive_e["rolling_window_days"] = np.nan
+    sig = pd.concat([a, b, naive_r, naive_e], ignore_index=True)
+    out = nc.absolute_vs_naive_table(sig)
+    assert len(out) == 2
+    assert set(out["train_window_mode"].astype(str).tolist()) == {
+        "rolling_fixed", "expanding",
+    }
+
+
+def test_parallel_hpo_objectives_produce_two_rows():
+    a = stamp_universe_metadata(
+        _model_rows(hpo_objective="log_loss"),
+        requested_universe=("BTC", "ETH"),
+    )
+    b = stamp_universe_metadata(
+        _model_rows(hpo_objective="brier_score"),
+        requested_universe=("BTC", "ETH"),
+    )
+    naive = _naive_rows(coin_universe_hash(("BTC", "ETH")))
+    sig = pd.concat([a, b, naive], ignore_index=True)
+    out = nc.absolute_vs_naive_table(sig)
+    assert len(out) == 2
+    assert set(out["hpo_objective"].astype(str).tolist()) == {
+        "log_loss", "brier_score",
+    }
+
 
 def test_legacy_realized_fallback_is_explicitly_labelled():
     """A historical model frame WITHOUT a coin_universe_hash column must

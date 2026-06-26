@@ -68,11 +68,25 @@ def repo(tmp_path, monkeypatch):
 
 
 def _ckpt_dir(repo, out_name, horizon="1d"):
-    return repo / "Outputs" / "Checkpoints" / "Models" / horizon / out_name
+    """Locate the checkpoint dir for ``out_name`` allowing the v4 universe
+    hash suffix. The directory carries the same ``_u_<8-hex>`` suffix as
+    the signal file (commit 4 A.2)."""
+    root = repo / "Outputs" / "Checkpoints" / "Models" / horizon
+    exact = root / out_name
+    if exact.exists():
+        return exact
+    cands = sorted(root.glob(f"{out_name}_u_*"))
+    return cands[0] if cands else exact
 
 
 def _final(repo, name, horizon="1d"):
-    return repo / "Outputs" / "Signals" / horizon / f"{name}.parquet"
+    """Locate the final signal parquet allowing the v4 universe suffix."""
+    d = repo / "Outputs" / "Signals" / horizon
+    exact = d / f"{name}.parquet"
+    if exact.exists():
+        return exact
+    cands = sorted(d.glob(f"{name}_u_*.parquet"))
+    return cands[0] if cands else exact
 
 
 # ---------------------------------------------------------------------------
