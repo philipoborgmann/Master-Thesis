@@ -390,6 +390,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"  [WARN] No data for {hz} — skipping")
             continue
 
+        # ── Final-frame leakage assertion (Aufgabe 7) ─────────────
+        # The audit refuses raw engagement columns, ``*_weighted_mean``
+        # variants and rows where ``market_cap_available_at`` violates
+        # the strict-< availability rule. Failures raise — never
+        # warned-and-continue.
+        from ..diagnostics.leakage_checks import run_feature_leakage_audit
+        run_feature_leakage_audit(merged)
+
         out_path = os.path.join(OUTPUT_DIR, f"features_{hz}.parquet")
         merged.to_parquet(out_path, index=False, engine="pyarrow")
         size_mb = os.path.getsize(out_path) / 1024 / 1024
