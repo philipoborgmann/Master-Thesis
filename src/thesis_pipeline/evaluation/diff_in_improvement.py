@@ -346,7 +346,13 @@ def difference_in_improvement_table(
         "n_control", "n_treatment", "n_clusters",
         "mean_d_control", "mean_d_treatment",
         "diff_in_improvement", "se_diff", "t_stat", "p_value",
-        "dof", "test_valid", "small_cluster_warning", "skip_reason",
+        "dof", "test_valid", "small_cluster_warning",
+        # Availability-based regime-matching diagnostics (Section E).
+        "regime_match_strategy",
+        "share_unmatched_regime",
+        "median_regime_lag_days",
+        "min_regime_lag_days", "max_regime_lag_days",
+        "skip_reason",
     ]
     if signals is None or signals.empty:
         return pd.DataFrame(columns=columns)
@@ -436,11 +442,45 @@ def difference_in_improvement_table(
             continue
 
         # ── Regime join ─────────────────────────────────────────
+        # Availability-based as-of join (Section E). Each regime row in
+        # ``look`` carries ``regime_available_at`` — the UTC instant the
+        # regime becomes usable downstream. A prediction at time ``t`` is
+        # paired with the latest regime whose ``regime_available_at < t``
+        # (strict ``<`` via ``allow_exact_matches=False``). This replaces
+        # the previous fixed D-1 calendar shift and naturally accommodates
+        # intraday horizons: a 1h prediction at D 14:00 UTC may match the
+        # day-D regime (available at D 00:00) while a 1d prediction at
+        # D 00:00 UTC steps back one further row.
         d_frame = d_frame.copy()
-        d_frame["__join_date__"] = _join_date_for_signals(
-            d_frame["timestamp"], regime_col,
+        d_frame["timestamp"] = pd.to_datetime(
+            d_frame["timestamp"], utc=True, errors="coerce",
         )
-        joined = d_frame.merge(look, on=["ticker", "__join_date__"], how="left")
+        joined = _asof_join_regime(d_frame, look, regime_col)
+        n_matched_regime = int(joined[regime_col].notna().sum())
+        share_unmatched = (
+            float(1.0 - n_matched_regime / max(len(joined), 1))
+            if len(joined) else 1.0
+        )
+        diag_row["regime_match_strategy"] = "asof_backward_strict"
+        diag_row["share_unmatched_regime"] = share_unmatched
+        if n_matched_regime:
+            lag = (joined["timestamp"]
+                   - joined["regime_available_at"]).dt.total_seconds() / 86400.0
+            lag = lag.dropna()
+            diag_row["median_regime_lag_days"] = float(lag.median()) if len(lag) else float("nan")
+            diag_row["min_regime_lag_days"]    = float(lag.min())    if len(lag) else float("nan")
+            diag_row["max_regime_lag_days"]    = float(lag.max())    if len(lag) else float("nan")
+            # Strict-< availability assertion: every matched row must
+            # have the regime available strictly before the prediction
+            # timestamp. ``allow_exact_matches=False`` enforces this in
+            # the merge, but we re-assert here so a future refactor cannot
+            # silently relax the invariant.
+            matched_mask = joined[regime_col].notna()
+            assert (joined.loc[matched_mask, "regime_available_at"]
+                    < joined.loc[matched_mask, "timestamp"]).all(), (
+                "diff_in_improvement: regime_available_at must be strictly "
+                "before prediction timestamp for every matched row"
+            )
         if joined[regime_col].isna().all():
             diag_row["skip_reason"] = "no_regime_match"
             rows.append(diag_row)
@@ -486,49 +526,72 @@ def _series_eq_nan_safe(s: pd.Series, value) -> pd.Series:
         return s.astype(str) == str(value)
 
 
-def _join_date_for_signals(timestamps: pd.Series, regime_col: str) -> pd.Series:
-    """Compute the regime-lookup join key from prediction timestamps.
-
-    The default for v4 regime lookups (volatility, market-cap) is daily.
-    To honour the "no future regime info enters earlier intraday
-    predictions" rule (Aufgabe 6 follow-up G), every prediction at time
-    t joins the regime from the **previous** calendar day's lookup —
-    the daily regime is known fully by 00:00 UTC of the next day, the
-    same convention used by the market-cap availability offset.
-    """
-    ts = pd.to_datetime(timestamps, utc=True, errors="coerce")
-    # Strict-as-of-yesterday: subtract one day before normalising, so
-    # an intraday 1h prediction on day D pairs with the regime from
-    # day D-1.
-    return (ts - pd.Timedelta(days=1)).dt.normalize()
-
-
 def _prepare_regime_lookup(regime_lookup: pd.DataFrame,
                            regime_col: str) -> pd.DataFrame:
-    """Standardise the regime lookup to ``(ticker, __join_date__, regime_col)``.
+    """Standardise the regime lookup to ``(ticker, regime_available_at,
+    regime_col)`` for availability-based as-of joining (Section E).
 
-    The lookup is expected to carry a ``date`` (or ``timestamp``) column;
-    the helper normalises to tz-aware UTC midnight so the join key matches
-    :func:`_join_date_for_signals` exactly.
+    The lookup must carry either a ``regime_available_at`` column
+    (preferred — built natively by :func:`volatility.build_regime_lookup`
+    and :func:`market_cap.build_market_cap_lookup`) or a ``date`` /
+    ``timestamp`` column. When only ``date`` is available we derive
+    ``regime_available_at = date`` (i.e. the lookup is the
+    shifted-by-one-day v4 layout where ``date`` already denotes the
+    instant the regime can be used).
     """
     look = regime_lookup.copy()
-    if "date" in look.columns:
-        join_date = pd.to_datetime(look["date"], utc=True, errors="coerce")
-        if join_date.isna().any():
+    if "regime_available_at" in look.columns:
+        avail = pd.to_datetime(look["regime_available_at"], utc=True,
+                                errors="coerce")
+    elif "date" in look.columns:
+        avail = pd.to_datetime(look["date"], utc=True, errors="coerce")
+        if avail.isna().any():
             naive = pd.to_datetime(look["date"], errors="coerce")
-            join_date = naive.dt.tz_localize("UTC", nonexistent="shift_forward")
-        look["__join_date__"] = join_date.dt.normalize()
+            avail = naive.dt.tz_localize("UTC", nonexistent="shift_forward")
+        avail = avail.dt.normalize()
     elif "timestamp" in look.columns:
-        look["__join_date__"] = pd.to_datetime(
-            look["timestamp"], utc=True, errors="coerce"
-        ).dt.normalize()
+        avail = pd.to_datetime(look["timestamp"], utc=True, errors="coerce")
     else:
         raise ValueError(
             "difference_in_improvement_table: regime_lookup must have a "
-            "'date' or 'timestamp' column."
+            "'regime_available_at', 'date' or 'timestamp' column."
         )
-    look = look[["ticker", "__join_date__", regime_col]].copy()
-    return look.dropna(subset=["__join_date__", regime_col])
+    look["regime_available_at"] = avail
+    look = look[["ticker", "regime_available_at", regime_col]].copy()
+    return look.dropna(subset=["regime_available_at", regime_col])
+
+
+def _asof_join_regime(signals: pd.DataFrame,
+                      lookup: pd.DataFrame,
+                      regime_col: str) -> pd.DataFrame:
+    """Availability-based as-of join: signal ⨝ latest regime with
+    ``regime_available_at < timestamp`` (strict ``<``).
+
+    Implements Section E of the v4 cleanup: replaces the fixed D-1
+    calendar shift with a per-ticker ``pd.merge_asof`` keyed on the
+    regime row's wall-clock availability timestamp.
+    """
+    sig = signals.copy()
+    sig["timestamp"] = pd.to_datetime(sig["timestamp"], utc=True,
+                                       errors="coerce")
+    sig["ticker"] = sig["ticker"].astype(str).str.upper()
+    look = lookup.copy()
+    look["ticker"] = look["ticker"].astype(str).str.upper()
+    # ``merge_asof`` requires BOTH sides to be sorted by the ``on`` key
+    # globally; the ``by`` key only secondary-groups the comparison.
+    look = look.sort_values("regime_available_at").reset_index(drop=True)
+    sig_sorted = sig.sort_values("timestamp").reset_index()
+    joined = pd.merge_asof(
+        sig_sorted, look,
+        left_on="timestamp", right_on="regime_available_at",
+        by="ticker",
+        direction="backward",
+        allow_exact_matches=False,
+    )
+    # Restore the original signal-frame ordering so downstream alignment
+    # (the diff series ``d`` etc.) is not silently permuted.
+    joined = joined.sort_values("index").drop(columns=["index"]).reset_index(drop=True)
+    return joined
 
 
 def _empty_row(columns: list[str], ident: dict, bench_set_id,
@@ -552,11 +615,15 @@ def _empty_row(columns: list[str], ident: dict, bench_set_id,
               "n_control", "n_treatment", "n_clusters", "dof"):
         row[k] = 0
     for k in ("mean_d_control", "mean_d_treatment", "diff_in_improvement",
-              "se_diff", "t_stat", "p_value"):
+              "se_diff", "t_stat", "p_value",
+              "share_unmatched_regime",
+              "median_regime_lag_days",
+              "min_regime_lag_days", "max_regime_lag_days"):
         row[k] = float("nan")
     row["targets_identical"]      = False
     row["test_valid"]              = False
     row["small_cluster_warning"]  = False
+    row["regime_match_strategy"]   = "asof_backward_strict"
     row["skip_reason"]             = ""
     return row
 

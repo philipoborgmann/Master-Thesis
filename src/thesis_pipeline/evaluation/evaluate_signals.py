@@ -46,6 +46,7 @@ from .economic import (
     summarize_high_low_threshold_backtest,
 )
 from .incremental import incremental_sentiment_value_table
+from .naive_comparison import absolute_vs_naive_table
 from .reporting import (
     build_leaderboard, build_summary,
     print_console_summary, write_csv_outputs, write_excel_report,
@@ -210,7 +211,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                out_root / "pooled_metrics.csv",
                out_root / "per_ticker_metrics.csv",
                out_root / "threshold_analysis.csv",
-               out_root / "volatility_stratification.csv"]
+               out_root / "volatility_stratification.csv",
+               out_root / "absolute_vs_naive.csv"]
     if not args.no_market_cap:
         outputs += [out_root / "market_cap_stratification.csv",
                     out_root / "regime_interaction.csv"]
@@ -235,7 +237,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "no_market_cap":         args.no_market_cap,
             "no_economic":           args.no_economic,
             "no_regime_mcnemar":     args.no_regime_mcnemar,
+            "no_diff_in_improvement": getattr(args, "no_diff_in_improvement", False),
             "strict_feature_set_ids": args.strict_feature_set_ids,
+            "strict_filter_keeps_naive": True,
+            "regime_match_strategy": "asof_backward_strict",
+            "absolute_vs_naive_csv": str(out_root / "absolute_vs_naive.csv"),
             "transaction_cost_bps":  args.transaction_cost_bps or "(from config)",
             "backtest_config":       args.backtest_config or "(default)",
             "force":                 args.force,
@@ -516,6 +522,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         signals, warn_missing=_warn_missing_bench,
     )
 
+    # ── 8c. Absolute vs NAIVE comparison (v4 cleanup commit 2 Section F) ──
+    # One row per (model run × matched NAIVE) using the COMPLETE NAIVE
+    # identity (horizon, model_type, panel_mode, train_window_*,
+    # coin_universe_hash). Hypothesis family ``absolute_vs_naive`` —
+    # NEVER pooled with H1 / H2 / H3.
+    absolute_vs_naive_df = absolute_vs_naive_table(signals)
+
     # ── 9. Leaderboard + thesis-style summary ───────────────────
     leaderboard = build_leaderboard(pooled)
     summary     = build_summary(
@@ -607,6 +620,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                               if not getattr(args, "no_diff_in_improvement",
                                              False) else None),
         incremental_sentiment=incremental_df,
+        absolute_vs_naive=absolute_vs_naive_df,
     )
     xlsx = write_excel_report(
         xlsx_path,
@@ -627,6 +641,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                               if not getattr(args, "no_diff_in_improvement",
                                              False) else None),
         incremental_sentiment=incremental_df,
+        absolute_vs_naive=absolute_vs_naive_df,
     )
     logger.info("evaluate-signals: wrote Excel report %s", xlsx)
     for label, path in csv_paths.items():

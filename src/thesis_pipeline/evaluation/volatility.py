@@ -220,6 +220,18 @@ def build_ticker_regime_lookup(ticker: str) -> pd.DataFrame | None:
     """Return a ``date → regime`` table for a single ticker.
 
     Returns ``None`` when the OHLCV file is missing or empty.
+
+    Each row also carries availability metadata:
+
+    * ``regime_source_date`` — the underlying source-data date used to
+      compute the regime on this row. Because :func:`rolling_volatility`
+      applies a ``.shift(1)`` lookahead guard, the regime on lookup
+      ``date = D`` is computed from data on day ``D − 1``.
+    * ``regime_available_at`` — the UTC instant at which the regime
+      becomes available for use by downstream code. Equal to
+      ``regime_source_date + 1 day`` (the next 00:00 UTC after the source
+      bar closes). With the current shifted lookup that is exactly
+      ``date`` itself.
     """
     ohlcv = load_daily_ohlcv(ticker)
     if ohlcv is None or ohlcv.empty:
@@ -227,25 +239,39 @@ def build_ticker_regime_lookup(ticker: str) -> pd.DataFrame | None:
     gk = garman_klass_variance(ohlcv)
     vol = rolling_volatility(gk)
     regimes = assign_tercile_regimes(vol)
+    date = pd.to_datetime(ohlcv["date"], utc=True).dt.normalize()
+    # ``rolling_volatility`` already shifts by 1 so vol[D] uses data up to D-1.
+    source_date = date - pd.Timedelta(days=1)
+    available_at = source_date + pd.Timedelta(days=1)
     out = pd.DataFrame({
-        "date":   ohlcv["date"].values,
-        "gk_var": gk.values,
-        "vol":    vol.values,
-        "regime": regimes.values,
+        "date":                 date.values,
+        "regime_source_date":   source_date.values,
+        "regime_available_at":  available_at.values,
+        "gk_var":               gk.values,
+        "vol":                  vol.values,
+        "regime":               regimes.values,
     })
     out["ticker"] = ticker.upper()
     return out
 
 
 def build_regime_lookup(tickers: Iterable[str]) -> pd.DataFrame:
-    """Concatenated ``(ticker, date) → regime`` lookup for every ticker."""
+    """Concatenated ``(ticker, date) → regime`` lookup for every ticker.
+
+    The output also carries the availability columns
+    ``regime_source_date`` and ``regime_available_at`` so callers can
+    use ``pd.merge_asof`` for strict-availability joins instead of a
+    fixed calendar-day shift.
+    """
     frames = []
     for tk in sorted(set(t.upper() for t in tickers)):
         per = build_ticker_regime_lookup(tk)
         if per is not None:
             frames.append(per)
+    columns = ["ticker", "date", "regime_source_date", "regime_available_at",
+               "gk_var", "vol", "regime"]
     if not frames:
-        return pd.DataFrame(columns=["ticker", "date", "gk_var", "vol", "regime"])
+        return pd.DataFrame(columns=columns)
     return pd.concat(frames, ignore_index=True)
 
 

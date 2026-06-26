@@ -263,27 +263,29 @@ def test_diff_in_improvement_target_mismatch_guard():
 
 
 # ---------------------------------------------------------------------------
-# Section G — regime join uses the previous day (no future regime leak)
+# Section G — regime join uses availability-based as-of (no future regime leak)
 # ---------------------------------------------------------------------------
+#
+# v4 cleanup commit 2 Section E replaced the fixed D-1 calendar shift with a
+# per-ticker ``pd.merge_asof`` keyed on ``regime_available_at`` and
+# ``allow_exact_matches=False``. The strict-< semantics still forbid any
+# future regime leak — a prediction at time t never reads a regime row whose
+# availability instant is >= t — but they ALSO promote intraday signals to
+# the same-day morning regime as soon as it is published, instead of always
+# stepping back a full calendar day. See :mod:`tests.
+# test_regime_availability_matching` for the focused regime-availability
+# contract; the legacy fixed-D-1 tests live in commit 2's archive.
 
-def test_join_date_for_signals_uses_previous_day():
-    ts = pd.date_range("2024-01-15 13:00", periods=3, freq="h", tz="UTC")
-    out = di._join_date_for_signals(pd.Series(ts), regime_col="vol_regime")
-    # Every join_date should be 2024-01-14 (one day before the prediction).
-    assert (out == pd.Timestamp("2024-01-14", tz="UTC")).all()
-
-
-def test_intraday_signal_only_sees_yesterday_regime():
-    """An intraday 1h prediction at 2024-01-15 14:00 must NOT pick up the
-    2024-01-15 regime — only 2024-01-14's regime is admissible."""
-    # Two ticker rows: 2024-01-15 14:00.
+def test_intraday_signal_uses_freshest_available_regime():
+    """An intraday 1h prediction at 2024-01-15 14:00 UTC must pick up the
+    2024-01-15 regime — which became available at 2024-01-15 00:00 UTC and
+    is therefore strictly before the 14:00 prediction instant."""
     aug = _signals_for_diff("ECON_VAD_F", "vader", n_per_ticker=1, seed=42)
     aug["timestamp"] = pd.Timestamp("2024-01-15 14:00:00", tz="UTC")
     econ = aug.copy()
     econ["set_id"] = "ECON"
     econ["sentiment_model"] = "-"
     econ["target"] = aug["target"].values
-    # Regime lookup: yesterday's row says "low", today's row says "high".
     look = pd.DataFrame({
         "ticker": ["BTC", "ETH", "SOL", "BTC", "ETH", "SOL"],
         "date":   [pd.Timestamp("2024-01-14", tz="UTC")] * 3
@@ -297,9 +299,39 @@ def test_intraday_signal_only_sees_yesterday_regime():
         regime_col="vol_regime", treatment_value="high", control_value="low",
         hypothesis_family="H2_volatility",
     )
-    # The lookup join uses D-1 = 2024-01-14 with regime "low" for every
-    # ticker. So treatment_value="high" has 0 observations.
     row = out.iloc[0]
-    assert row["n_treatment"] == 0
-    # All observations are in the control regime ("low" → yesterday's label).
-    assert row["n_control"] >= 0
+    # The 2024-01-15 row (regime "high", available_at = 2024-01-15 00:00)
+    # is strictly before the prediction at 14:00 → every ticker matches it.
+    assert row["n_treatment"] >= 3
+    assert row["n_control"] == 0
+
+
+def test_daily_midnight_signal_skips_same_day_regime():
+    """A 1d prediction at 2024-01-15 00:00 UTC must NOT match the regime row
+    whose availability instant is exactly 2024-01-15 00:00 — strict-<
+    excludes the equal case. The latest admissible match is the row
+    available at 2024-01-14 00:00 (regime "low")."""
+    aug = _signals_for_diff("ECON_VAD_F", "vader", n_per_ticker=1, seed=43)
+    aug["timestamp"] = pd.Timestamp("2024-01-15 00:00:00", tz="UTC")
+    econ = aug.copy()
+    econ["set_id"] = "ECON"
+    econ["sentiment_model"] = "-"
+    econ["target"] = aug["target"].values
+    look = pd.DataFrame({
+        "ticker": ["BTC", "ETH", "SOL", "BTC", "ETH", "SOL"],
+        "date":   [pd.Timestamp("2024-01-14", tz="UTC")] * 3
+                  + [pd.Timestamp("2024-01-15", tz="UTC")] * 3,
+        "vol_regime": ["high"] * 3 + ["low"] * 3,
+    })
+    out = di.difference_in_improvement_table(
+        signals=pd.concat([aug, econ], ignore_index=True),
+        matched_benchmark=MATCHED_ECONOMIC_BENCHMARK,
+        regime_lookup=look,
+        regime_col="vol_regime", treatment_value="high", control_value="low",
+        hypothesis_family="H2_volatility",
+    )
+    row = out.iloc[0]
+    # 2024-01-15 00:00 strict-< excludes the same-day row (avail_at=00:00).
+    # The latest admissible row is 2024-01-14 (regime "high").
+    assert row["n_treatment"] >= 3
+    assert row["n_control"] == 0

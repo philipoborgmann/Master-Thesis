@@ -415,6 +415,7 @@ def write_csv_outputs(out_dir: Path, *,
                       regime_mcnemar_summary: pd.DataFrame | None = None,
                       diff_in_improvement: pd.DataFrame | None = None,
                       incremental_sentiment: pd.DataFrame | None = None,
+                      absolute_vs_naive: pd.DataFrame | None = None,
                       ) -> dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
@@ -441,6 +442,7 @@ def write_csv_outputs(out_dir: Path, *,
     _emit("diff_in_improvement",    diff_in_improvement,    "diff_in_improvement.csv")
     _emit("incremental_sentiment_value", incremental_sentiment,
           "incremental_sentiment_value.csv")
+    _emit("absolute_vs_naive", absolute_vs_naive, "absolute_vs_naive.csv")
     return paths
 
 
@@ -461,7 +463,8 @@ def write_excel_report(out_path: Path, *,
                        regime_mcnemar: pd.DataFrame | None = None,
                        regime_mcnemar_summary: pd.DataFrame | None = None,
                        diff_in_improvement: pd.DataFrame | None = None,
-                       incremental_sentiment: pd.DataFrame | None = None) -> Path:
+                       incremental_sentiment: pd.DataFrame | None = None,
+                       absolute_vs_naive: pd.DataFrame | None = None) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _write_all(target: Path) -> None:
@@ -493,6 +496,8 @@ def write_excel_report(out_path: Path, *,
             if incremental_sentiment is not None:
                 _write_sheet(writer, "incremental_sentiment_value",
                              incremental_sentiment)
+            if absolute_vs_naive is not None:
+                _write_sheet(writer, "absolute_vs_naive", absolute_vs_naive)
             _write_sheet(writer, "leaderboard",                   leaderboard)
             _write_sheet(writer, "summary",                       summary)
 

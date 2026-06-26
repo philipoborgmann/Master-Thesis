@@ -189,7 +189,9 @@ def build_market_cap_lookup(mcap_path: str | Path | None = None,
     """
     raw = load_market_cap(mcap_path)
     if raw.empty:
-        return pd.DataFrame(columns=["date", "ticker", "market_cap_lag", "mcap_regime"])
+        return pd.DataFrame(columns=["date", "ticker", "market_cap_lag",
+                                      "mcap_regime", "regime_source_date",
+                                      "regime_available_at"])
 
     if tickers is not None:
         universe = {_normalise_ticker(t) for t in tickers}
@@ -199,7 +201,9 @@ def build_market_cap_lookup(mcap_path: str | Path | None = None,
                 "evaluate-signals: market-cap data contains none of the "
                 "signal-universe tickers — mcap stratification will be empty"
             )
-            return pd.DataFrame(columns=["date", "ticker", "market_cap_lag", "mcap_regime"])
+            return pd.DataFrame(columns=["date", "ticker", "market_cap_lag",
+                                          "mcap_regime", "regime_source_date",
+                                          "regime_available_at"])
 
     lagged = normalize_market_cap(raw)
     # Daily cross-sectional tertile assignment using lagged mcap (no leakage).
@@ -216,6 +220,14 @@ def build_market_cap_lookup(mcap_path: str | Path | None = None,
         }))
     out = pd.concat(regimes, ignore_index=True)
     out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce").dt.normalize()
+    # Availability metadata (Section E). ``normalize_market_cap`` applies a
+    # ``.shift(1)`` lookahead guard so the regime on lookup ``date = D`` is
+    # computed from CMC data dated ``D − 1``. ``regime_available_at`` is the
+    # UTC instant at which the regime becomes usable downstream — equal to
+    # ``regime_source_date + 1 day`` (next 00:00 UTC after the source-day
+    # close), which with the shifted lookup is exactly ``date`` itself.
+    out["regime_source_date"]  = out["date"] - pd.Timedelta(days=1)
+    out["regime_available_at"] = out["regime_source_date"] + pd.Timedelta(days=1)
     return out.dropna(subset=["mcap_regime"]).reset_index(drop=True)
 
 
