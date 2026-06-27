@@ -581,6 +581,27 @@ def build_market_cap_series(
 # 5. FEATURE ENGINEERING
 # =============================================================================
 
+def _normalize_utc_ns(series: pd.Series) -> pd.Series:
+    """Coerce a datetime-like Series to ``datetime64[ns, UTC]``.
+
+    Handles every input class that has surfaced in the production
+    data flow: ``datetime64[{ms,us,ns}, UTC]``, naive datetimes
+    (interpreted as UTC — the pipeline's documented convention),
+    ISO date / datetime strings, and ``NaT``.
+
+    The conversion uses :func:`pd.to_datetime(..., utc=True,
+    errors='coerce')` and then explicitly downcasts to the
+    nanosecond UTC dtype so callers can rely on a single canonical
+    dtype across the merge-asof boundary.
+    """
+    parsed = pd.to_datetime(series, utc=True, errors="coerce")
+    # ``.astype("datetime64[ns, UTC]")`` works across the pandas
+    # versions the project supports (2.x + 3.x). On older versions
+    # ``parsed`` may already be ``[ns, UTC]`` — astype is a no-op
+    # in that case.
+    return parsed.astype("datetime64[ns, UTC]")
+
+
 def create_features_for_coin_horizon(
     price_dir: Path,
     ticker: str,
@@ -670,12 +691,40 @@ def create_features_for_coin_horizon(
 
     # ── Market-cap merge: strict as-of with documented availability ──
     # No same-day or future market cap may enter a row.
-    df = df.sort_values("timestamp").reset_index(drop=True)
+    #
+    # Production raw OHLCV parquet files and the CMC dump land on disk
+    # with DIFFERENT datetime resolutions (e.g. ``datetime64[ms, UTC]``
+    # for OHLCV vs ``datetime64[us, UTC]`` for the reshaped CMC
+    # series). ``pd.merge_asof`` refuses to join across mismatched
+    # resolutions with ``MergeError: incompatible merge keys [0]
+    # datetime64[ms, UTC] and datetime64[us, UTC]``. Normalise BOTH
+    # join keys to ``datetime64[ns, UTC]`` immediately before the
+    # merge, then assert they actually share a dtype — a defensive
+    # guard so a future pandas upgrade cannot regress silently.
     if market_cap_series is not None and not market_cap_series.empty:
         mc = market_cap_series[
             ["market_cap_source_date", "market_cap_available_at",
              "market_cap", "log_market_cap_lag1"]
         ].copy()
+        df["timestamp"] = _normalize_utc_ns(df["timestamp"])
+        mc["market_cap_available_at"] = _normalize_utc_ns(
+            mc["market_cap_available_at"]
+        )
+        if df["timestamp"].dtype != mc["market_cap_available_at"].dtype:
+            raise TypeError(
+                "Market-cap merge_asof keys are not the same dtype after "
+                f"normalisation: left 'timestamp'={df['timestamp'].dtype} "
+                "vs right 'market_cap_available_at'="
+                f"{mc['market_cap_available_at'].dtype}"
+            )
+        # ``pd.merge_asof`` refuses null keys on either side — drop NaT
+        # availability rows BEFORE the merge so a tampered CMC dump
+        # never crashes the pipeline. Unmatched price rows fall through
+        # as NaN, which is the documented behaviour.
+        mc = mc[mc["market_cap_available_at"].notna()].copy()
+        # Sort AFTER normalisation so the merge sees a canonical, sorted
+        # column on both sides.
+        df = df.sort_values("timestamp").reset_index(drop=True)
         mc = mc.sort_values("market_cap_available_at").reset_index(drop=True)
         df = pd.merge_asof(
             df,
@@ -686,6 +735,7 @@ def create_features_for_coin_horizon(
             allow_exact_matches=False,
         )
     else:
+        df = df.sort_values("timestamp").reset_index(drop=True)
         df["market_cap"]              = np.nan
         df["log_market_cap_lag1"]     = np.nan
         df["market_cap_source_date"]  = pd.NaT
