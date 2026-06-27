@@ -262,7 +262,7 @@ def test_no_same_date_merge_in_production_regime_code():
     for p in src.glob("*.py"):
         if p.name == "regime_join.py":
             continue
-        text = p.read_text()
+        text = p.read_text(encoding="utf-8")
         if "merge(rl, on=[\"ticker\", \"date\"]" in text:
             offenders.append(str(p))
     assert offenders == [], offenders

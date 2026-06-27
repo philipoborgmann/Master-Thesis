@@ -142,7 +142,7 @@ def audit_price_features() -> dict:
     """
     try:
         from ..price import features as pf
-        src = Path(pf.__file__).read_text()
+        src = Path(pf.__file__).read_text(encoding="utf-8")
         has_momentum = ("cum_log_return" in src and "BARS_PER_DAY" in src)
         has_vol = ("realized_vol_14d" in src and "BARS_PER_DAY" in src)
         return {
@@ -170,7 +170,7 @@ def audit_market_cap() -> dict:
     feature-building code path."""
     try:
         from ..price import features as pf
-        src = Path(pf.__file__).read_text()
+        src = Path(pf.__file__).read_text(encoding="utf-8")
         used_strict = "allow_exact_matches=False" in src
         has_lag1 = "log_market_cap_lag1" in src
         has_avail = "market_cap_available_at" in src

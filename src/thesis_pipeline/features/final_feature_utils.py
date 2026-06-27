@@ -33,6 +33,23 @@ SENTIMENT_MODELS: tuple[str, ...] = ("cryptobert", "vader")
 SENTIMENT_PREFIXES: tuple[str, ...] = tuple(f"{m}_" for m in SENTIMENT_MODELS)
 _SENTIMENT_TOKENS: tuple[str, ...] = ("bullishness", "post_count")
 
+#: Diagnostic attention columns that may legitimately appear in the
+#: final feature parquet but are NOT part of the 17-set modeling
+#: registry. The stationarity / descriptive paths still surface them
+#: when present so the report reads ``post_count`` next to the
+#: sentiment polarity series instead of silently dropping it.
+DIAGNOSTIC_ATTENTION_FEATURES: tuple[str, ...] = (
+    "post_count",
+    "log1p_post_count",
+    "has_posts",
+    # Per-scorer directional post-count diagnostics — expanded across
+    # SENTIMENT_MODELS so a frame can carry ``vader_directional_post_count``
+    # plus the bare ``directional_post_count`` rollup.
+    "directional_post_count",
+    "vader_directional_post_count",
+    "cryptobert_directional_post_count",
+)
+
 # Group membership for the canonical thesis features.
 _PRICE_FEATURES: frozenset = frozenset({
     "log_return_t",
@@ -83,6 +100,8 @@ def classify_feature_group(feature: str) -> str:
     if any(f.startswith(p) for p in SENTIMENT_PREFIXES):
         return "sentiment"
     if any(tok in f for tok in _SENTIMENT_TOKENS):
+        return "sentiment"
+    if f in DIAGNOSTIC_ATTENTION_FEATURES:
         return "sentiment"
     return "other"
 
@@ -182,6 +201,28 @@ def resolve_final_feature_columns(
                 "set_id":              "__numeric_fallback__",
                 "category":            "",
                 "label":               "numeric fallback (registry unavailable)",
+                "sentiment_model":     "",
+                "requested_feature":   col,
+                "resolved_feature":    col,
+                "exists_in_final_data": True,
+                "reason_if_missing":   "",
+            })
+
+    # Diagnostic attention columns that exist in the frame but are NOT
+    # in the 17-set modeling registry. These remain diagnostic-only —
+    # they're NEVER added to the registry — but the stationarity /
+    # descriptive paths surface them so a final report reads
+    # ``post_count`` alongside the sentiment polarity series.
+    for col in DIAGNOSTIC_ATTENTION_FEATURES:
+        if col in columns_in_df and col not in seen \
+                and not _is_identifier_column(col):
+            seen.add(col)
+            resolved_order.append(col)
+            resolution.append({
+                "set_id":              "__diagnostic_attention__",
+                "category":            "diagnostic_attention",
+                "label":               "attention / post-count diagnostic "
+                                        "(not a modeling feature)",
                 "sentiment_model":     "",
                 "requested_feature":   col,
                 "resolved_feature":    col,

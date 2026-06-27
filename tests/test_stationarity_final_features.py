@@ -52,6 +52,12 @@ SENTIMENT_COLUMNS = [
     "vader_post_count",
     "cryptobert_post_count",
     "post_count",
+    # Diagnostic attention columns: present in the final parquet but
+    # NOT in the 17-set modeling registry. The stationarity stage
+    # picks them up via DIAGNOSTIC_ATTENTION_FEATURES so the report
+    # still surfaces them.
+    "log1p_post_count",
+    "has_posts",
 ]
 ECONOMIC_COLUMNS = ["log_return_t", "cum_log_return_7", "cum_log_return_14",
                     "realized_vol_14", "volume_diff", "market_cap_t"]
@@ -206,14 +212,29 @@ def test_run_final_records_include_sentiment(stationarity_repo, stationarity_mod
     records = pd.read_csv(out_dir / "stationarity_final_records.csv")
     feats = set(records["feature"].astype(str))
 
+    # v4 final feature path: no ``*_weighted_mean`` rows survive in the
+    # canonical registry. The diagnostic attention columns
+    # (``post_count``, ``log1p_post_count``, ``has_posts``) are surfaced
+    # by :data:`final_feature_utils.DIAGNOSTIC_ATTENTION_FEATURES` when
+    # they exist in the parquet — even though they are NOT modeling
+    # features.
     must_have = {
         "log_return_t",
         "vader_title_score_mean", "cryptobert_title_score_mean",
-        "vader_title_score_weighted_mean",
         "vader_bullishness_ratio",
         "vader_title_score_std",
         "post_count",
     }
+    # Optional diagnostic-attention columns: required iff the fixture
+    # actually carries them.
+    fixture_cols = set(
+        pd.read_parquet(
+            stationarity_repo / "Data" / "Final" / "features_1d.parquet"
+        ).columns
+    )
+    for opt in ("log1p_post_count", "has_posts"):
+        if opt in fixture_cols:
+            must_have.add(opt)
     missing = must_have - feats
     assert not missing, (
         f"stationarity records lost {sorted(missing)} — the stage fell back "
