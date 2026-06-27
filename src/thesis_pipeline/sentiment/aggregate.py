@@ -62,12 +62,19 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 MODELS = ["vader", "cryptobert"]   # FinBERT removed (see docs/refactor_log.md)
 
+# Repository-root paths (commit 8). Resolving via :func:`config.project_root`
+# means ``python -m thesis_pipeline.cli create-sentiment-features`` and the
+# direct module entry point both read/write under ``<repo>/Data/...``
+# regardless of cwd or editable-install layout.
+from ..config import project_root as _project_root
+
+_REPO_ROOT = _project_root()
 DEFAULT_INPUTS = {
-    "vader":      os.path.join("Data", "Transformed", "Sentiment_Scored_Vader.csv"),
-    "cryptobert": os.path.join("Data", "Transformed", "Sentiment_Scored_Cryptobert.csv"),
+    "vader":      str(_REPO_ROOT / "Data" / "Transformed" / "Sentiment_Scored_Vader.csv"),
+    "cryptobert": str(_REPO_ROOT / "Data" / "Transformed" / "Sentiment_Scored_Cryptobert.csv"),
 }
 
-OUTPUT_DIR = os.path.join("Data", "Features")
+OUTPUT_DIR = str(_REPO_ROOT / "Data" / "Features")
 PLOT_DIR   = os.path.join(OUTPUT_DIR, "plots")
 
 EMPTY_SELFTEXT = {"[removed]", "[deleted]", "", "nan", "None"}
@@ -542,6 +549,10 @@ def create_all_plots(df_post, df_daily, plot_dir):
 def save_parquet(df, path, label):
     abs_path = os.path.abspath(path)
     os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
+    # Generator-boundary contract: refuse to write a sentiment parquet
+    # that carries any ``*_weighted_mean`` or raw engagement column.
+    from ..diagnostics.feature_schema import validate_sentiment_feature_schema
+    validate_sentiment_feature_schema(df, source=abs_path)
     df.to_parquet(abs_path, index=False, engine="pyarrow")
     size = os.path.getsize(abs_path)
     print(f"  {label}: {abs_path} ({size / 1024 / 1024:.1f} MB, "

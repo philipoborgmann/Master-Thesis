@@ -51,24 +51,30 @@ def get_included_tickers(coverage_path: str, horizon: str,
 
 
 def load_price_features(horizon: str, feature_dir: str = FEATURE_DIR) -> pd.DataFrame:
-    """Load price features parquet for a horizon."""
+    """Load price features parquet for a horizon AND validate the v4 schema."""
     path = os.path.join(feature_dir, f"price_features_{horizon}.parquet")
     if not os.path.isfile(path):
         print(f"  [ERROR] Missing: {path}")
         return pd.DataFrame()
     df = pd.read_parquet(path)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    # Refuse pre-v4 schemas with an actionable regenerate-with message.
+    from ..diagnostics.feature_schema import validate_price_feature_schema
+    validate_price_feature_schema(df, horizon=horizon, source=path)
     return df
 
 
 def load_sentiment_features(horizon: str, feature_dir: str = FEATURE_DIR) -> pd.DataFrame:
-    """Load sentiment features parquet for a horizon."""
+    """Load sentiment features parquet for a horizon AND validate the v4
+    Variante-A contract."""
     path = os.path.join(feature_dir, f"sentiment_features_{horizon}.parquet")
     if not os.path.isfile(path):
         print(f"  [ERROR] Missing: {path}")
         return pd.DataFrame()
     df = pd.read_parquet(path)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    from ..diagnostics.feature_schema import validate_sentiment_feature_schema
+    validate_sentiment_feature_schema(df, horizon=horizon, source=path)
     return df
 
 
