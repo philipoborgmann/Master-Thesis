@@ -71,9 +71,18 @@ import pandas as pd
 # 1. DEFAULT CONFIGURATION
 # =============================================================================
 
-BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_PRICE_DIR = BASE_DIR / "Data" / "Raw" / "Price"
-DEFAULT_OUTPUT_DIR = BASE_DIR / "Data" / "Features"
+# Repository-root data layout. The price generator was previously
+# anchored on ``Path(__file__).resolve().parent`` which put the defaults
+# under ``src/thesis_pipeline/price/Data/`` and broke ``python -m
+# thesis_pipeline.cli create-price-features``. Use the shared
+# :func:`thesis_pipeline.config.resolve_path` helper instead so the
+# generator reads from and writes to the canonical repo-root layout on
+# every OS / install mode.
+from ..config import resolve_path as _resolve_path
+DEFAULT_PRICE_DIR = _resolve_path("raw_price_root")
+DEFAULT_OUTPUT_DIR = Path(_resolve_path(
+    "price_features_pattern", horizon="1d"
+)).parent
 
 HORIZONS = ["1h", "6h", "1d"]
 
@@ -579,6 +588,7 @@ def create_features_for_coin_horizon(
     market_cap_series: Optional[pd.DataFrame],
     winsor_p: float,
     marketcap_lag_days: int = 0,  # noqa: ARG001 — accepted for CLI back-compat; ignored.
+    ohlcv_override: Optional[pd.DataFrame] = None,
 ) -> tuple[pd.DataFrame, dict, list[dict]]:
     """Creates features for one ticker-horizon pair.
 
@@ -592,13 +602,21 @@ def create_features_for_coin_horizon(
     only enters a row whose ``timestamp`` is **strictly** after that
     instant (``allow_exact_matches=False``). The legacy
     ``--marketcap_lag_days`` flag is ignored.
+
+    ``ohlcv_override`` is a unit-test hook: pass a fully-formed OHLCV
+    frame and the function skips the parquet read. It must NOT be used
+    in production code paths.
     """
     if horizon not in BARS_PER_DAY:
         raise ValueError(
             f"Unknown horizon {horizon!r}; expected one of {list(BARS_PER_DAY)}"
         )
 
-    df = load_ohlcv(price_dir, ticker, horizon)
+    if ohlcv_override is not None:
+        df = ohlcv_override.copy()
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    else:
+        df = load_ohlcv(price_dir, ticker, horizon)
     if df is None or df.empty:
         report = {
             "ticker": ticker,
@@ -854,7 +872,17 @@ def main(argv=None) -> int:
             except Exception as exc:  # noqa: BLE001
                 print(f"[WARN] timing audit skipped for {horizon}: {exc}")
 
-            output_path = output_dir / f"features_{horizon}.parquet"
+            # Canonical v4 filename: ``price_features_{horizon}.parquet``
+            # (matches ``configs/paths.yaml :: price_features_pattern``
+            # and the downstream merge stage). Legacy installations
+            # produced ``features_{horizon}.parquet``; the v4 merge
+            # never reads that name.
+            output_path = output_dir / f"price_features_{horizon}.parquet"
+            # Generator-boundary schema validation. Refuses to write a
+            # parquet that lacks any required ECON column.
+            from ..diagnostics.feature_schema import validate_price_feature_schema
+            validate_price_feature_schema(df_horizon, horizon=horizon,
+                                            source=output_path)
             df_horizon.to_parquet(output_path, index=False)
             print(f"\n[INFO] Saved {output_path} ({len(df_horizon):,} rows, {df_horizon.shape[1]} columns)")
         else:

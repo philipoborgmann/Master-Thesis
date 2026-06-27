@@ -243,7 +243,7 @@ def break_repo(tmp_path, monkeypatch):
             "timestamp": ts, "ticker": tk, "horizon": "1d",
             "target": rng.integers(0, 2, n),
             "log_return_t": rng.normal(0, 0.02, n),
-            "realized_vol_14": np.abs(rng.normal(0.02, 0.005, n)),
+            "realized_vol_14d": np.abs(rng.normal(0.02, 0.005, n)),
             "volume_diff": rng.normal(0, 0.5, n),
             "post_count": rng.integers(0, 5, n),
             "vader_title_score_mean": rng.normal(0, 0.1, n),
@@ -314,8 +314,17 @@ def merge_repo(tmp_path, monkeypatch):
         price_rows.append(pd.DataFrame({
             "timestamp": ts, "ticker": tk, "horizon": "1d",
             "target": [0, 1] * (n // 2),
-            "log_return_t":    np.linspace(-0.01, 0.01, n),
-            "realized_vol_14": np.linspace(0.01, 0.02, n),
+            # v4 canonical momentum + realised-volatility names. The
+            # schema validator in :mod:`thesis_pipeline.diagnostics
+            # .feature_schema` refuses legacy ``cum_log_return_N`` /
+            # ``realized_vol_14`` aliases.
+            "log_return_t":         np.linspace(-0.01, 0.01, n),
+            "cum_log_return_7d":    np.linspace(-0.02, 0.02, n),
+            "cum_log_return_14d":   np.linspace(-0.03, 0.03, n),
+            "cum_log_return_21d":   np.linspace(-0.04, 0.04, n),
+            "realized_vol_14d":     np.linspace(0.01, 0.02, n),
+            "volume_diff":          np.linspace(0.0, 1.0, n),
+            "log_market_cap_lag1":  np.linspace(20.0, 21.0, n),
             # v4 final-frame leakage assertion (Aufgabe 7) requires the
             # availability stamp on every merged frame. The fixture
             # mirrors the strict-< rule: market_cap_available_at = D 00:00
@@ -386,7 +395,7 @@ def test_no_neutral_fill_leaves_missing_sentiment_nan(merge_repo):
     assert sol["vader_bullishness_ratio"].isna().all()
     # Non-sentiment columns are not touched in either direction.
     assert sol["log_return_t"].notna().all()
-    assert sol["realized_vol_14"].notna().all()
+    assert sol["realized_vol_14d"].notna().all()
 
 
 def test_neutral_fill_sets_sentiment_std_to_zero(merge_repo):
@@ -465,26 +474,26 @@ def test_fill_missing_sentiment_fills_each_column_kind_correctly():
 
 
 def test_non_sentiment_std_like_columns_are_not_filled():
-    """``realized_vol_14`` looks std-ish in spirit but is NOT a sentiment
+    """``realized_vol_14d`` looks std-ish in spirit but is NOT a sentiment
     column, so ``sentiment_neutral_columns`` must keep it out of scope.
     """
-    cols = ["realized_vol_14", "vader_title_score_std", "cryptobert_combined_score_std",
+    cols = ["realized_vol_14d", "vader_title_score_std", "cryptobert_combined_score_std",
             "log_return_t", "target", "timestamp", "ticker"]
     fill_targets = set(fm.sentiment_neutral_columns(cols))
     assert {"vader_title_score_std", "cryptobert_combined_score_std"} <= fill_targets
-    assert "realized_vol_14" not in fill_targets
+    assert "realized_vol_14d" not in fill_targets
     assert fill_targets.isdisjoint({"log_return_t", "target", "timestamp", "ticker"})
 
 
 def test_neutral_fill_targets_only_sentiment_attention_columns():
     cols = ["vader_title_score_mean", "vader_bullishness_ratio",
             "vader_title_score_std", "post_count", "log_return_t",
-            "realized_vol_14", "market_cap_t", "target", "timestamp", "ticker"]
+            "realized_vol_14d", "market_cap_t", "target", "timestamp", "ticker"]
     fill_targets = set(fm.sentiment_neutral_columns(cols))
     # Sentiment / attention columns are in scope.
     assert {"vader_title_score_mean", "vader_bullishness_ratio",
             "vader_title_score_std", "post_count"} <= fill_targets
     # Non-sentiment columns are NEVER neutral-fill targets.
-    assert fill_targets.isdisjoint({"log_return_t", "realized_vol_14",
+    assert fill_targets.isdisjoint({"log_return_t", "realized_vol_14d",
                                      "market_cap_t", "target",
                                      "timestamp", "ticker"})
