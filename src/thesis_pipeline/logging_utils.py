@@ -26,13 +26,30 @@ _DEFAULT_FORMAT = "[%(levelname)s] %(asctime)s %(name)s :: %(message)s"
 
 
 def get_logger(name: str = _LOGGER_NAME) -> logging.Logger:
+    """Return the named logger, attaching the canonical stderr handler
+    exactly once on the parent ``thesis_pipeline`` namespace.
+
+    The parent logger keeps ``propagate=True`` so descendant loggers
+    (``thesis_pipeline.completed_slot`` and friends) reach pytest's
+    root ``caplog`` handler. To avoid double-printing on the console
+    when the root has a real handler attached, we tag our own handler
+    and refuse to add it twice.
+    """
     logger = logging.getLogger(name)
-    if not logger.handlers:
+    parent = logging.getLogger(_LOGGER_NAME)
+    if not any(getattr(h, "_thesis_pipeline_handler", False)
+                for h in parent.handlers):
         handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(logging.Formatter(_DEFAULT_FORMAT, datefmt="%Y-%m-%d %H:%M:%S"))
-        logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
-        logger.propagate = False
+        handler.setFormatter(
+            logging.Formatter(_DEFAULT_FORMAT, datefmt="%Y-%m-%d %H:%M:%S")
+        )
+        handler._thesis_pipeline_handler = True   # noqa: SLF001
+        parent.addHandler(handler)
+        parent.setLevel(logging.INFO)
+        # propagate=True keeps records flowing to pytest's caplog handler
+        # at the root. The double-add guard above ensures we never emit
+        # twice in normal CLI use.
+        parent.propagate = True
     return logger
 
 

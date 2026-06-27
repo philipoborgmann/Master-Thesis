@@ -464,6 +464,26 @@ def cmd_run_stage(args: argparse.Namespace) -> int:
 def cmd_run_pipeline(args: argparse.Namespace) -> int:
     pipeline = load_config("pipeline")
     stages = args.stages or pipeline.get("default_order", [])
+    # Pipeline-level dry-run preview. Each stage's own dispatcher also
+    # short-circuits on --dry-run (via :func:`_stage_dry_run`), but
+    # emitting an orchestrator header up-front documents the canonical
+    # order — and means a missing/optional sub-flag on a stage cannot
+    # block the dry-run path with a parser error.
+    if getattr(args, "dry_run", False):
+        from .logging_utils import log_stage_header
+        log_stage_header(
+            "run_pipeline",
+            mode="dry-run",
+            inputs=[],
+            outputs=[],
+            extra={
+                "stages":   stages,
+                "horizon":  getattr(args, "horizon", None) or "(all)",
+                "smoke":    bool(getattr(args, "smoke", False)),
+                "force":    bool(getattr(args, "force", False)),
+                "dry_run":  True,
+            },
+        )
     rc = 0
     for stage in stages:
         get_logger().info(">>> running stage: %s", stage)
@@ -695,9 +715,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # run-pipeline
     sp = sub.add_parser("run-pipeline", help="Run multiple stages in order.")
-    sp.add_argument("--stages", nargs="*", default=None,
-                    help="Subset of stages to run, in the given order. "
-                         "Defaults to configs/pipeline.yaml default_order.")
+    # ``--smoke`` / ``--dry-run`` / ``--force`` are registered FIRST so
+    # they cannot be greedily consumed by an ``nargs="*"`` option that
+    # follows (``--stages``, ``--coins``, ``--transaction-cost-bps``).
+    _add_common(sp)
     sp.add_argument("--horizon", default=None)
     sp.add_argument("--set-id", dest="set_id", default=None)
     sp.add_argument("--coins", nargs="*")
@@ -717,7 +738,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--backtest-config", dest="backtest_config", default=None)
     sp.add_argument("--transaction-cost-bps", dest="transaction_cost_bps",
                     type=float, nargs="*", default=None)
-    _add_common(sp)
+    sp.add_argument("--stages", nargs="*", default=None,
+                    help="Subset of stages to run, in the given order. "
+                         "Defaults to configs/pipeline.yaml default_order.")
     sp.set_defaults(func=cmd_run_pipeline)
 
     return p

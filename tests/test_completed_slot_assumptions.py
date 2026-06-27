@@ -127,3 +127,28 @@ def test_completed_slot_unresolved_warning_text_present():
     msg = CompletedSlotAssumption.UNRESOLVED_WARNING
     assert "REMAINING ASSUMPTION" in msg
     assert "observation cutoff" in msg
+
+
+# ---------------------------------------------------------------------------
+# Regression: caplog must capture the unresolved-warning record even when
+# ``get_logger()`` has already wired its own stderr handler (Windows
+# failure path — propagate=False used to block the propagation to root).
+# ---------------------------------------------------------------------------
+
+def test_completed_slot_warning_propagates_to_caplog(caplog):
+    import logging
+    from thesis_pipeline.logging_utils import get_logger
+
+    # Trigger the production logger configuration up-front.
+    get_logger()
+    df = _aggregated(["2024-01-10 18:00:00"], 6 * 3600)
+    with caplog.at_level(logging.WARNING,
+                          logger="thesis_pipeline.completed_slot"):
+        out = assert_only_completed_slots(df, horizon="6h",
+                                            observation_cutoff=None)
+    # Frame unchanged + exactly one captured warning record.
+    pd.testing.assert_frame_equal(out, df)
+    relevant = [r for r in caplog.records
+                if "REMAINING ASSUMPTION" in r.getMessage()]
+    assert len(relevant) == 1
+    assert relevant[0].levelno == logging.WARNING
