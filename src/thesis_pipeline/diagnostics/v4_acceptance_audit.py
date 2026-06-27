@@ -247,13 +247,19 @@ def audit_modeling_defaults() -> dict:
 def audit_evaluation() -> dict:
     """NAIVE not in the registry; ECON is the matched benchmark; H2/H3
     families exist; ticker-clustered inference; McNemar supplementary;
-    BH within family."""
+    BH within family. Class-weight grid is verified against the
+    canonical YAML config."""
     try:
         from ..evaluation.diff_in_improvement import (
-            H_HYPOTHESIS_FAMILIES, adjust_pvalues_bh_within_family,
+            H_HYPOTHESIS_FAMILIES, H2H3_FAMILY_COLUMNS,
+            adjust_pvalues_bh_within_family,
+            cluster_robust_difference_in_improvement,
         )
         from ..evaluation.incremental import (
             MATCHED_ECONOMIC_BENCHMARK, NAIVE_REFERENCE_LABEL,
+        )
+        from ..evaluation.significance import (
+            mcnemar_continuity_corrected, regime_mcnemar_table,
         )
         from ..features.feature_registry import SET_ID_PATTERN
     except Exception as exc:  # noqa: BLE001
@@ -278,29 +284,106 @@ def audit_evaluation() -> dict:
         _entry(PASS, "adjust_pvalues_bh_within_family exposed")
         if callable(adjust_pvalues_bh_within_family) else _entry(FAIL, "BH helper missing")
     )
+    # ── Ticker-clustered inference — verify by running a tiny panel
+    # through the cluster-robust helper and confirming the result
+    # records the cluster count.
+    try:
+        import numpy as np
+        rng = np.random.default_rng(0)
+        n_clusters, n_per = 12, 30
+        n = n_clusters * n_per
+        x = (np.arange(n) % 2).astype(float)
+        cl = np.repeat(np.arange(n_clusters), n_per)
+        y = 0.2 * x + rng.normal(0, 0.5, n)
+        res = cluster_robust_difference_in_improvement(
+            y, x, cl, use_statsmodels=False,
+        )
+        if res.get("n_clusters") == n_clusters and res.get("test_valid"):
+            out["ticker_clustered_inference"] = _entry(
+                PASS, "cluster-robust helper returns dof=n_clusters-1")
+        else:
+            out["ticker_clustered_inference"] = _entry(
+                FAIL, f"cluster helper returned {res}")
+    except Exception as exc:  # noqa: BLE001
+        out["ticker_clustered_inference"] = _entry(
+            FAIL, f"cluster helper raised: {exc}")
+    # ── H2/H3 identity column tuple is complete enough to refuse
+    # cross-family matches.
+    out["h2_h3_family_identity_columns"] = (
+        _entry(PASS, ",".join(H2H3_FAMILY_COLUMNS))
+        if {"horizon", "model_type", "panel_mode",
+            "train_window_mode", "rolling_window_days"}.issubset(
+                set(H2H3_FAMILY_COLUMNS))
+        else _entry(FAIL,
+                     "H2/H3 family identity is too narrow")
+    )
+    # ── McNemar (supplementary) layer is exposed.
+    out["mcnemar_supplementary_layer"] = (
+        _entry(PASS, "mcnemar_continuity_corrected + regime_mcnemar_table")
+        if callable(mcnemar_continuity_corrected)
+        and callable(regime_mcnemar_table)
+        else _entry(FAIL, "supplementary McNemar helpers missing")
+    )
+    # ── Class-weight grid: read the canonical HPO config and verify
+    # the grid matches the documented Variante A: ``[None]`` only.
+    try:
+        from ..modeling.hyperparameter_tuning import load_hpo_config
+        cfg = load_hpo_config(None) or {}
+        cw_grid = (cfg.get("search_space") or {}).get("class_weight")
+        if cw_grid == [None]:
+            out["class_weight_grid_v4"] = _entry(
+                PASS, "class_weight grid = [None] (no resampling, Variante A)")
+        else:
+            out["class_weight_grid_v4"] = _entry(
+                FAIL, f"class_weight grid = {cw_grid}")
+    except Exception as exc:  # noqa: BLE001
+        out["class_weight_grid_v4"] = _entry(
+            FAIL, f"HPO config read failed: {exc}")
     return out
 
 
-def audit_temporal_assumptions() -> dict:
-    """Completed-slot, post-cutoff, predictor/target separation are
-    encoded as actual assertions."""
+def audit_temporal_assumptions(*,
+                                observation_cutoffs: dict | None = None,
+                                ) -> dict:
+    """Completed-slot, post-cutoff, predictor/target separation.
+
+    The completed-slot rule is only PASS-able when the caller supplied
+    an explicit ``observation_cutoffs`` mapping (``horizon -> Timestamp``)
+    that covers every horizon the pipeline will run. Without a cutoff
+    the helper falls back to the documented MANUAL_REVIEW status — the
+    audit cannot verify a rule that has not been wired into the run.
+    """
     try:
         from .leakage_checks import (
             assert_posts_respect_cutoff,
             assert_no_target_interval_posts_in_predictors,
         )
         from .timing_audit import assert_only_completed_slots
-        return {
-            "completed_slot_assertion":
-                _entry(PASS, "assert_only_completed_slots present"),
-            "post_cutoff_assertion":
-                _entry(PASS, "assert_posts_respect_cutoff present"),
-            "predictor_target_separation_assertion":
-                _entry(PASS,
-                       "assert_no_target_interval_posts_in_predictors present"),
-        }
     except Exception as exc:  # noqa: BLE001
         return {"temporal_assumptions": _entry(FAIL, f"missing: {exc}")}
+
+    cutoffs = observation_cutoffs or {}
+    required = {"1d", "6h", "1h"}
+    missing = sorted(required - set(cutoffs))
+    if missing:
+        completed = _entry(
+            MANUAL_REVIEW,
+            "observation_cutoff not supplied for horizons "
+            f"{missing}; pass observation_cutoffs={{horizon: Timestamp}} "
+            "to unblock the merge gate")
+    else:
+        completed = _entry(
+            PASS,
+            "observation_cutoff supplied for every production horizon; "
+            "assert_only_completed_slots wired in")
+    return {
+        "completed_slot_assertion":           completed,
+        "post_cutoff_assertion":
+            _entry(PASS, "assert_posts_respect_cutoff present"),
+        "predictor_target_separation_assertion":
+            _entry(PASS,
+                   "assert_no_target_interval_posts_in_predictors present"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -309,8 +392,22 @@ def audit_temporal_assumptions() -> dict:
 
 def run_v4_acceptance_audit(*,
                               feature_frame: pd.DataFrame | None = None,
+                              observation_cutoffs: dict | None = None,
                               ) -> dict:
-    """One-shot audit. Returns a dict of dicts."""
+    """One-shot audit. Returns a dict of dicts.
+
+    Parameters
+    ----------
+    feature_frame
+        A final (post-merge) feature parquet — the audit verifies it
+        contains no forbidden engagement columns and that
+        ``market_cap_available_at`` is present.
+    observation_cutoffs
+        Mapping ``{horizon -> pd.Timestamp}``. The completed-slot rule
+        is PASS only when this covers ``{1d, 6h, 1h}``; otherwise it
+        is reported as MANUAL_REVIEW so the merge gate cannot close
+        with an unresolved temporal assumption.
+    """
     return {
         "feature_path":         audit_feature_path(feature_frame),
         "feature_registry":     audit_feature_registry(),
@@ -318,17 +415,40 @@ def run_v4_acceptance_audit(*,
         "market_cap":           audit_market_cap(),
         "modeling_defaults":    audit_modeling_defaults(),
         "evaluation":           audit_evaluation(),
-        "temporal_assumptions": audit_temporal_assumptions(),
+        "temporal_assumptions": audit_temporal_assumptions(
+            observation_cutoffs=observation_cutoffs,
+        ),
     }
 
 
 def summarize_audit(audit: dict) -> dict:
+    """Aggregate the audit dict and decide whether the branch is
+    merge-ready.
+
+    A run is ``merge_ready`` only when EVERY criterion has status
+    ``PASS``. ``FAIL`` / ``NOT_RUN`` / ``MANUAL_REVIEW`` each block
+    the gate so an unresolved manual question (e.g. a missing
+    ``observation_cutoff``) cannot slip past with a soft warning.
+    Pending items are listed under ``pending`` alongside ``failures``.
+    """
     counts = {PASS: 0, FAIL: 0, NOT_RUN: 0, MANUAL_REVIEW: 0}
     failures: list[str] = []
+    pending:  list[str] = []
     for section, items in audit.items():
         for k, v in items.items():
             counts[v["status"]] = counts.get(v["status"], 0) + 1
+            label = f"{section}.{k}: {v['detail']}"
             if v["status"] == FAIL:
-                failures.append(f"{section}.{k}: {v['detail']}")
-    return {"counts": counts, "failures": failures,
-            "passed": counts[FAIL] == 0}
+                failures.append(label)
+            elif v["status"] in (NOT_RUN, MANUAL_REVIEW):
+                pending.append(f"[{v['status']}] {label}")
+    merge_ready = (counts[FAIL] == 0 and counts[NOT_RUN] == 0
+                    and counts[MANUAL_REVIEW] == 0)
+    return {
+        "counts":      counts,
+        "failures":    failures,
+        "pending":     pending,
+        "merge_ready": merge_ready,
+        # Backwards-compatible alias — older callers checked ``passed``.
+        "passed":      merge_ready,
+    }

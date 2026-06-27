@@ -89,14 +89,38 @@ def assert_market_cap_asof_correct(
     *,
     prediction_col: str = "timestamp",
     availability_col: str = "market_cap_available_at",
+    require_availability_column: bool = True,
 ) -> None:
     """Raise if any row has ``market_cap_available_at >= prediction_timestamp``.
 
     Rows without a matched market-cap value (NaN ``availability_col``)
     are skipped — the as-of merge legitimately leaves the first
     observations of each ticker without market-cap data.
+
+    A final modeling frame is expected to carry
+    ``market_cap_available_at`` even when individual rows are NaN. The
+    column is the contract that lets the audit verify the strict-<
+    rule; its complete absence is itself a leakage red flag (the merge
+    may have silently dropped the diagnostic). With the default
+    ``require_availability_column=True`` the helper raises in that
+    case. Callers running the assertion on partial frames (e.g. a
+    sentiment-only subset) can opt out by passing ``False``.
     """
-    if availability_col not in df.columns or prediction_col not in df.columns:
+    if prediction_col not in df.columns:
+        if require_availability_column:
+            raise AssertionError(
+                "leakage_checks: market_cap_asof check requires "
+                f"prediction column {prediction_col!r}"
+            )
+        return
+    if availability_col not in df.columns:
+        if require_availability_column:
+            raise AssertionError(
+                "leakage_checks: market_cap_asof check requires "
+                f"availability column {availability_col!r} on the final "
+                "feature frame — its absence may indicate the as-of "
+                "merge silently dropped the diagnostic"
+            )
         return
     avail = pd.to_datetime(df[availability_col], utc=True, errors="coerce")
     pred  = pd.to_datetime(df[prediction_col],  utc=True, errors="coerce")
@@ -121,13 +145,23 @@ def assert_market_cap_asof_correct(
 # Optional unified audit
 # ---------------------------------------------------------------------------
 
-def run_feature_leakage_audit(df: pd.DataFrame) -> dict:
+def run_feature_leakage_audit(df: pd.DataFrame,
+                                 *,
+                                 require_market_cap_column: bool = True,
+                                 ) -> dict:
     """Run every final-frame assertion and return a machine-readable
     summary. Failing assertions are re-raised so the caller cannot
     swallow them — the summary is for the PASS path only.
+
+    Production-frame contract (Aufgabe 7): the market-cap availability
+    column must exist; the merge layer guarantees it. Set
+    ``require_market_cap_column=False`` only on partial frames where
+    the column is intentionally absent.
     """
     assert_no_forbidden_engagement_features(df)
-    assert_market_cap_asof_correct(df)
+    assert_market_cap_asof_correct(
+        df, require_availability_column=require_market_cap_column,
+    )
     return {
         "forbidden_engagement_check":     "PASS",
         "market_cap_asof_check":          "PASS",

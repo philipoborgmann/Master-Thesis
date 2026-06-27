@@ -316,6 +316,12 @@ def merge_repo(tmp_path, monkeypatch):
             "target": [0, 1] * (n // 2),
             "log_return_t":    np.linspace(-0.01, 0.01, n),
             "realized_vol_14": np.linspace(0.01, 0.02, n),
+            # v4 final-frame leakage assertion (Aufgabe 7) requires the
+            # availability stamp on every merged frame. The fixture
+            # mirrors the strict-< rule: market_cap_available_at = D 00:00
+            # for a daily bar at D 00:00 means availability is one calendar
+            # day in the past.
+            "market_cap_available_at": ts - pd.Timedelta(days=1),
         }))
     pd.concat(price_rows, ignore_index=True).to_parquet(
         feature_dir / "price_features_1d.parquet", index=False)

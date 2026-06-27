@@ -72,6 +72,26 @@ def test_validator_passes_on_canonical_smoke_outputs(tmp_path):
     assert mismatches == {}
 
 
+def test_validator_ignores_full_grid_leftover_with_wrong_universe(tmp_path):
+    """A full-grid ECON parquet sitting in the same folder must NOT be
+    mistaken for the smoke output. The lookup keys on the EXPECTED
+    universe hash."""
+    sig_dir = tmp_path / "Signals"
+    horizon_dir = sig_dir / "1d"
+    horizon_dir.mkdir(parents=True)
+    # Leftover production parquet with a different universe hash.
+    leftover_hash = coin_universe_hash(("BTC", "ETH", "SOL"))
+    leftover = horizon_dir / f"ECON_panel_ticker_fe_hpo_logloss_rw180d_u_{leftover_hash}.parquet"
+    pd.DataFrame([_econ_row(
+        requested_tickers="BTC|ETH|SOL",
+        requested_coin_universe_hash=leftover_hash,
+    )] * 3).to_parquet(leftover, index=False)
+    # No smoke ECON/NAIVE under the BTC/ETH hash.
+    mismatches = validate_smoke_outputs(sig_dir, expected_tickers=("BTC", "ETH"))
+    assert any("ECON output parquet with universe suffix" in m
+                for m in mismatches.get("econ", []))
+
+
 def test_validator_flags_missing_econ(tmp_path):
     sig_dir = tmp_path / "Signals"
     _write(sig_dir, "NAIVE", _naive_row())

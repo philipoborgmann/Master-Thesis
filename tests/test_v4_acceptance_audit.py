@@ -52,10 +52,30 @@ def test_evaluation_audit_passes_on_current_code():
         assert v["status"] == au.PASS, (k, v)
 
 
-def test_temporal_assumptions_audit_passes():
+def test_temporal_assumptions_audit_reports_manual_review_without_cutoff():
     out = au.audit_temporal_assumptions()
+    assert out["completed_slot_assertion"]["status"] == au.MANUAL_REVIEW
+    assert out["post_cutoff_assertion"]["status"] == au.PASS
+    assert out["predictor_target_separation_assertion"]["status"] == au.PASS
+
+
+def test_temporal_assumptions_audit_passes_with_full_cutoff_map():
+    out = au.audit_temporal_assumptions(observation_cutoffs={
+        "1d": pd.Timestamp("2024-01-01", tz="UTC"),
+        "6h": pd.Timestamp("2024-01-01", tz="UTC"),
+        "1h": pd.Timestamp("2024-01-01", tz="UTC"),
+    })
     for k, v in out.items():
         assert v["status"] == au.PASS, (k, v)
+
+
+def test_temporal_assumptions_partial_cutoff_is_manual_review():
+    out = au.audit_temporal_assumptions(observation_cutoffs={
+        "1d": pd.Timestamp("2024-01-01", tz="UTC"),
+    })
+    assert out["completed_slot_assertion"]["status"] == au.MANUAL_REVIEW
+    detail = out["completed_slot_assertion"]["detail"]
+    assert "1h" in detail and "6h" in detail
 
 
 def test_market_cap_audit_passes_on_current_code():
@@ -90,24 +110,59 @@ def test_feature_path_audit_passes_on_clean_frame():
 # Audit summariser
 # ---------------------------------------------------------------------------
 
-def test_summarize_audit_counts_pass_fail():
+def test_summarize_audit_zero_failures_zero_pending_is_merge_ready():
     audit = au.run_v4_acceptance_audit(
-        feature_frame=pd.DataFrame({"log_return_t": [0.0]})
+        feature_frame=pd.DataFrame({"log_return_t": [0.0]}),
+        observation_cutoffs={
+            "1d": pd.Timestamp("2024-01-01", tz="UTC"),
+            "6h": pd.Timestamp("2024-01-01", tz="UTC"),
+            "1h": pd.Timestamp("2024-01-01", tz="UTC"),
+        },
     )
     summary = au.summarize_audit(audit)
-    assert "counts" in summary
     assert summary["counts"][au.FAIL] == 0
-    assert summary["passed"] is True
+    assert summary["counts"][au.MANUAL_REVIEW] == 0
+    assert summary["counts"][au.NOT_RUN] == 0
+    assert summary["merge_ready"] is True
+    assert summary["passed"] is True   # legacy alias
+
+
+def test_summarize_audit_blocks_on_manual_review():
+    """Audit without cutoffs leaves the completed-slot rule in
+    MANUAL_REVIEW — the merge gate MUST stay closed even though there
+    are no hard failures."""
+    audit = au.run_v4_acceptance_audit(
+        feature_frame=pd.DataFrame({"log_return_t": [0.0]}),
+    )
+    summary = au.summarize_audit(audit)
+    assert summary["counts"][au.MANUAL_REVIEW] >= 1
+    assert summary["merge_ready"] is False
+    assert any("completed_slot" in p for p in summary["pending"])
 
 
 def test_summarize_audit_records_failures():
     audit = au.run_v4_acceptance_audit(
-        feature_frame=pd.DataFrame({"score": [1.0]})
+        feature_frame=pd.DataFrame({"score": [1.0]}),
+        observation_cutoffs={
+            "1d": pd.Timestamp("2024-01-01", tz="UTC"),
+            "6h": pd.Timestamp("2024-01-01", tz="UTC"),
+            "1h": pd.Timestamp("2024-01-01", tz="UTC"),
+        },
     )
     summary = au.summarize_audit(audit)
-    assert summary["passed"] is False
+    assert summary["merge_ready"] is False
     assert any("forbidden_engagement_in_frame" in f
                 for f in summary["failures"])
+
+
+def test_evaluation_audit_includes_clustering_and_classweight():
+    out = au.audit_evaluation()
+    for key in ("ticker_clustered_inference",
+                 "class_weight_grid_v4",
+                 "mcnemar_supplementary_layer",
+                 "h2_h3_family_identity_columns"):
+        assert key in out
+        assert out[key]["status"] == au.PASS, (key, out[key])
 
 
 # ---------------------------------------------------------------------------

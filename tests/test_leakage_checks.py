@@ -131,6 +131,42 @@ def test_market_cap_unmatched_rows_skipped():
     lc.assert_market_cap_asof_correct(df)  # no raise
 
 
+def test_market_cap_missing_column_fails_by_default():
+    """Final feature frames must carry ``market_cap_available_at``.
+    Silent absence is itself a leakage red flag."""
+    df = pd.DataFrame({
+        "ticker": "BTC",
+        "timestamp": [pd.Timestamp("2024-01-10", tz="UTC")],
+        "log_return_t": [0.0],
+    })
+    with pytest.raises(AssertionError,
+                        match="availability column 'market_cap_available_at'"):
+        lc.assert_market_cap_asof_correct(df)
+
+
+def test_market_cap_missing_column_can_be_opted_out():
+    df = pd.DataFrame({
+        "ticker": "BTC",
+        "timestamp": [pd.Timestamp("2024-01-10", tz="UTC")],
+    })
+    # Partial-frame caller can disable the column requirement.
+    lc.assert_market_cap_asof_correct(df, require_availability_column=False)
+
+
+def test_run_feature_leakage_audit_requires_market_cap_column():
+    df = pd.DataFrame({
+        "timestamp": [pd.Timestamp("2024-01-10", tz="UTC")],
+        "log_return_t": [0.0],
+    })
+    with pytest.raises(AssertionError):
+        lc.run_feature_leakage_audit(df)
+    # Opt-out path stays available for partial frames.
+    summary = lc.run_feature_leakage_audit(
+        df, require_market_cap_column=False,
+    )
+    assert summary["market_cap_asof_check"] == "PASS"
+
+
 def test_market_cap_error_message_reports_first_offender():
     df = _mcap_rows([0, -1])
     with pytest.raises(AssertionError) as exc:
