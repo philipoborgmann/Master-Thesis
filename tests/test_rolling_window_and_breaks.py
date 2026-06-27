@@ -109,7 +109,7 @@ def _panel_repo(tmp_path):
     df = _build_synthetic_panel(n_timestamps=200, tickers=("BTC", "ETH", "SOL"))
     df.to_parquet(tmp_path / "Data" / "Final" / "features_1d.parquet", index=False)
     fs = pd.DataFrame({
-        "set_id":   ["B1", "B2", "C2"],
+        "set_id":   ["NAIVE_FIXTURE", "ECON", "ECON_VAD_L"],
         "category": ["benchmark", "economic", "combined"],
         "sentiment_model": ["-", "-", "vader"],
         "label":    ["bench", "econ", "combo"],
@@ -141,19 +141,27 @@ def _build_synthetic_panel(n_timestamps=200, tickers=("BTC", "ETH", "SOL"), seed
 def test_rolling_window_filename_differs_from_expanding(tmp_path, monkeypatch):
     repo = _panel_repo(tmp_path)
     monkeypatch.chdir(repo)
-    expanded = run_models_main(["--horizon", "1d", "--set-id", "B2",
+    # NB: v4 default is --train-window rolling_fixed --rolling-window-days 180,
+    # so to compare expanding vs. rolling filenames we must opt back into
+    # expanding explicitly. Both runs also opt out of HPO (default-on in v4)
+    # to keep this test focused on filename mechanics, not estimator depth.
+    expanded = run_models_main(["--horizon", "1d", "--set-id", "ECON",
                                  "--model-type", "panel_logit", "--panel-mode", "pooled",
-                                 "--restart"])
-    rolling = run_models_main(["--horizon", "1d", "--set-id", "B2",
+                                 "--train-window", "expanding",
+                                 "--no-tune-hyperparams", "--restart"])
+    rolling = run_models_main(["--horizon", "1d", "--set-id", "ECON",
                                 "--model-type", "panel_logit", "--panel-mode", "pooled",
                                 "--train-window", "rolling_fixed",
                                 "--rolling-window-timestamps", "30",
-                                "--restart"])
+                                "--no-tune-hyperparams", "--restart"])
     assert expanded == 0 and rolling == 0
-    assert (repo / "Outputs" / "Signals" / "1d" / "B2_panel_pooled.parquet").exists()
-    rolling_path = repo / "Outputs" / "Signals" / "1d" / "B2_panel_pooled_rw30.parquet"
-    assert rolling_path.exists(), \
+    sig_dir = repo / "Outputs" / "Signals" / "1d"
+    assert sorted(sig_dir.glob("ECON_panel_pooled_u_*.parquet")), \
+        "expanding output missing"
+    rolling_cands = sorted(sig_dir.glob("ECON_panel_pooled_rw30_u_*.parquet"))
+    assert rolling_cands, \
         "rolling-window run must NOT overwrite the expanding filename"
+    rolling_path = rolling_cands[0]
     sig = pd.read_parquet(rolling_path)
     assert (sig["train_window_mode"] == "rolling_fixed").all()
     assert (sig["train_window_timestamps"] <= 30).all()
@@ -162,11 +170,16 @@ def test_rolling_window_filename_differs_from_expanding(tmp_path, monkeypatch):
 def test_checkpoint_manifest_refuses_reuse_when_window_changes(tmp_path, monkeypatch):
     repo = _panel_repo(tmp_path)
     monkeypatch.chdir(repo)
-    # Run 1: expanding window — checkpoints + manifest written.
-    run_models_main(["--horizon", "1d", "--set-id", "B2",
+    # Run 1: expanding window — checkpoints + manifest written. v4 defaults
+    # would write to a different out_name (...rw180), so opt into expanding
+    # explicitly to test the same-out_name manifest-mismatch path.
+    run_models_main(["--horizon", "1d", "--set-id", "ECON",
                      "--model-type", "panel_logit", "--panel-mode", "pooled",
-                     "--restart"])
-    root = (repo / "Outputs" / "Checkpoints" / "Models" / "1d" / "B2_panel_pooled")
+                     "--train-window", "expanding",
+                     "--no-tune-hyperparams", "--restart"])
+    ckpt_root_d = repo / "Outputs" / "Checkpoints" / "Models" / "1d"
+    cands = sorted(ckpt_root_d.glob("ECON_panel_pooled_u_*"))
+    root = cands[0] if cands else (ckpt_root_d / "ECON_panel_pooled")
     mf = ckpt.load_manifest(root)
     assert mf["train_window_mode"] == "expanding"
     chunk = ckpt.chunk_checkpoint_path(root, 0)
@@ -184,9 +197,10 @@ def test_checkpoint_manifest_refuses_reuse_when_window_changes(tmp_path, monkeyp
     ckpt.write_manifest(root, incompatible)
     mtime_before = chunk.stat().st_mtime
 
-    run_models_main(["--horizon", "1d", "--set-id", "B2",
+    run_models_main(["--horizon", "1d", "--set-id", "ECON",
                      "--model-type", "panel_logit", "--panel-mode", "pooled",
-                     "--restart"])
+                     "--train-window", "expanding",
+                     "--no-tune-hyperparams", "--restart"])
     # The chunk was rewritten (not silently reused).
     assert chunk.stat().st_mtime != mtime_before
 
@@ -194,12 +208,18 @@ def test_checkpoint_manifest_refuses_reuse_when_window_changes(tmp_path, monkeyp
 def test_panel_b1_runs_as_rolling_probability_benchmark(tmp_path, monkeypatch):
     repo = _panel_repo(tmp_path)
     monkeypatch.chdir(repo)
-    rc = run_models_main(["--horizon", "1d", "--set-id", "B1",
+    # Opt back into expanding + no-HPO so the legacy filename
+    # `NAIVE_FIXTURE_panel_pooled.parquet` is produced (the v4 default
+    # would add `_rw180` and `_hpo_logloss` suffixes).
+    rc = run_models_main(["--horizon", "1d", "--set-id", "NAIVE_FIXTURE",
                           "--model-type", "panel_logit", "--panel-mode", "pooled",
-                          "--restart"])
+                          "--train-window", "expanding",
+                          "--no-tune-hyperparams", "--restart"])
     assert rc == 0
-    out = repo / "Outputs" / "Signals" / "1d" / "B1_panel_pooled.parquet"
-    assert out.exists(), "panel B1 must be produced, not silently skipped"
+    sig_dir = repo / "Outputs" / "Signals" / "1d"
+    cands = sorted(sig_dir.glob("NAIVE_FIXTURE_panel_pooled_u_*.parquet"))
+    assert cands, "panel rolling-prob NAIVE_FIXTURE must be produced, not silently skipped"
+    out = cands[0]
     sig = pd.read_parquet(out)
     assert not sig.empty
     assert (sig["benchmark_model"]
@@ -296,6 +316,12 @@ def merge_repo(tmp_path, monkeypatch):
             "target": [0, 1] * (n // 2),
             "log_return_t":    np.linspace(-0.01, 0.01, n),
             "realized_vol_14": np.linspace(0.01, 0.02, n),
+            # v4 final-frame leakage assertion (Aufgabe 7) requires the
+            # availability stamp on every merged frame. The fixture
+            # mirrors the strict-< rule: market_cap_available_at = D 00:00
+            # for a daily bar at D 00:00 means availability is one calendar
+            # day in the past.
+            "market_cap_available_at": ts - pd.Timedelta(days=1),
         }))
     pd.concat(price_rows, ignore_index=True).to_parquet(
         feature_dir / "price_features_1d.parquet", index=False)
@@ -394,40 +420,45 @@ def test_fill_missing_sentiment_fills_each_column_kind_correctly():
     """Spot-check every neutral-fill branch in one go on a synthetic frame
     so a future edit can't quietly regress one of them.
     """
+    # Variante A: *_weighted_mean is no longer a valid sentiment column and
+    # must NOT be auto-filled; including one here verifies it stays NaN.
     df = pd.DataFrame({
         "ticker":                       ["BTC", "BTC"],
         "post_count":                   [np.nan, 3],
         "vader_post_count":             [np.nan, 7],
+        "vader_directional_post_count": [np.nan, 5],
         "vader_title_score_mean":       [np.nan, 0.42],
-        "vader_combined_weighted_mean": [np.nan, 0.10],
+        "vader_combined_weighted_mean": [np.nan, 0.10],  # forbidden — stays NaN
         "vader_title_score_median":     [np.nan, 0.05],
         "vader_title_score_std":        [np.nan, 0.20],
         "vader_combined_score_std":     [np.nan, 0.30],
         "cryptobert_bullishness_ratio": [np.nan, 0.60],
         # Non-sentiment columns the function must NEVER touch.
         "log_return_t":                 [np.nan, 0.01],
-        "realized_vol_14":              [np.nan, 0.02],
+        "realized_vol_14d":             [np.nan, 0.02],
         "target":                       [np.nan, 1.0],
     })
     sent_cols = [c for c in df.columns
-                 if c not in ("ticker", "log_return_t", "realized_vol_14",
+                 if c not in ("ticker", "log_return_t", "realized_vol_14d",
                               "target")]
     out = fm.fill_missing_sentiment(df.copy(), sent_cols)
-    # post_count → 0
+    # post_count / directional_post_count → 0
     assert (out["post_count"] == [0, 3]).all()
     assert (out["vader_post_count"] == [0, 7]).all()
-    # mean / weighted_mean / median → 0.0
+    assert (out["vader_directional_post_count"] == [0, 5]).all()
+    # mean / median → 0.0
     assert out["vader_title_score_mean"].iat[0] == 0.0
-    assert out["vader_combined_weighted_mean"].iat[0] == 0.0
     assert out["vader_title_score_median"].iat[0] == 0.0
-    # std → 0.0 (the change under test)
+    # std → 0.0
     assert out["vader_title_score_std"].iat[0] == 0.0
     assert out["vader_combined_score_std"].iat[0] == 0.0
     # bullishness_ratio → 0.5
     assert out["cryptobert_bullishness_ratio"].iat[0] == 0.5
+    # Variante A: *_weighted_mean must stay NaN — engagement weighting was removed.
+    assert pd.isna(out["vader_combined_weighted_mean"].iat[0])
     # Non-sentiment columns stay NaN.
     assert pd.isna(out["log_return_t"].iat[0])
-    assert pd.isna(out["realized_vol_14"].iat[0])
+    assert pd.isna(out["realized_vol_14d"].iat[0])
     assert pd.isna(out["target"].iat[0])
     # And real values are preserved on the non-NaN rows.
     assert out["vader_title_score_std"].iat[1] == 0.20

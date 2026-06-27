@@ -118,7 +118,7 @@ CLI_DRY_RUN_CASES = [
     (["create-sentiment-features", "--smoke", "--dry-run"]),
     (["stationarity", "--smoke", "--dry-run"]),
     (["merge-features", "--horizon", "1d", "--smoke", "--dry-run"]),
-    (["run-models", "--horizon", "1d", "--set-id", "B1", "--smoke", "--dry-run"]),
+    (["run-models", "--horizon", "1d", "--set-id", "ECON", "--smoke", "--dry-run"]),
     (["evaluate-signals", "--horizon", "1d", "--smoke", "--dry-run"]),
     (["diagnostics", "--horizon", "1d", "--dry-run"]),
 ]

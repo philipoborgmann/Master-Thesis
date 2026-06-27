@@ -33,9 +33,13 @@ There are **no time fixed effects**: a dummy for the test timestamp would be
 unidentified out-of-sample (it never appears in training), so time FE are
 intentionally excluded.
 
-B1 (``__rolling_probability__`` / ``__majority_class__``) is not a panel-logit
-model — for ``model_type=panel_logit`` such sets are skipped with a warning
-rather than crashing.
+The NAIVE rolling-probability path
+(``__rolling_probability__`` / ``__majority_class__``) is not a panel-logit
+model — under ``model_type=panel_logit`` a feature-set entry that resolves to
+the sentinel is skipped with a warning rather than crashing. Production v4
+runs generate NAIVE separately via
+:mod:`thesis_pipeline.modeling.naive_reference`, independent of the
+feature-set grid.
 """
 
 from __future__ import annotations
@@ -415,14 +419,21 @@ def _mode_suffix(panel_mode: str) -> str:
 
 def panel_output_name(set_id: str, sentiment_model: str, panel_mode: str,
                       hpo_variant: str = "fixed",
-                      window_suffix: str = "") -> str:
-    """``{set_id}[_{sentiment_model}]_{panel_pooled|panel_ticker_fe}[_{hpo_variant}][_rw{N}]``.
+                      window_suffix: str = "",
+                      coin_universe: "Iterable[str] | None" = None) -> str:
+    """``{set_id}[_{sentiment_model}]_{panel_pooled|panel_ticker_fe}[_{hpo_variant}][_rw{N}][_u_{hash}]``.
 
     A tuned run appends the HPO variant (e.g. ``..._panel_pooled_hpo_brier``)
     so tuned and fixed-C panel signals never share a filename. A rolling-window
     run appends ``_rw{N}`` (or ``_rw{D}d``) — see
     :func:`thesis_pipeline.modeling.windowing.window_suffix`. Expanding runs
-    keep the historical filenames unchanged.
+    keep the legacy unsuffixed window section.
+
+    When ``coin_universe`` is provided the requested-universe hash is
+    appended as ``_u_{8-hex}`` (commit 4 Section A.2). The hash is
+    produced by :func:`thesis_pipeline.modeling.naive_reference
+    .coin_universe_hash` — the exact same helper NAIVE uses, so a model
+    and its matched NAIVE share the suffix on disk.
     """
     suffix = _mode_suffix(panel_mode)
     if sentiment_model and str(sentiment_model) not in ("-", "nan"):
@@ -433,6 +444,11 @@ def panel_output_name(set_id: str, sentiment_model: str, panel_mode: str,
         base = f"{base}_{hpo_variant}"
     if window_suffix:
         base = f"{base}{window_suffix}"
+    if coin_universe is not None:
+        from .naive_reference import coin_universe_hash
+        h = coin_universe_hash(coin_universe)
+        if h:
+            base = f"{base}_u_{h}"
     return base
 
 
@@ -509,11 +525,18 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
     (standalone ``python -m ...panel_logit`` invocation) it is resolved here
     from the CLI flags + ``configs/model_specs.yaml``.
     """
-    panel_mode = getattr(args, "panel_mode", "pooled") or "pooled"
+    panel_mode = getattr(args, "panel_mode", "ticker_fixed_effects") \
+                 or "ticker_fixed_effects"
     from .windowing import window_suffix as _window_suffix
-    train_window_mode = getattr(args, "train_window", "expanding") or "expanding"
+    train_window_mode = getattr(args, "train_window", "rolling_fixed") \
+                        or "rolling_fixed"
     rolling_window_timestamps = getattr(args, "rolling_window_timestamps", None)
-    rolling_window_days = getattr(args, "rolling_window_days", None)
+    rolling_window_days       = getattr(args, "rolling_window_days", None)
+    # The v4 default is rolling_window_days=180. A user who explicitly
+    # asks for a timestamp-count window must take priority — pass only
+    # the one they set so select_panel_train_window's mutex check passes.
+    if rolling_window_timestamps is not None and rolling_window_days is not None:
+        rolling_window_days = None
     if train_window_mode == "rolling_fixed" and (
         rolling_window_timestamps is None and rolling_window_days is None
     ):
@@ -521,7 +544,9 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
         # default window. Structural breaks are diagnostic only.
         print("  [ERROR] --train-window rolling_fixed requires "
               "--rolling-window-timestamps or --rolling-window-days "
-              "(no automatic default).")
+              "(v4 default is 180 calendar days; pass --rolling-window-days 0 "
+              "to disable explicitly is NOT supported — pass "
+              "--train-window expanding instead).")
         return 2
     win_suffix = _window_suffix(train_window_mode, rolling_window_timestamps,
                                 rolling_window_days)
@@ -529,7 +554,9 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
     from .hyperparameter_tuning import hpo_variant_label, load_hpo_config
     if hpo_cfg is None:
         hpo_cfg = load_hpo_config(
-            enabled_override=True if getattr(args, "tune_hyperparams", False) else None,
+            # v4: --tune-hyperparams defaults to True via BooleanOptionalAction.
+            # Forward the explicit bool so --no-tune-hyperparams really disables.
+            enabled_override=bool(getattr(args, "tune_hyperparams", True)),
             objective_override=getattr(args, "hpo_objective", None),
             c_grid=getattr(args, "hpo_grid_C", None),
             class_weight_grid=getattr(args, "hpo_class_weight", None),
@@ -628,9 +655,14 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
             continue
 
         tickers = sorted(df_all["ticker"].unique())
-        if args.coins:
-            wanted = set(args.coins)
-            tickers = [t for t in tickers if t in wanted]
+        # Universe resolution — REQUESTED is immutable per-run, AVAILABLE is
+        # the subset present in the feature frame (commit 4 Section A.1).
+        from .naive_reference import resolve_universes
+        uni = resolve_universes(args.coins, tickers)
+        requested_tickers = list(uni["requested"])
+        available_tickers = list(uni["available"])
+        # Estimation runs on the AVAILABLE subset.
+        tickers = available_tickers
         print(f"  Tickers: {len(tickers)} — {', '.join(tickers)}")
 
         hz_dir = os.path.join(SIGNAL_DIR, hz)
@@ -645,8 +677,11 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
             if not (sent_model and str(sent_model) not in ("-", "nan")):
                 sent_model = "-"
 
+            # Output filename embeds the REQUESTED-universe hash so smoke
+            # and full-grid runs never share a parquet (commit 4 A.2).
             out_name = panel_output_name(set_id, sent_model, panel_mode,
-                                         hpo_variant, win_suffix)
+                                         hpo_variant, win_suffix,
+                                         coin_universe=requested_tickers)
             out_path = os.path.join(hz_dir, f"{out_name}.parquet")
 
             # Panel-compatible benchmark: ticker-rolling probability with pooled
@@ -708,19 +743,26 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                 "rolling_window_timestamps": rolling_window_timestamps,
                 "rolling_window_days":       rolling_window_days,
                 "benchmark":                 bool(is_benchmark),
+                # Universe identity (commit 4 A.4). Checkpoints created
+                # for a smaller universe must NOT resume a larger run.
+                "requested_tickers":            list(requested_tickers),
+                "requested_coin_universe_hash": uni["requested_hash"],
+                "n_requested_tickers":          len(requested_tickers),
             }
             if ckpt_on:
                 # Refuse to reuse checkpoints when the run's window mode,
-                # rolling-window size, feature list, HPO objective, panel mode
-                # or panel-mode/benchmark identity differs.
+                # rolling-window size, feature list, HPO objective, panel mode,
+                # benchmark identity, OR requested coin universe differs.
                 existing = ckpt.load_manifest(root)
                 guard_keys = ("train_window_mode", "rolling_window_timestamps",
                               "rolling_window_days", "feature_cols",
-                              "hpo_objective", "panel_mode", "benchmark")
+                              "hpo_objective", "panel_mode", "benchmark",
+                              "requested_coin_universe_hash",
+                              "requested_tickers")
                 if existing and any(existing.get(k) != manifest_base.get(k)
                                     for k in guard_keys):
                     print("  [INFO] Existing checkpoint manifest is incompatible "
-                          "(window/feature/hpo/panel-mode changed) — clearing.")
+                          "(window/feature/hpo/panel-mode/universe changed) — clearing.")
                     ckpt.clear_run_checkpoints(root)
                 if clear_ckpt:
                     ckpt.clear_run_checkpoints(root)
@@ -773,6 +815,17 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                 signals["hpo_enabled"]   = False
                 signals["hpo_objective"] = "-"
                 signals["hpo_variant"]   = "fixed"
+            # Universe identity (commit 3 Section B + commit 4 A.5).
+            # Stamp the REQUESTED universe (immutable) alongside the
+            # AVAILABLE subset and the REALIZED ticker set so the
+            # absolute_vs_naive evaluation matches by requested-hash
+            # without inferring from realized tickers later.
+            from .naive_reference import stamp_universe_metadata
+            signals = stamp_universe_metadata(
+                signals,
+                requested_universe=requested_tickers,
+                available_universe=available_tickers,
+            )
             signals.to_parquet(out_path, index=False, engine="pyarrow")
 
             from .hyperparameter_tuning import summarize_hpo_columns

@@ -1,19 +1,31 @@
 #!/usr/bin/env python3
 """
-Sentiment_Feature_Engineering.py
-=================================
-Reads the three scored sentiment CSVs (VADER, FinBERT, CryptoBERT),
-combines them (positional assignment with alignment verification), builds raw
-and engagement-weighted features, combines title + selftext scores,
-aggregates to 1h / 6h / 1d horizons, produces comparison
-visualizations, coverage statistics, and exports three parquet files.
+Sentiment_Feature_Engineering.py — Variante A
+==============================================
+Reads the scored sentiment CSVs (VADER, CryptoBERT), combines them
+(positional assignment with alignment verification), builds title- and
+selftext-based aggregates per (ticker, horizon) slot — and is designed to
+eliminate identified engagement-related look-ahead leakage.
 
-Engagement-weighted aggregation uses proper np.average(score, weights=w),
-not mean(score * weight).
+Variante A: engagement metrics (``score``, ``upvote_ratio``,
+``num_comments``) are a snapshot at the ``retrieved`` instant (~13 h
+median after a post). Because engagement reacts to the very price move
+we want to forecast, weighting by engagement injects look-ahead bias.
+This module therefore:
+
+* drops ``compute_engagement_weight`` and every ``*_weighted_mean`` branch,
+* never reads ``score`` / ``upvote_ratio`` / ``num_comments`` /
+  ``total_awards_received`` / ``gilded`` as a feature input,
+* never uses ``retrieved`` as an input to a feature.
+
+Bucketing is unchanged (post ``date`` → ``ticker × timestamp`` slots, all
+floored to the slot start), and per-slot moments (mean / median / std),
+the per-model bullishness ratio, post_count, and winsorisation are
+unchanged. New per-model column ``{m}_directional_post_count`` records
+the count of non-neutral posts in the slot for diagnostics.
 
 Input:
     - Data/Transformed/Sentiment_Scored_Vader.csv
-    - Data/Transformed/Sentiment_Scored_Finbert.csv
     - Data/Transformed/Sentiment_Scored_Cryptobert.csv
 
 Output:
@@ -24,9 +36,9 @@ Output:
     - Data/Features/plots/  (PNG visualizations)
 
 Usage:
-    python Sentiment_Feature_Engineering.py
-    python Sentiment_Feature_Engineering.py --test_days 30
-    python Sentiment_Feature_Engineering.py --no_plots
+    python -m thesis_pipeline.sentiment.aggregate
+    python -m thesis_pipeline.sentiment.aggregate --test_days 30
+    python -m thesis_pipeline.sentiment.aggregate --no_plots
 """
 
 import argparse
@@ -126,36 +138,27 @@ def load_scored_data(paths: dict) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. COMPUTE ENGAGEMENT WEIGHTS
+# 3. BUILD POST-LEVEL FEATURES
 # ══════════════════════════════════════════════════════════════════════════════
-
-def compute_engagement_weight(df: pd.DataFrame) -> pd.Series:
-    score = df["score"].clip(lower=0)
-    ratio = df["upvote_ratio"].fillna(0.5)
-    comments = df["num_comments"].fillna(0).clip(lower=0)
-
-    w = np.log1p(score) * ratio * (1 + np.log1p(comments))
-
-    w_max = w.max()
-    if w_max > 0:
-        w = w / w_max
-
-    return w
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 4. BUILD POST-LEVEL FEATURES
-# ══════════════════════════════════════════════════════════════════════════════
+#
+# Variante A: engagement weighting is intentionally removed. The function
+# previously named ``compute_engagement_weight`` no longer exists (any caller
+# that still imports it will fail loudly — the absence is the contract).
 
 def build_post_level_features(df: pd.DataFrame) -> pd.DataFrame:
-    print("\n[INFO] Building post-level features...")
+    """Build per-post features without any engagement weight.
 
-    required = ["date", "ticker", "score", "upvote_ratio", "num_comments", "selftext"]
+    ``selftext`` is still used to construct the per-model ``combined_score``
+    (a 0.7 / 0.3 blend of title and selftext sentiment) — this stays in the
+    output as a robustness/diagnostic column. It is **not** part of the
+    primary 17-set feature grid (see ``features/feature_registry.py``).
+    """
+    print("\n[INFO] Building post-level features (Variante A — no engagement weighting)...")
+
+    required = ["date", "ticker", "selftext"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
-
-    df["engagement_weight"] = compute_engagement_weight(df)
 
     selftext_clean = df["selftext"].fillna("").astype(str).str.strip()
     has_usable_selftext = (
@@ -183,10 +186,6 @@ def build_post_level_features(df: pd.DataFrame) -> pd.DataFrame:
     n_with_st = has_usable_selftext.sum()
     print(f"  Posts with usable selftext: {n_with_st:,} / {len(df):,} "
           f"({n_with_st / len(df) * 100:.1f}%)")
-    print(f"  Engagement weight stats: "
-          f"mean={df['engagement_weight'].mean():.3f}, "
-          f"median={df['engagement_weight'].median():.3f}, "
-          f"zero={(df['engagement_weight'] == 0).sum():,}")
 
     return df
 
@@ -206,6 +205,16 @@ def _bullishness_ratio(sentiments: pd.Series) -> float:
 
 def aggregate_to_horizon(df: pd.DataFrame, freq: str,
                          horizon_label: str) -> pd.DataFrame:
+    """Bucket posts to ``(ticker, horizon-slot)`` and compute moments.
+
+    Per slot and per model: ``*_mean / _median / _std`` for the three score
+    variants (title / selftext / combined), per-model ``bullishness_ratio``
+    and ``directional_post_count`` (count of positively- or negatively-
+    classified posts in the slot), plus the slot-level ``post_count``.
+
+    No engagement weighting (Variante A) — designed to eliminate identified
+    engagement-related look-ahead leakage.
+    """
     print(f"\n[INFO] Aggregating to {horizon_label} ({freq})...")
 
     df = df.copy()
@@ -220,6 +229,10 @@ def aggregate_to_horizon(df: pd.DataFrame, freq: str,
             sent_col = f"{model}_title_sentiment"
             if sent_col in grp.columns:
                 row[f"{model}_bullishness_ratio"] = _bullishness_ratio(grp[sent_col])
+                # Per-model directional post count = pos + neg (neutrals excluded).
+                row[f"{model}_directional_post_count"] = int(
+                    grp[sent_col].isin(["positive", "negative"]).sum()
+                )
 
             for variant in ["title_score", "selftext_score", "combined_score"]:
                 col = f"{model}_{variant}"
@@ -231,20 +244,10 @@ def aggregate_to_horizon(df: pd.DataFrame, freq: str,
                     row[f"{col}_mean"] = np.nan
                     row[f"{col}_median"] = np.nan
                     row[f"{col}_std"] = np.nan
-                    row[f"{col}_weighted_mean"] = np.nan
                 else:
                     row[f"{col}_mean"] = vals.mean()
                     row[f"{col}_median"] = vals.median()
                     row[f"{col}_std"] = vals.std() if len(vals) > 1 else 0.0
-
-                    weights = grp.loc[vals.index, "engagement_weight"]
-                    w_sum = weights.sum()
-                    if w_sum > 0:
-                        row[f"{col}_weighted_mean"] = np.average(
-                            vals, weights=weights
-                        )
-                    else:
-                        row[f"{col}_weighted_mean"] = np.nan
 
         records.append(row)
 
@@ -280,13 +283,15 @@ def winsorize_features(aggregated: dict) -> dict:
 
     Returns the same dict with clipped DataFrames.
     """
-    # Columns that should never be winsorized
+    # Columns that should never be winsorized. Per-model directional counts
+    # are integers and are kept exact.
     skip_cols = {"ticker", "timestamp", "post_count"}
-
     for hz_label, df_hz in aggregated.items():
+        skip_dyn = skip_cols | {c for c in df_hz.columns
+                                if c.endswith("_directional_post_count")}
         numeric_cols = [
             c for c in df_hz.select_dtypes(include=[np.number]).columns
-            if c not in skip_cols
+            if c not in skip_dyn
         ]
 
         n_clipped_total = 0
@@ -497,29 +502,6 @@ def plot_model_correlation(df, plot_dir):
     plt.close()
     print(f"  Saved: model_correlation_matrix.png")
 
-def plot_engagement_weight_distribution(df, plot_dir):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-    w = df["engagement_weight"]
-    axes[0].hist(w, bins=80, color="#795548", alpha=0.8, edgecolor="white", linewidth=0.3)
-    axes[0].set_title("Engagement Weight Distribution")
-    axes[0].set_xlabel("Weight (normalized)")
-    axes[0].set_ylabel("Count")
-    axes[0].axvline(w.median(), color="red", linestyle="--", linewidth=1, label=f"Median: {w.median():.3f}")
-    axes[0].legend()
-    model = MODELS[0]
-    t_col = f"{model}_title_score"
-    if t_col in df.columns:
-        sample = df[[t_col, "engagement_weight"]].dropna()
-        if len(sample) > 10000: sample = sample.sample(10000, random_state=42)
-        axes[1].scatter(sample[t_col], sample["engagement_weight"], alpha=0.1, s=2, color="#FF5722")
-        axes[1].set_xlabel(f"{model.upper()} Title Score")
-        axes[1].set_ylabel("Engagement Weight")
-        axes[1].set_title("Engagement Weight vs. Sentiment Score")
-    plt.tight_layout()
-    plt.savefig(os.path.join(plot_dir, "engagement_weight.png"), dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  Saved: engagement_weight.png")
-
 def plot_daily_sentiment_timeseries(df_daily, plot_dir):
     if "ticker" not in df_daily.columns: return
     ticker_counts = df_daily.groupby("ticker").size()
@@ -542,37 +524,14 @@ def plot_daily_sentiment_timeseries(df_daily, plot_dir):
     plt.close()
     print(f"  Saved: daily_sentiment_timeseries.png")
 
-def plot_raw_vs_weighted_comparison(df_daily, plot_dir):
-    if "ticker" not in df_daily.columns: return
-    ticker_counts = df_daily.groupby("ticker").size()
-    top_ticker = ticker_counts.idxmax()
-    sub = df_daily[df_daily["ticker"] == top_ticker].sort_values("timestamp")
-    model = MODELS[0]
-    raw_col = f"{model}_title_score_mean"
-    ew_col  = f"{model}_title_score_weighted_mean"
-    if raw_col not in sub.columns or ew_col not in sub.columns: return
-    fig, ax = plt.subplots(figsize=(14, 5))
-    ax.plot(sub["timestamp"], sub[raw_col], label="Raw", color="#1976D2", alpha=0.7, linewidth=0.8)
-    ax.plot(sub["timestamp"], sub[ew_col], label="Engagement-Weighted", color="#D32F2F", alpha=0.7, linewidth=0.8)
-    ax.axhline(0, color="black", linewidth=0.5, linestyle="--", alpha=0.4)
-    ax.set_title(f"{model.upper()} Daily Title Score: Raw vs. Engagement-Weighted \u2014 {top_ticker}", fontsize=11)
-    ax.set_ylabel("Mean Score"); ax.legend(); ax.grid(alpha=0.2)
-    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    plt.xticks(rotation=45); plt.tight_layout()
-    plt.savefig(os.path.join(plot_dir, "raw_vs_weighted.png"), dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"  Saved: raw_vs_weighted.png")
-
 def create_all_plots(df_post, df_daily, plot_dir):
+    """Variante A \u2014 no engagement plots; engagement weighting is removed."""
     print("\n[INFO] Creating visualizations...")
     os.makedirs(plot_dir, exist_ok=True)
     plot_score_distributions(df_post, plot_dir)
     plot_sentiment_class_comparison(df_post, plot_dir)
     plot_model_correlation(df_post, plot_dir)
-    plot_engagement_weight_distribution(df_post, plot_dir)
     plot_daily_sentiment_timeseries(df_daily, plot_dir)
-    plot_raw_vs_weighted_comparison(df_daily, plot_dir)
     print(f"[INFO] All plots saved to {os.path.abspath(plot_dir)}")
 
 
@@ -678,8 +637,8 @@ def main(argv=None):
     print(f"  Tickers:             {df['ticker'].nunique()}")
     print(f"  Date range:          {df['date'].min()} -> {df['date'].max()}")
     print(f"  Models:              {', '.join(m.upper() for m in MODELS)}")
-    print(f"  Score variants:      raw, engagement-weighted")
-    print(f"  Text sources:        title, selftext, combined")
+    print(f"  Score variants:      raw (Variante A — engagement weighting removed)")
+    print(f"  Text sources:        title (primary), selftext (robustness), combined (robustness)")
     for label in HORIZONS:
         agg = aggregated[label]
         n_cols = len([c for c in agg.columns if c not in ("ticker", "timestamp", "post_count")])

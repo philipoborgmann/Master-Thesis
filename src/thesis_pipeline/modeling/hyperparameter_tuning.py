@@ -89,7 +89,8 @@ def hpo_variant_label(enabled: bool, objective: str | None) -> str:
     """
     if not enabled:
         return FIXED_VARIANT
-    return OBJECTIVE_SUFFIX.get(objective or "brier_score", "hpo_brier")
+    # v4 fallback objective: log_loss (was brier_score in v3).
+    return OBJECTIVE_SUFFIX.get(objective or "log_loss", "hpo_logloss")
 
 # Default hyperparameters — identical to the pinned thesis estimator so that
 # any fallback path reproduces the non-tuned behaviour exactly.
@@ -119,10 +120,16 @@ _DEFAULT_SEARCH_SPACE = {
     "class_weight": [None],
 }
 
+# v4 defaults (Aufgabe 5):
+#   * enabled    — ``True``: HPO is on by default (overridden by
+#                  ``--no-tune-hyperparams``).
+#   * objective  — ``"log_loss"``: log-loss is the canonical objective for
+#                  the panel-logit / probability-forecast use case.
+#                  (Pre-v4 was "brier_score"; the helper still accepts it.)
 _DEFAULT_HPO = {
-    "enabled": False,
+    "enabled": True,
     "method": "grid",
-    "objective": "brier_score",
+    "objective": "log_loss",
     "validation_fraction": 0.2,
     "min_train_obs": 60,
     "min_validation_obs": 20,

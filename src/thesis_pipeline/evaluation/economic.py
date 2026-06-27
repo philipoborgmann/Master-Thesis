@@ -18,8 +18,9 @@ implementation:
 * **Returns are log returns throughout.** The output table exposes both
   ``annualized_log_return`` and ``annualized_simple_return = expm1(...)``.
 * **Buy-and-hold** is generated for every cost level (was only cost=0).
-* **Benchmark lifts** vs B1 / B2 are appended where the benchmark rows
-  are available.
+* **Benchmark lifts** vs ECON are appended where the ECON row is
+  available (v4: the legacy `B1` / `B2` benchmarks are gone; `ECON` is
+  the single matched benchmark for the v4 nested-comparison evaluation).
 
 The portfolio is **equal-weight long-short, dollar-neutral approximated**:
 ``long_weights.sum() = +1``, ``short_weights.sum() = -1``, ``gross = 2``.
@@ -959,11 +960,12 @@ def attach_benchmark_lifts(economic_df: pd.DataFrame,
     The benchmark Sharpe / cumulative return are matched **within the same
     model family** (horizon + cost_bps + model_type + panel_mode +
     hpo_variant). A panel-logit row is therefore lifted only against the
-    panel-logit B1 / B2 rows of the same panel mode and HPO variant — fixed-C
+    panel-logit ECON row of the same panel mode and HPO variant — fixed-C
     and HPO are never mixed, nor per-asset and panel. Rows with no same-family
     benchmark keep NaN lift columns rather than crashing or silently borrowing
     another family's number. (BUY_HOLD is a separate global reference and is
-    not used here.)
+    not used here; NAIVE lives outside the economic backtest as a separate
+    evaluation reference.)
     """
     if economic_df is None or economic_df.empty:
         return economic_df
@@ -1007,7 +1009,7 @@ def load_backtest_config(path: str | Path | None = None) -> dict:
         "crypto_calendar_days": 365,
         "transaction_cost_bps": [0, 5, 10],
         "thresholds":          [0.55, 0.60, 0.65],
-        "benchmark_ids":       ["B1", "B2"],
+        "benchmark_ids":       ["ECON"],
         "risk_free_rate":      0.0,
         "include_buy_and_hold": True,
     }

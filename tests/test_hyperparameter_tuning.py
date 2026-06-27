@@ -308,7 +308,10 @@ def test_panel_hpo_ticker_fe_runs():
 def test_load_hpo_config_defaults_disabled():
     cfg = hpt.load_hpo_config({"hyperparameter_tuning": {"enabled": False}})
     assert cfg["enabled"] is False
-    assert cfg["objective"] == "brier_score"
+    # v4 default objective is log_loss (was brier_score in v3). The
+    # `enabled: false` flag only flips the toggle — the objective stays
+    # at whatever the v4 _DEFAULT_HPO carries.
+    assert cfg["objective"] == "log_loss"
 
 
 def test_load_hpo_config_legacy_bool():
@@ -365,7 +368,7 @@ def test_summarize_hpo_columns_aggregates():
 
 def test_cli_dry_run_with_tune_hyperparams():
     from thesis_pipeline import cli
-    rc = cli.main(["run-models", "--horizon", "1d", "--set-id", "C3",
+    rc = cli.main(["run-models", "--horizon", "1d", "--set-id", "ECON_CBT_F",
                    "--sentiment-model", "cryptobert", "--tune-hyperparams",
                    "--hpo-objective", "brier_score", "--dry-run"])
     assert rc == 0
@@ -373,7 +376,7 @@ def test_cli_dry_run_with_tune_hyperparams():
 
 def test_cli_dry_run_panel_with_tune_hyperparams():
     from thesis_pipeline import cli
-    rc = cli.main(["run-models", "--horizon", "1d", "--set-id", "C3",
+    rc = cli.main(["run-models", "--horizon", "1d", "--set-id", "ECON_CBT_F",
                    "--sentiment-model", "cryptobert", "--model-type", "panel_logit",
                    "--panel-mode", "pooled", "--tune-hyperparams",
                    "--hpo-objective", "brier_score", "--dry-run"])

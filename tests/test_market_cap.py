@@ -132,7 +132,10 @@ def _synthetic_signals():
 
 
 def _synthetic_mcap_lookup():
-    dates = pd.date_range("2024-01-01", periods=12, tz="UTC")
+    # Includes a leading prior day so the availability-based as-of join
+    # (commit 3 Section E) finds an admissible regime for the first
+    # signal — strict-< excludes same-day availability instants.
+    dates = pd.date_range("2023-12-31", periods=13, tz="UTC")
     frames = []
     for tk, lag_val, regime in (("BTC", 400.0, "large"),
                                 ("ETH", 200.0, "mid"),

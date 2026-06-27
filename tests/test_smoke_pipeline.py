@@ -30,8 +30,9 @@ def test_dry_run_merge_features():
     assert rc == 0
 
 
-def test_dry_run_run_models_b1():
-    rc = cli.main(["run-models", "--horizon", "1d", "--set-id", "B1",
+def test_dry_run_run_models_econ():
+    """v4 smoke set_id is ECON (was B1 before the 17-set registry refactor)."""
+    rc = cli.main(["run-models", "--horizon", "1d", "--set-id", "ECON",
                    "--smoke", "--dry-run"])
     assert rc == 0
 

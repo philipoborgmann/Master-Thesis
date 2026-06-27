@@ -1,9 +1,21 @@
-"""Tests for the matched-benchmark comparison (C/CV/M_k vs B_k).
+"""Tests for the v4 nested matched-benchmark comparison (ECON_* vs ECON).
 
-Covers spec items 1-8 for the post-refactor mapping ``X_k → B_k`` across the
-combined CryptoBERT (``C*``), combined VADER (``CV*``) and multi (``M*``)
-families. Also exercises matched-key joining, lift-sign symmetry, the
-missing-benchmark sentinel, and the CSV/Excel output from ``evaluate-signals``.
+The v4 17-set registry collapses the v3 ``C_k → B_k`` / ``CV_k → B_k`` /
+``M_k → B_k`` mapping into a single matched benchmark: every combined set
+(``ECON_VAD_*`` / ``ECON_CBT_*``) shares the same ``ECON`` core and is
+compared against ``ECON`` directly. This file pins:
+
+* the mapping covers exactly the v4 combined family,
+* matching joins on ``(horizon, timestamp, ticker)``,
+* lift signs are consistent with "combined model beats ECON",
+* a missing-benchmark row falls through to the sentinel status,
+* the rolling-window guard still discriminates between expanding and
+  ``rolling_fixed`` configurations,
+* ``evaluate-signals`` writes the CSV + Excel sheet.
+
+Plus the new ``NAIVE`` separate-reference contract (Aufgabe 6.3) — NAIVE
+is NOT a feature set and is never returned by the matched-benchmark
+mapper.
 """
 from __future__ import annotations
 
@@ -19,29 +31,42 @@ from thesis_pipeline.evaluation import evaluate_signals as eval_main
 
 
 # ---------------------------------------------------------------------------
-# Items 1-4 — mapping is explicit and exhaustive for C1-C6
+# Items 1-4 — mapping is explicit and exhaustive for ECON_VAD_* and ECON_CBT_*
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("set_id,expected", [
-    *[(f"C{k}", f"B{k}") for k in range(1, 7)],
-    *[(f"CV{k}", f"B{k}") for k in range(1, 7)],
-    *[(f"M{k}", f"B{k}") for k in range(1, 7)],
+@pytest.mark.parametrize("set_id", [
+    "ECON_VAD_L", "ECON_VAD_LD", "ECON_VAD_DA", "ECON_VAD_F",
+    "ECON_CBT_L", "ECON_CBT_LD", "ECON_CBT_DA", "ECON_CBT_F",
 ])
-def test_matched_economic_benchmark_mapping(set_id, expected):
-    assert inc.matched_economic_benchmark_for_combined(set_id) == expected
+def test_matched_economic_benchmark_mapping_v4(set_id):
+    assert inc.matched_economic_benchmark_for_combined(set_id) == "ECON"
 
 
 def test_matched_economic_benchmark_unknown_returns_none():
     assert inc.matched_economic_benchmark_for_combined("Z9") is None
-    # Pure sentiment / benchmark families never appear on the model side of
-    # the incremental comparison, so the mapping yields None.
-    assert inc.matched_economic_benchmark_for_combined("S3") is None
-    assert inc.matched_economic_benchmark_for_combined("SV3") is None
-    assert inc.matched_economic_benchmark_for_combined("B4") is None
+    # Pure sentiment / benchmark / NAIVE families never appear on the model
+    # side of the v4 incremental comparison.
+    assert inc.matched_economic_benchmark_for_combined("SENT_CBT_F") is None
+    assert inc.matched_economic_benchmark_for_combined("SENT_VAD_F") is None
+    assert inc.matched_economic_benchmark_for_combined("ECON") is None
+    assert inc.matched_economic_benchmark_for_combined("NAIVE") is None
+    # And the removed v3 ids must NOT secretly retain a mapping entry.
+    assert inc.matched_economic_benchmark_for_combined("C3") is None
+    assert inc.matched_economic_benchmark_for_combined("CV3") is None
+    assert inc.matched_economic_benchmark_for_combined("M1") is None
+    assert inc.matched_economic_benchmark_for_combined("B1") is None
+
+
+def test_matched_economic_benchmark_count_is_eight():
+    """The v4 mapping must contain exactly 8 entries — 4 VADER + 4 CryptoBERT
+    combined sets. Any drift means an ECON_* set was added or removed
+    without an explicit decision."""
+    assert len(inc.MATCHED_ECONOMIC_BENCHMARK) == 8
+    assert set(inc.MATCHED_ECONOMIC_BENCHMARK.values()) == {"ECON"}
 
 
 # ---------------------------------------------------------------------------
-# Synthetic signal frames for items 5-7
+# Synthetic signal frames
 # ---------------------------------------------------------------------------
 
 def _signal_frame(*, set_id, sentiment_model, model_type="per_asset",
@@ -64,7 +89,7 @@ def _signal_frame(*, set_id, sentiment_model, model_type="per_asset",
         "horizon": "1d", "category": _category_for(set_id),
         "model_type": model_type, "panel_mode": panel_mode,
         "hpo_variant": hpo_variant, "hpo_enabled": hpo_variant != "fixed",
-        "hpo_objective": "brier_score" if hpo_variant != "fixed" else "-",
+        "hpo_objective": "log_loss" if hpo_variant != "fixed" else "-",
         "train_window_mode": train_window_mode,
         "train_window_timestamps": train_window_timestamps,
         "rolling_window_days": rolling_window_days,
@@ -72,12 +97,12 @@ def _signal_frame(*, set_id, sentiment_model, model_type="per_asset",
 
 
 def _category_for(set_id: str) -> str:
-    if set_id.startswith("B"):  return "benchmark"
-    if set_id.startswith("SV"): return "sentiment_vader"
-    if set_id.startswith("S"):  return "sentiment_cryptobert"
-    if set_id.startswith("CV"): return "combined_vader"
-    if set_id.startswith("C"):  return "combined_cryptobert"
-    if set_id.startswith("M"):  return "multi"
+    s = str(set_id)
+    if s == "ECON":            return "benchmark"
+    if s.startswith("SENT_VAD"):  return "sentiment_vader"
+    if s.startswith("SENT_CBT"):  return "sentiment_cryptobert"
+    if s.startswith("ECON_VAD"):  return "combined_vader"
+    if s.startswith("ECON_CBT"):  return "combined_cryptobert"
     return "other"
 
 
@@ -88,14 +113,15 @@ def _category_for(set_id: str) -> str:
 def test_comparison_matches_on_timestamp_and_ticker():
     # The combined frame's first 60 timestamps overlap the benchmark; the
     # benchmark covers only the first 60 days. n_matched must be 60, not 120.
-    combined = _signal_frame(set_id="C2", sentiment_model="cryptobert", n=120,
-                              acc=0.70, seed=11)
-    bench    = _signal_frame(set_id="B2", sentiment_model="-",     n=60,
-                              acc=0.55, seed=12)
+    combined = _signal_frame(set_id="ECON_CBT_F", sentiment_model="cryptobert",
+                              n=120, acc=0.70, seed=11)
+    bench    = _signal_frame(set_id="ECON", sentiment_model="-",
+                              n=60,  acc=0.55, seed=12)
     out = inc.incremental_sentiment_value_table(
         pd.concat([combined, bench], ignore_index=True))
-    row = out[(out["set_id"] == "C2") & (out["sentiment_model"] == "cryptobert")].iloc[0]
-    assert row["benchmark_set_id"] == "B2"
+    row = out[(out["set_id"] == "ECON_CBT_F")
+              & (out["sentiment_model"] == "cryptobert")].iloc[0]
+    assert row["benchmark_set_id"] == "ECON"
     assert int(row["n_matched"]) == 60
 
 
@@ -104,10 +130,9 @@ def test_comparison_matches_on_timestamp_and_ticker():
 # ---------------------------------------------------------------------------
 
 def test_accuracy_lift_sign_follows_combined_better():
-    # Combined model is constructed to be more accurate than the benchmark.
-    combined = _signal_frame(set_id="C1", sentiment_model="cryptobert",
+    combined = _signal_frame(set_id="ECON_VAD_L", sentiment_model="vader",
                               acc=0.75, seed=1, n=200)
-    bench    = _signal_frame(set_id="B1", sentiment_model="-",
+    bench    = _signal_frame(set_id="ECON", sentiment_model="-",
                               acc=0.55, seed=1, n=200)
     # Align target so the matched-subset comparison is fair (both rows share τ).
     bench["target"] = combined["target"].values
@@ -120,14 +145,11 @@ def test_accuracy_lift_sign_follows_combined_better():
     assert row["status"] == "ok"
     assert row["model_accuracy"] > row["benchmark_accuracy"]
     assert row["accuracy_lift"] > 0
-    # Symmetry of "positive = combined is better" for the other metrics.
     assert row["brier_improvement"] == pytest.approx(
         row["benchmark_brier"] - row["model_brier"])
     assert row["log_loss_improvement"] == pytest.approx(
         row["benchmark_log_loss"] - row["model_log_loss"])
     assert row["f1_lift"] == pytest.approx(row["model_f1"] - row["benchmark_f1"])
-    # McNemar c counts cases where the model is correct & benchmark wrong;
-    # with a real lift c >> b.
     assert int(row["mcnemar_c"]) > int(row["mcnemar_b"])
     assert row["interpretation_flag"] in {"improved", "improved_significant"}
 
@@ -137,10 +159,12 @@ def test_accuracy_lift_sign_follows_combined_better():
 # ---------------------------------------------------------------------------
 
 def test_missing_benchmark_emits_sentinel_row():
-    """``C3 → B3``. With no B3 frame in the signals, the comparison yields a
-    ``status='missing_benchmark'`` row instead of crashing.
+    """``ECON_CBT_F → ECON``. With no ECON frame in the signals, the
+    comparison yields a ``status='missing_benchmark'`` row instead of
+    crashing.
     """
-    only_combined = _signal_frame(set_id="C3", sentiment_model="cryptobert",
+    only_combined = _signal_frame(set_id="ECON_CBT_F",
+                                   sentiment_model="cryptobert",
                                    acc=0.6, seed=3)
     captured = []
     out = inc.incremental_sentiment_value_table(
@@ -150,11 +174,10 @@ def test_missing_benchmark_emits_sentinel_row():
     assert len(out) == 1
     row = out.iloc[0]
     assert row["status"] == "missing_benchmark"
-    assert row["benchmark_set_id"] == "B3"
+    assert row["benchmark_set_id"] == "ECON"
     assert int(row["n_matched"]) == 0
-    # Lift values are NaN, not zero, to signal "not computed".
     assert pd.isna(row["accuracy_lift"])
-    assert captured == [("1d", "C3", "cryptobert", "B3")]
+    assert captured == [("1d", "ECON_CBT_F", "cryptobert", "ECON")]
 
 
 # ---------------------------------------------------------------------------
@@ -163,10 +186,10 @@ def test_missing_benchmark_emits_sentinel_row():
 
 def test_rolling_window_must_match_for_comparison():
     """A combined rolling_fixed run must NOT borrow an expanding benchmark."""
-    combined = _signal_frame(set_id="CV2", sentiment_model="vader",
+    combined = _signal_frame(set_id="ECON_VAD_F", sentiment_model="vader",
                               train_window_mode="rolling_fixed",
                               train_window_timestamps=30, n=120, seed=4)
-    expanding_bench = _signal_frame(set_id="B2", sentiment_model="-",
+    expanding_bench = _signal_frame(set_id="ECON", sentiment_model="-",
                                     train_window_mode="expanding",
                                     n=120, seed=5)
     out = inc.incremental_sentiment_value_table(
@@ -174,7 +197,7 @@ def test_rolling_window_must_match_for_comparison():
     assert (out["status"] == "missing_benchmark").all()
 
     # Same rolling configuration → comparison succeeds.
-    matched_bench = _signal_frame(set_id="B2", sentiment_model="-",
+    matched_bench = _signal_frame(set_id="ECON", sentiment_model="-",
                                   train_window_mode="rolling_fixed",
                                   train_window_timestamps=30, n=120, seed=6)
     out2 = inc.incremental_sentiment_value_table(
@@ -183,6 +206,37 @@ def test_rolling_window_must_match_for_comparison():
     ok = out2[out2["status"] == "ok"].iloc[0]
     assert ok["train_window_mode"] == "rolling_fixed"
     assert int(ok["train_window_timestamps"]) == 30
+
+
+# ---------------------------------------------------------------------------
+# NAIVE separate-reference contract (Aufgabe 6.3)
+# ---------------------------------------------------------------------------
+
+def test_naive_label_constant_value():
+    assert inc.NAIVE_REFERENCE_LABEL == "NAIVE"
+
+
+def test_is_naive_signal_row_detects_naive_set_id():
+    row = pd.Series({"set_id": "NAIVE"})
+    assert inc.is_naive_signal_row(row)
+
+
+def test_is_naive_signal_row_detects_panel_benchmark_model():
+    row = pd.Series({
+        "set_id": "ECON",
+        "benchmark_model": "ticker_rolling_probability_with_pooled_fallback",
+    })
+    assert inc.is_naive_signal_row(row)
+
+
+def test_is_naive_signal_row_rejects_econ_signal():
+    row = pd.Series({"set_id": "ECON", "benchmark_model": ""})
+    assert not inc.is_naive_signal_row(row)
+
+
+def test_is_naive_signal_row_rejects_sentiment_signal():
+    row = pd.Series({"set_id": "ECON_VAD_F", "benchmark_model": np.nan})
+    assert not inc.is_naive_signal_row(row)
 
 
 # ---------------------------------------------------------------------------
@@ -210,22 +264,22 @@ def signals_env(tmp_path, monkeypatch):
     (signals_root / "1d").mkdir(parents=True)
     raw_1d = tmp_path / "Data" / "Raw" / "Price" / "1d"
     raw_1d.mkdir(parents=True)
-    # Combined CV2 / VADER + matched B2 (per the new C/CV/M_k → B_k map).
-    _build_synth_signal_frame(set_id="CV2", sentiment_model="vader",
+    # Combined ECON_VAD_F + matched ECON (v4 nested H1 pairing).
+    _build_synth_signal_frame(set_id="ECON_VAD_F", sentiment_model="vader",
                                acc=0.70, n=80, seed=1).to_parquet(
-        signals_root / "1d" / "CV2_vader.parquet", index=False)
-    _build_synth_signal_frame(set_id="B2", sentiment_model="-",
+        signals_root / "1d" / "ECON_VAD_F_vader.parquet", index=False)
+    _build_synth_signal_frame(set_id="ECON", sentiment_model="-",
                                acc=0.55, n=80, seed=2).to_parquet(
-        signals_root / "1d" / "B2.parquet", index=False)
+        signals_root / "1d" / "ECON.parquet", index=False)
     # Minimal feature_sets workbook so attach_feature_set_metadata works.
     fs = pd.DataFrame({
-        "set_id":   ["B1", "B2", "CV2"],
-        "category": ["benchmark", "benchmark", "combined_vader"],
-        "sentiment_model": ["-", "-", "vader"],
-        "label":    ["b", "lag", "cv2"],
+        "set_id":   ["ECON", "ECON_VAD_F"],
+        "category": ["benchmark", "combined_vader"],
+        "sentiment_model": ["-", "vader"],
+        "label":    ["econ", "econ-vader-full"],
         "feature_columns_comma_separated": [
-            "__majority_class__", "log_return_t",
-            "log_return_t,vader_title_score_mean,vader_bullishness_ratio",
+            "log_return_t,cum_log_return_7d,cum_log_return_14d,cum_log_return_21d,realized_vol_14d,volume_diff,log_market_cap_lag1",
+            "log_return_t,cum_log_return_7d,cum_log_return_14d,cum_log_return_21d,realized_vol_14d,volume_diff,log_market_cap_lag1,vader_title_score_mean,vader_title_score_std,vader_bullishness_ratio,log1p_post_count",
         ],
     })
     fs_path = tmp_path / "feature_sets.xlsx"
@@ -252,12 +306,11 @@ def test_evaluate_signals_writes_incremental_csv_and_sheet(signals_env):
     csv_path = out_dir / "incremental_sentiment_value.csv"
     assert csv_path.exists()
     df = pd.read_csv(csv_path)
-    # The combined CV2 / VADER vs B2 comparison must be present and ok.
-    row = df[(df["set_id"] == "CV2") & (df["sentiment_model"] == "vader")].iloc[0]
-    assert row["benchmark_set_id"] == "B2"
+    row = df[(df["set_id"] == "ECON_VAD_F")
+             & (df["sentiment_model"] == "vader")].iloc[0]
+    assert row["benchmark_set_id"] == "ECON"
     assert row["status"] == "ok"
     assert int(row["n_matched"]) > 0
-    # Required column set from the spec.
     expected_cols = {
         "horizon", "set_id", "sentiment_model", "model_type", "panel_mode",
         "train_window_mode", "train_window_timestamps",
@@ -273,7 +326,6 @@ def test_evaluate_signals_writes_incremental_csv_and_sheet(signals_env):
         "model_correct", "benchmark_correct", "interpretation_flag",
     }
     assert expected_cols <= set(df.columns)
-
     # The Excel report carries the new sheet.
     xlsx = out_dir / "signal_evaluation.xlsx"
     assert xlsx.exists()

@@ -68,6 +68,10 @@ def _add_run_models_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--set-id", "--set_id", dest="set_id", default=None)
     parser.add_argument("--coins", "--coin", "--ticker",
                         dest="coins", nargs="*")
+    parser.add_argument("--feature-config", "--feature_config",
+                        dest="feature_config", default=None,
+                        help="Override path to feature_sets.xlsx (used by "
+                             "modeling.run_models.load_feature_sets).")
     parser.add_argument("--sentiment-model", "--sentiment_model",
                         dest="sentiment_model", default=None,
                         type=_sentiment_model_choice,
@@ -75,23 +79,28 @@ def _add_run_models_args(parser: argparse.ArgumentParser) -> None:
                         help="Restrict to one sentiment scorer. FinBERT was "
                              "removed and rejected with an informative error.")
     parser.add_argument("--model-type", "--model_type", dest="model_type",
-                        default="per_asset",
+                        default="panel_logit",
                         choices=["per_asset", "panel_logit"],
-                        help="per_asset (default) or panel_logit.")
+                        help="v4 default: panel_logit. Pass per_asset to opt "
+                             "back into the historical ticker-by-ticker model.")
     parser.add_argument("--panel-mode", "--panel_mode", dest="panel_mode",
-                        default="pooled",
+                        default="ticker_fixed_effects",
                         choices=["pooled", "ticker_fixed_effects"],
-                        help="Panel variant (only with --model-type panel_logit).")
+                        help="v4 default: ticker_fixed_effects (shared slopes "
+                             "+ coin dummies). Pass pooled for a single "
+                             "intercept across all coins.")
     parser.add_argument("--restart", action="store_true",
                         help="Ignore cached signal parquets and rerun every set.")
     parser.add_argument("--tune-hyperparams", "--tune_hyperparams",
-                        dest="tune_hyperparams", action="store_true",
-                        help="Enable conservative, leakage-safe grid-search HPO "
-                             "inside each walk-forward training window.")
+                        dest="tune_hyperparams",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="v4 default: ON. Run nested grid-search HPO inside "
+                             "each walk-forward training window. "
+                             "--no-tune-hyperparams falls back to fixed-C.")
     parser.add_argument("--hpo-objective", "--hpo_objective",
-                        dest="hpo_objective", default=None,
+                        dest="hpo_objective", default="log_loss",
                         choices=["brier_score", "log_loss", "accuracy"],
-                        help="HPO selection metric (default: model_specs.yaml).")
+                        help="HPO selection metric (v4 default: log_loss).")
     parser.add_argument("--hpo-config", "--hpo_config", dest="hpo_config",
                         default=None,
                         help="Path to a YAML with a hyperparameter_tuning section.")
@@ -122,20 +131,29 @@ def _add_run_models_args(parser: argparse.ArgumentParser) -> None:
                         help="Delete this run's checkpoint directory before "
                              "starting (does not happen automatically on --restart).")
     parser.add_argument("--train-window", "--train_window",
-                        dest="train_window", default="expanding",
+                        dest="train_window", default="rolling_fixed",
                         choices=["expanding", "rolling_fixed"],
-                        help="Panel training window (default: expanding). "
-                             "rolling_fixed requires --rolling-window-timestamps "
-                             "or --rolling-window-days; structural-break "
+                        help="v4 default: rolling_fixed (180 calendar days). "
+                             "Pass expanding to opt back into the historical "
+                             "all-of-history training set. Structural-break "
                              "diagnostics never set this automatically.")
     parser.add_argument("--rolling-window-timestamps", "--rolling_window_timestamps",
                         dest="rolling_window_timestamps", type=int, default=None,
-                        help="Manual number of pre-tau unique timestamps to "
-                             "include in the rolling training window.")
+                        help="Override the day-distance window with an exact "
+                             "count of pre-tau timestamps. Mutually exclusive "
+                             "with --rolling-window-days.")
     parser.add_argument("--rolling-window-days", "--rolling_window_days",
-                        dest="rolling_window_days", type=float, default=None,
-                        help="Manual day-distance rolling window (alternative "
-                             "to --rolling-window-timestamps).")
+                        dest="rolling_window_days", type=float, default=180.0,
+                        help="Rolling window in CALENDAR days (v4 default: "
+                             "180). Identical wall-clock across 1d/6h/1h.")
+    parser.add_argument("--generate-naive-reference",
+                        "--generate_naive_reference",
+                        dest="generate_naive_reference",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Generate the NAIVE rolling-probability "
+                             "reference signal once per (horizon, family, "
+                             "window) configuration, independently of the "
+                             "feature-set grid (v4 default: ON).")
 
 
 # ---------------------------------------------------------------------------
@@ -343,14 +361,23 @@ def cmd_run_models(args: argparse.Namespace) -> int:
         argv += ["--set-id", args.set_id]
     if args.coins:
         argv += ["--coins", *list(args.coins)]
+    if getattr(args, "feature_config", None):
+        argv += ["--feature-config", args.feature_config]
     if args.sentiment_model:
         argv += ["--sentiment-model", args.sentiment_model]
     if getattr(args, "model_type", None):
         argv += ["--model-type", args.model_type]
     if getattr(args, "panel_mode", None):
         argv += ["--panel-mode", args.panel_mode]
-    if getattr(args, "tune_hyperparams", False):
-        argv.append("--tune-hyperparams")
+    # ``--tune-hyperparams`` is BooleanOptionalAction with v4 default True.
+    # Forward the explicit positive OR negative form so the user's choice
+    # propagates through to modeling.run_models (rather than letting the
+    # downstream parser silently reapply its own default).
+    argv += (["--tune-hyperparams"] if getattr(args, "tune_hyperparams", True)
+             else ["--no-tune-hyperparams"])
+    argv += (["--generate-naive-reference"]
+             if getattr(args, "generate_naive_reference", True)
+             else ["--no-generate-naive-reference"])
     if getattr(args, "hpo_objective", None):
         argv += ["--hpo-objective", args.hpo_objective]
     if getattr(args, "hpo_config", None):
@@ -566,7 +593,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Override the default diagnostic basket.")
     sp.add_argument("--include-market-cap", dest="include_market_cap",
                     action="store_true",
-                    help="Include market_cap_t in the default basket.")
+                    help="Include log_market_cap_lag1 in the default basket.")
     sp.add_argument("--max-breaks", dest="max_breaks", type=int, default=None)
     sp.add_argument("--min-segment-frac", dest="min_segment_frac", type=float,
                     default=None)

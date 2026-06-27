@@ -136,7 +136,7 @@ stages:
     supports_smoke: true
     smoke:
       horizon: "1d"
-      set_id: "B1"
+      set_id: "ECON"
       coins: [BTC, ETH]
 
   evaluate_signals:

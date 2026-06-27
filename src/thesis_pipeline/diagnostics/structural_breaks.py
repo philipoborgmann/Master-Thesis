@@ -35,11 +35,11 @@ logger = logging.getLogger("structural_breaks")
 
 HORIZONS = ("1h", "6h", "1d")
 
-# Default diagnostic basket — market_cap_t is intentionally excluded; flip
+# Default diagnostic basket — log_market_cap_lag1 is intentionally excluded; flip
 # --include-market-cap on the CLI to add it.
 DEFAULT_DIAGNOSTIC_FEATURES: tuple[str, ...] = (
     "log_return_t",
-    "realized_vol_14",
+    "realized_vol_14d",
     "volume_diff",
     "post_count",
     "cryptobert_title_score_mean",
@@ -211,7 +211,7 @@ def _select_features(df: pd.DataFrame,
                      include_market_cap: bool) -> list[str]:
     """Pick the subset of ``requested`` (default basket) actually in ``df``.
 
-    ``market_cap_t`` is excluded unless ``include_market_cap`` is set.
+    ``log_market_cap_lag1`` is excluded unless ``include_market_cap`` is set.
     Identifier / target columns are always excluded.
     """
     requested = list(requested) if requested else list(DEFAULT_DIAGNOSTIC_FEATURES)
@@ -219,7 +219,7 @@ def _select_features(df: pd.DataFrame,
     for col in requested:
         if col in _FORBIDDEN_COLUMNS:
             continue
-        if col == "market_cap_t" and not include_market_cap:
+        if col in ("log_market_cap_lag1", "market_cap_t") and not include_market_cap:
             continue
         if col in df.columns:
             out.append(col)
@@ -344,7 +344,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Override the default diagnostic feature basket.")
     p.add_argument("--include-market-cap", "--include_market_cap",
                    dest="include_market_cap", action="store_true",
-                   help="Include market_cap_t in the default basket "
+                   help="Include log_market_cap_lag1 in the default basket "
                         "(off by default).")
     p.add_argument("--max-breaks", "--max_breaks", dest="max_breaks", type=int,
                    default=5, help="Upper bound on break count (default: 5).")

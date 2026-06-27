@@ -413,7 +413,9 @@ def write_csv_outputs(out_dir: Path, *,
                       economic_diagnostics: pd.DataFrame | None = None,
                       regime_mcnemar: pd.DataFrame | None = None,
                       regime_mcnemar_summary: pd.DataFrame | None = None,
+                      diff_in_improvement: pd.DataFrame | None = None,
                       incremental_sentiment: pd.DataFrame | None = None,
+                      absolute_vs_naive: pd.DataFrame | None = None,
                       ) -> dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
@@ -437,8 +439,10 @@ def write_csv_outputs(out_dir: Path, *,
     _emit("economic_diagnostics", economic_diagnostics, "economic_diagnostics.csv")
     _emit("regime_mcnemar",         regime_mcnemar,         "regime_mcnemar_tests.csv")
     _emit("regime_mcnemar_summary", regime_mcnemar_summary, "regime_mcnemar_summary.csv")
+    _emit("diff_in_improvement",    diff_in_improvement,    "diff_in_improvement.csv")
     _emit("incremental_sentiment_value", incremental_sentiment,
           "incremental_sentiment_value.csv")
+    _emit("absolute_vs_naive", absolute_vs_naive, "absolute_vs_naive.csv")
     return paths
 
 
@@ -458,7 +462,9 @@ def write_excel_report(out_path: Path, *,
                        economic_by_ticker: pd.DataFrame | None = None,
                        regime_mcnemar: pd.DataFrame | None = None,
                        regime_mcnemar_summary: pd.DataFrame | None = None,
-                       incremental_sentiment: pd.DataFrame | None = None) -> Path:
+                       diff_in_improvement: pd.DataFrame | None = None,
+                       incremental_sentiment: pd.DataFrame | None = None,
+                       absolute_vs_naive: pd.DataFrame | None = None) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _write_all(target: Path) -> None:
@@ -485,9 +491,13 @@ def write_excel_report(out_path: Path, *,
                 _write_sheet(writer, "regime_mcnemar_tests",      regime_mcnemar)
             if regime_mcnemar_summary is not None:
                 _write_sheet(writer, "regime_mcnemar_summary",    regime_mcnemar_summary)
+            if diff_in_improvement is not None:
+                _write_sheet(writer, "diff_in_improvement",       diff_in_improvement)
             if incremental_sentiment is not None:
                 _write_sheet(writer, "incremental_sentiment_value",
                              incremental_sentiment)
+            if absolute_vs_naive is not None:
+                _write_sheet(writer, "absolute_vs_naive", absolute_vs_naive)
             _write_sheet(writer, "leaderboard",                   leaderboard)
             _write_sheet(writer, "summary",                       summary)
 
@@ -547,10 +557,10 @@ def print_console_summary(*,
             parts.append(hv)
         return f" [{'/'.join(parts)}]" if parts else ""
 
-    # Benchmark accuracy per horizon
-    bench = pooled[pooled["set_id"] == "B1"][["horizon", "accuracy"]].sort_values("horizon")
+    # Benchmark accuracy per horizon — v4 nested H1 baseline is ECON.
+    bench = pooled[pooled["set_id"] == "ECON"][["horizon", "accuracy"]].sort_values("horizon")
     if not bench.empty:
-        print("\n  Benchmark (B1) accuracy by horizon:")
+        print("\n  Benchmark (ECON) accuracy by horizon:")
         for _, r in bench.iterrows():
             acc = r["accuracy"]
             acc_str = f"{acc:.4f}" if pd.notna(acc) else "n/a"

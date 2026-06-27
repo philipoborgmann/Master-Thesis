@@ -96,7 +96,9 @@ def test_module_parser_accepts_new_arg_names():
 
 
 def test_dry_run_via_module_main_returns_zero():
-    """``main(['--smoke', '--dry-run'])`` must not touch the filesystem."""
+    """``main(['--smoke', '--dry-run'])`` must not touch the filesystem.
+    Set-id ECON is the v4 smoke default; B1 was removed in the 17-set
+    registry refactor."""
     rc = rm.main(["--smoke", "--dry-run", "--horizon", "1d",
-                  "--set-id", "B1", "--coins", "BTC"])
+                  "--set-id", "ECON", "--coins", "BTC"])
     assert rc == 0

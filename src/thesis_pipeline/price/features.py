@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
 """
-Create_Price_Features_v3.py
+Create_Price_Features_v4.py
 ===========================
 
 Creates ML-ready feature parquet files from OHLCV price data.
 
-Version 3: fixes CMC market-cap matching for rebranded/renamed coins.
-- NANO prefers XNO because it has overlap with the thesis sample.
-- MIOTA prefers MIOTA because the IOTA column starts after the thesis sample.
+Version 4 — calendar-consistent windows and strict as-of market-cap merge,
+designed to eliminate identified market-cap-related look-ahead leakage.
 
 For each horizon (1h, 6h, 1d) and each coin, the script computes:
   - target: 0 if log return in t+1 is negative, otherwise 1
   - log_return_t: log return at t
-  - cum_log_return_7: cumulative log return over the last 7 observations
-  - cum_log_return_14: cumulative log return over the last 14 observations
-  - realized_vol_14: rolling std of log returns over 14 observations
-  - volume_diff: simple first difference in volume at t
-  - market_cap_t: CoinMarketCap market cap matched by calendar date
+  - cum_log_return_7d  / 14d / 21d: cumulative log return over the past
+    7 / 14 / 21 CALENDAR days. The window length in bars is therefore
+    ``days * BARS_PER_DAY[horizon]`` and identical wall-clock between
+    horizons (1d → 7/14/21 bars; 6h → 28/56/84; 1h → 168/336/504).
+  - realized_vol_14d: rolling std of log returns over 14 calendar days.
+  - volume_diff: simple first difference in volume at t (horizon-native).
+  - log_market_cap_lag1 = log(market_cap_at_t-1).
+  - market_cap_source_date: the CMC source date D the value came from.
+  - market_cap_available_at: assumed availability of the value
+    (D + 1 day, 00:00 UTC). This is a documented conservative DEFAULT
+    ASSUMPTION about CMC publication latency, not an empirically
+    measured release time.
+
+Market-cap merge is strictly as-of: only values with
+``market_cap_available_at < prediction_timestamp`` enter the feature row
+(``pd.merge_asof(..., direction='backward', allow_exact_matches=False)``).
 
 Outlier treatment:
   - log_return_t and volume_diff are winsorized per coin and horizon
@@ -40,9 +50,8 @@ Output:
   Data/Features/cmc_marketcap_column_matches.csv
 
 Usage:
-  python Create_Price_Features.py
-  python Create_Price_Features.py --coin BTC
-  python Create_Price_Features.py --price_dir "Data/Raw/Price" --output_dir "Data/Features"
+  python -m thesis_pipeline.price.features
+  python -m thesis_pipeline.price.features --coin BTC
 """
 
 from __future__ import annotations
@@ -67,6 +76,22 @@ DEFAULT_PRICE_DIR = BASE_DIR / "Data" / "Raw" / "Price"
 DEFAULT_OUTPUT_DIR = BASE_DIR / "Data" / "Features"
 
 HORIZONS = ["1h", "6h", "1d"]
+
+# Bar-count per calendar day for each modelling horizon. Window features
+# (cum_log_return_*d, realized_vol_14d) use ``days * BARS_PER_DAY[horizon]``
+# so the wall-clock window length is identical across horizons.
+BARS_PER_DAY: dict[str, int] = {"1d": 1, "6h": 4, "1h": 24}
+
+# Calendar days for each rolling window. 21d is new for v4.
+CUM_RETURN_WINDOW_DAYS: tuple[int, ...] = (7, 14, 21)
+REALIZED_VOL_WINDOW_DAYS: int = 14
+
+# Assumed availability lag for the daily CMC market-cap snapshot. The
+# raw file carries a single calendar date D per row; we model the value
+# as becoming usable for a prediction at D + MARKET_CAP_AVAILABILITY_LAG.
+# This is a **conservative default assumption** about CMC publication
+# latency, not an empirically measured release time.
+MARKET_CAP_AVAILABILITY_LAG: pd.Timedelta = pd.Timedelta(days=1)
 
 # File aliases: local exchange files sometimes use IOTA although the thesis
 # ticker is MIOTA; Nano can appear as NANO or XNO depending on source/date.
@@ -497,9 +522,33 @@ def build_market_cap_series(
             })
             continue
 
-        tmp = market_cap[["date", col]].rename(columns={col: "market_cap_t"}).copy()
-        tmp["market_cap_t"] = pd.to_numeric(tmp["market_cap_t"], errors="coerce")
-        tmp = tmp.dropna(subset=["market_cap_t"]).sort_values("date").reset_index(drop=True)
+        tmp = market_cap[["date", col]].rename(columns={col: "market_cap"}).copy()
+        tmp["market_cap"] = pd.to_numeric(tmp["market_cap"], errors="coerce")
+        # ── Defensive pre-log filtering ────────────────────────────
+        # log() of non-positive / non-finite values yields NaN or -inf
+        # and would silently leak into log_market_cap_lag1. Drop ≤0,
+        # NaN and ±inf market-caps here so only finite, strictly positive
+        # source values survive into the feature pipeline.
+        valid_mask  = tmp["market_cap"].notna() & np.isfinite(tmp["market_cap"]) & (tmp["market_cap"] > 0)
+        n_invalid_raw = int((~valid_mask).sum())
+        tmp = tmp[valid_mask].sort_values("date").reset_index(drop=True)
+        # Add documented availability columns:
+        #   market_cap_source_date  – the calendar date D the snapshot belongs to.
+        #   market_cap_available_at – D + 1 day, 00:00 UTC (conservative default
+        #     assumption about CMC publication latency — see module docstring).
+        tmp["market_cap_source_date"]  = pd.to_datetime(tmp["date"], utc=True)
+        tmp["market_cap_available_at"] = (
+            tmp["market_cap_source_date"] + MARKET_CAP_AVAILABILITY_LAG
+        )
+        # log_market_cap_lag1 — log transform once, here. After the
+        # pre-filter above this can only produce finite values; the
+        # ``replace`` is a belt-and-braces safety net.
+        tmp["log_market_cap_lag1"] = (
+            np.log(tmp["market_cap"]).replace([np.inf, -np.inf], np.nan)
+        )
+        n_invalid_after_log = int(tmp["log_market_cap_lag1"].isna().sum())
+        if n_invalid_after_log:
+            tmp = tmp.dropna(subset=["log_market_cap_lag1"]).reset_index(drop=True)
         series_by_ticker[ticker] = tmp
 
         cmc_id, sym = parse_cmc_column(col)
@@ -508,9 +557,11 @@ def build_market_cap_series(
             "market_cap_column": col,
             "parsed_cmc_id": cmc_id,
             "parsed_symbol": sym,
-            "n_non_null_market_cap": int(tmp["market_cap_t"].notna().sum()),
+            "n_non_null_market_cap":           int(tmp["market_cap"].notna().sum()),
+            "n_invalid_market_cap_rows_raw":   n_invalid_raw,
+            "n_invalid_market_cap_after_log":  n_invalid_after_log,
             "first_market_cap_date": str(tmp["date"].min()) if len(tmp) else "",
-            "last_market_cap_date": str(tmp["date"].max()) if len(tmp) else "",
+            "last_market_cap_date":  str(tmp["date"].max()) if len(tmp) else "",
             "status": "ok",
         })
 
@@ -527,9 +578,26 @@ def create_features_for_coin_horizon(
     horizon: str,
     market_cap_series: Optional[pd.DataFrame],
     winsor_p: float,
-    marketcap_lag_days: int = 0,
+    marketcap_lag_days: int = 0,  # noqa: ARG001 — accepted for CLI back-compat; ignored.
 ) -> tuple[pd.DataFrame, dict, list[dict]]:
-    """Creates features for one ticker-horizon pair."""
+    """Creates features for one ticker-horizon pair.
+
+    Windows are calendar-consistent across horizons: cum_log_return_7d /
+    14d / 21d and realized_vol_14d use ``days * BARS_PER_DAY[horizon]``
+    bars and ``min_periods = window_bars``.
+
+    Market-cap merge is strictly as-of with documented availability:
+    a CMC value with source date D is modelled as available at
+    D + MARKET_CAP_AVAILABILITY_LAG (default = D + 1 day, 00:00 UTC) and
+    only enters a row whose ``timestamp`` is **strictly** after that
+    instant (``allow_exact_matches=False``). The legacy
+    ``--marketcap_lag_days`` flag is ignored.
+    """
+    if horizon not in BARS_PER_DAY:
+        raise ValueError(
+            f"Unknown horizon {horizon!r}; expected one of {list(BARS_PER_DAY)}"
+        )
+
     df = load_ohlcv(price_dir, ticker, horizon)
     if df is None or df.empty:
         report = {
@@ -557,31 +625,53 @@ def create_features_for_coin_horizon(
     df["log_return_t"], lr_low, lr_high = winsorize_series(df["log_return_raw"], winsor_p)
     df["volume_diff"], vd_low, vd_high = winsorize_series(df["volume_diff_raw"], winsor_p)
 
-    # Rolling cumulative log returns are based on winsorized log returns.
-    df["cum_log_return_7"] = df["log_return_t"].rolling(window=7, min_periods=7).sum()
-    df["cum_log_return_14"] = df["log_return_t"].rolling(window=14, min_periods=14).sum()
+    # Calendar-consistent rolling windows. ``bars`` is the count of horizon
+    # bars that fits the requested calendar days exactly (1d→1, 6h→4, 1h→24
+    # bars per day). ``min_periods = bars`` so we never emit a partial-window
+    # value, and the windows are identical wall-clock between horizons.
+    bpd = BARS_PER_DAY[horizon]
+    for n_days in CUM_RETURN_WINDOW_DAYS:
+        bars = n_days * bpd
+        df[f"cum_log_return_{n_days}d"] = (
+            df["log_return_t"].rolling(window=bars, min_periods=bars).sum()
+        )
 
-    # Realized volatility: rolling standard deviation of winsorized log returns.
-    # Captures the second moment (dispersion) of returns, complementing the
-    # first-moment features (level and direction). Crypto returns exhibit strong
-    # volatility clustering; this feature allows the classifier to condition on
-    # the current volatility regime (Sung et al., 2022; Tang et al., 2024).
-    df["realized_vol_14"] = df["log_return_t"].rolling(window=14, min_periods=14).std()
+    # Realized volatility: rolling std of winsorized log returns over the
+    # 14-calendar-day window. Captures the second moment of returns,
+    # complementing the first-moment level features (volatility clustering;
+    # Sung et al., 2022; Tang et al., 2024).
+    rv_bars = REALIZED_VOL_WINDOW_DAYS * bpd
+    df["realized_vol_14d"] = (
+        df["log_return_t"].rolling(window=rv_bars, min_periods=rv_bars).std()
+    )
 
     # Target: next-period log return. No winsorization needed for sign.
     next_log_return = df["log_return_raw"].shift(-1)
     df["target"] = np.where(next_log_return < 0, 0, 1).astype("float")
     df.loc[next_log_return.isna(), "target"] = np.nan
 
-    # Market cap merge by calendar date. Optional lag can avoid same-day leakage.
+    # ── Market-cap merge: strict as-of with documented availability ──
+    # No same-day or future market cap may enter a row.
+    df = df.sort_values("timestamp").reset_index(drop=True)
     if market_cap_series is not None and not market_cap_series.empty:
-        mc = market_cap_series.copy()
-        if marketcap_lag_days != 0:
-            mc["date"] = pd.to_datetime(mc["date"]) + pd.to_timedelta(marketcap_lag_days, unit="D")
-            mc["date"] = mc["date"].dt.date
-        df = df.merge(mc, on="date", how="left")
+        mc = market_cap_series[
+            ["market_cap_source_date", "market_cap_available_at",
+             "market_cap", "log_market_cap_lag1"]
+        ].copy()
+        mc = mc.sort_values("market_cap_available_at").reset_index(drop=True)
+        df = pd.merge_asof(
+            df,
+            mc,
+            left_on="timestamp",
+            right_on="market_cap_available_at",
+            direction="backward",
+            allow_exact_matches=False,
+        )
     else:
-        df["market_cap_t"] = np.nan
+        df["market_cap"]              = np.nan
+        df["log_market_cap_lag1"]     = np.nan
+        df["market_cap_source_date"]  = pd.NaT
+        df["market_cap_available_at"] = pd.NaT
 
     feature_cols = [
         "timestamp",
@@ -590,11 +680,14 @@ def create_features_for_coin_horizon(
         "horizon",
         "target",
         "log_return_t",
-        "cum_log_return_7",
-        "cum_log_return_14",
-        "realized_vol_14",
+        "cum_log_return_7d",
+        "cum_log_return_14d",
+        "cum_log_return_21d",
+        "realized_vol_14d",
         "volume_diff",
-        "market_cap_t",
+        "log_market_cap_lag1",
+        "market_cap_source_date",
+        "market_cap_available_at",
     ]
 
     before_drop = len(df)
@@ -602,11 +695,12 @@ def create_features_for_coin_horizon(
     out = out.dropna(subset=[
         "target",
         "log_return_t",
-        "cum_log_return_7",
-        "cum_log_return_14",
-        "realized_vol_14",
+        "cum_log_return_7d",
+        "cum_log_return_14d",
+        "cum_log_return_21d",
+        "realized_vol_14d",
         "volume_diff",
-        "market_cap_t",
+        "log_market_cap_lag1",
     ]).reset_index(drop=True)
     out["target"] = out["target"].astype("int8")
 
@@ -621,7 +715,8 @@ def create_features_for_coin_horizon(
         "first_timestamp": str(out["timestamp"].min()) if len(out) else "",
         "last_timestamp": str(out["timestamp"].max()) if len(out) else "",
         "share_positive_target": float(out["target"].mean()) if len(out) else np.nan,
-        "n_missing_market_cap_before_drop": int(df["market_cap_t"].isna().sum()),
+        "n_missing_market_cap_before_drop":
+            int(df["log_market_cap_lag1"].isna().sum()),
     }
 
     thresholds = [
@@ -664,11 +759,20 @@ def main(argv=None) -> int:
         type=int,
         default=0,
         help=(
-            "Optional date shift applied to market cap before merging. "
-            "Default 0 means same calendar date. Use 1 if you want yesterday's market cap as today's feature."
+            "DEPRECATED — accepted for back-compat only and IGNORED. "
+            "Market-cap merge is now strictly as-of with a documented "
+            "availability lag (MARKET_CAP_AVAILABILITY_LAG, default = "
+            "D + 1 day, 00:00 UTC); see module docstring."
         ),
     )
     args = parser.parse_args(argv)
+    if args.marketcap_lag_days != 0:
+        print(
+            "[WARN] --marketcap_lag_days is deprecated and IGNORED. "
+            "The merge is now strictly as-of (allow_exact_matches=False) "
+            "with a documented availability lag of "
+            f"{MARKET_CAP_AVAILABILITY_LAG}."
+        )
 
     price_dir = Path(args.price_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
@@ -699,6 +803,9 @@ def main(argv=None) -> int:
 
     all_reports: list[dict] = []
     all_thresholds: list[dict] = []
+    # Audit accumulators (effective market-cap lag + bar-grid regularity).
+    lag_audit_rows: list[pd.DataFrame] = []
+    bar_audit_rows: list[pd.DataFrame] = []
 
     for horizon in args.horizons:
         print("\n" + "=" * 70)
@@ -734,6 +841,19 @@ def main(argv=None) -> int:
             df_horizon = pd.concat(horizon_parts, ignore_index=True)
             df_horizon = df_horizon.sort_values(["timestamp", "ticker"]).reset_index(drop=True)
 
+            # Section F / G — timing audits per horizon (best-effort; the
+            # main feature pipeline is never broken by an audit failure).
+            try:
+                from ..diagnostics.timing_audit import (
+                    market_cap_lag_audit, bar_grid_audit,
+                )
+                if {"market_cap_source_date", "market_cap_available_at"}.issubset(
+                        df_horizon.columns):
+                    lag_audit_rows.append(market_cap_lag_audit(df_horizon))
+                bar_audit_rows.append(bar_grid_audit(df_horizon))
+            except Exception as exc:  # noqa: BLE001
+                print(f"[WARN] timing audit skipped for {horizon}: {exc}")
+
             output_path = output_dir / f"features_{horizon}.parquet"
             df_horizon.to_parquet(output_path, index=False)
             print(f"\n[INFO] Saved {output_path} ({len(df_horizon):,} rows, {df_horizon.shape[1]} columns)")
@@ -742,6 +862,27 @@ def main(argv=None) -> int:
 
     # Audit files.
     report_df = pd.DataFrame(all_reports)
+    # ── Section F: market-cap effective-lag summary appended to the report ─
+    if lag_audit_rows:
+        from ..diagnostics.timing_audit import market_cap_lag_summary
+        lag_full = pd.concat(lag_audit_rows, ignore_index=True)
+        per_h = (lag_full.groupby("horizon", as_index=False)
+                 .apply(lambda g: pd.Series(market_cap_lag_summary(g)))
+                 .reset_index(drop=True))
+        per_h.to_csv(output_dir / "market_cap_lag_summary.csv", index=False)
+        # Append global summary columns to the per-(ticker,horizon) report.
+        global_summary = market_cap_lag_summary(lag_full)
+        for k, v in global_summary.items():
+            report_df[k] = v
+        print(f"[INFO] market_cap_lag_summary: {global_summary}")
+    # ── Section G: bar-grid regularity report ─────────────────────────────
+    if bar_audit_rows:
+        bar_full = pd.concat(bar_audit_rows, ignore_index=True)
+        bar_full.to_csv(output_dir / "bar_grid_audit.csv", index=False)
+        n_irregular = int((bar_full["n_missing_expected_bars"] > 0).sum())
+        if n_irregular:
+            print(f"[WARN] bar-grid: {n_irregular} (ticker, horizon) entries "
+                  f"have missing bars — see bar_grid_audit.csv.")
     report_path = output_dir / "feature_generation_report.csv"
     report_df.to_csv(report_path, index=False)
 

@@ -78,12 +78,13 @@ def signals_env(tmp_path, monkeypatch):
 
     rng = np.random.default_rng(0)
 
-    # Signal files: B1 (benchmark), E4 (economic), S1_vader (sentiment), C1_vader (combined)
+    # v4 synthetic signal files. The v4 nested H1 test is "ECON_VAD_F vs ECON"
+    # so the fixture must carry ECON (matched benchmark) and at least one
+    # combined / sentiment-only set.
     sigs = {
-        ("B1", "-"):       _synthetic_signals(rng, set_id="B1", sentiment_model="-",       accuracy_target=0.51),
-        ("E4", "-"):       _synthetic_signals(rng, set_id="E4", sentiment_model="-",       accuracy_target=0.55),
-        ("S1", "vader"):   _synthetic_signals(rng, set_id="S1", sentiment_model="vader",   accuracy_target=0.58),
-        ("C1", "vader"):   _synthetic_signals(rng, set_id="C1", sentiment_model="vader",   accuracy_target=0.60),
+        ("ECON", "-"):           _synthetic_signals(rng, set_id="ECON",       sentiment_model="-",      accuracy_target=0.55),
+        ("SENT_VAD_L", "vader"): _synthetic_signals(rng, set_id="SENT_VAD_L", sentiment_model="vader",  accuracy_target=0.58),
+        ("ECON_VAD_F", "vader"): _synthetic_signals(rng, set_id="ECON_VAD_F", sentiment_model="vader",  accuracy_target=0.60),
         # An empty file to ensure it is skipped gracefully
     }
     for (sid, sm), df in sigs.items():
@@ -95,25 +96,24 @@ def signals_env(tmp_path, monkeypatch):
                                                 index=False)
 
     # A different-horizon signal so we can verify horizon filtering
-    sig_1h = _synthetic_signals(rng, set_id="B1", sentiment_model="-",
+    sig_1h = _synthetic_signals(rng, set_id="ECON", sentiment_model="-",
                                 horizon="1h", n=80, step=timedelta(hours=1))
-    sig_1h.to_parquet(signals_root / "1h" / "B1.parquet", index=False)
+    sig_1h.to_parquet(signals_root / "1h" / "ECON.parquet", index=False)
 
     # Daily OHLCV for BTC
     ohlcv = _synthetic_ohlcv(rng)
     ohlcv.to_parquet(raw_1d / "BTCUSDT_1d.parquet", index=False)
 
-    # Minimal feature_sets.xlsx
+    # Minimal feature_sets.xlsx (v4 ids).
     feature_sets = pd.DataFrame({
-        "set_id":   ["B1", "E4", "S1", "C1"],
-        "category": ["benchmark", "economic", "sentiment", "combined"],
-        "sentiment_model": ["-", "-", "vader", "vader"],
-        "label":    ["bench", "econ-full", "sent-mean", "combo"],
+        "set_id":   ["ECON", "SENT_VAD_L", "ECON_VAD_F"],
+        "category": ["benchmark", "sentiment_vader", "combined_vader"],
+        "sentiment_model": ["-", "vader", "vader"],
+        "label":    ["econ", "vad-mean", "econ+vad-full"],
         "feature_columns_comma_separated": [
-            "__majority_class__",
-            "log_return_t,cum_log_return_7",
-            "vader_combined_mean",
-            "log_return_t,vader_combined_mean",
+            "log_return_t,cum_log_return_7d,cum_log_return_14d,cum_log_return_21d,realized_vol_14d,volume_diff,log_market_cap_lag1",
+            "vader_title_score_mean",
+            "log_return_t,vader_title_score_mean",
         ],
     })
     fs_path = tmp_path / "feature_sets.xlsx"
@@ -146,8 +146,10 @@ def test_discover_signal_files_filters_by_horizon(signals_env):
     files_all = loading.discover_signal_files()
     files_1d  = loading.discover_signal_files("1d")
     files_1h  = loading.discover_signal_files("1h")
-    assert len(files_all) >= 5
-    assert len(files_1d) == 5  # 4 valid + EMPTY.parquet
+    # v4 fixture: 3 valid (ECON, SENT_VAD_L_vader, ECON_VAD_F_vader)
+    # + 1 EMPTY.parquet on the 1d horizon = 4.
+    assert len(files_all) >= 4
+    assert len(files_1d) == 4
     assert len(files_1h) == 1
     assert all(p.suffix == ".parquet" for p in files_all)
 
@@ -167,7 +169,7 @@ def test_load_all_signals_carries_metadata_from_columns(signals_env):
     df = loading.load_all_signals("1d")
     assert not df.empty
     # set_id/sentiment_model/horizon come from columns, never the filename:
-    assert set(df["set_id"].unique()) == {"B1", "E4", "S1", "C1"}
+    assert set(df["set_id"].unique()) == {"ECON", "SENT_VAD_L", "ECON_VAD_F"}
     assert "vader" in df["sentiment_model"].unique()
     assert (df["horizon"] == "1d").all()
 
@@ -188,15 +190,15 @@ def test_pooled_and_per_ticker_metrics(signals_env):
     pooled = metrics.pooled_metrics_table(df)
     per_tk = metrics.per_ticker_metrics_table(df)
 
-    # 4 sets × 1 horizon × 1 sentiment_model-per-set
-    assert len(pooled) == 4
+    # 3 sets × 1 horizon × 1 sentiment_model-per-set (v4 fixture)
+    assert len(pooled) == 3
     for col in ("accuracy", "balanced_accuracy", "f1", "precision", "recall",
                 "log_loss", "brier_score", "TP", "TN", "FP", "FN",
                 "positive_accuracy", "negative_accuracy", "n_obs", "n_tickers"):
         assert col in pooled.columns
     # Per-ticker: one ticker (BTC) per set
     assert (per_tk["ticker"] == "BTC").all()
-    assert len(per_tk) == 4
+    assert len(per_tk) == 3
 
 
 def test_confusion_diagnostics_synthetic():
@@ -351,14 +353,13 @@ def test_mcnemar_table_excludes_benchmarks_and_non_eligible(signals_env):
     fs = pd.read_excel(signals_env["feature_sets"], sheet_name="feature_sets")
     fs.columns = [c.strip().lower().replace(" ", "_") for c in fs.columns]
     df = loading.attach_feature_set_metadata(df, fs)
-    out = significance.mcnemar_table(df, benchmarks=("B1", "B2"))
-    # Benchmark sets never appear as the *tested* set_id.
-    assert {"B1", "B2"}.isdisjoint(out["set_id"].unique())
-    # Only sentiment+combined are eligible → S1 and C1 = 2 sets,
-    # tested against both benchmarks where present → expect rows per (set × benchmark)
-    # Note: B2 is not part of this synthetic env, so only B1 contributes.
-    assert set(out["set_id"]) == {"S1", "C1"}
-    assert set(out["benchmark"]) == {"B1"}
+    out = significance.mcnemar_table(df, benchmarks=("ECON",))
+    # The benchmark itself never appears as the *tested* set_id.
+    assert "ECON" not in out["set_id"].unique()
+    # Only sentiment + combined are eligible → SENT_VAD_L and ECON_VAD_F,
+    # each tested against ECON.
+    assert set(out["set_id"]) == {"SENT_VAD_L", "ECON_VAD_F"}
+    assert set(out["benchmark"]) == {"ECON"}
 
 
 def test_mcnemar_wide_disambiguates_benchmarks():
@@ -420,18 +421,20 @@ def test_full_evaluation_writes_excel_and_csvs(signals_env):
                 "benchmark_better_bh_5pct"):
         assert col in regime.columns
     # Pooled CSV must carry both the disambiguated McNemar columns AND the
-    # legacy back-compat aliases.
+    # legacy back-compat aliases. v4: the single matched benchmark is ECON,
+    # so the disambiguated column is `mcnemar_pval_vs_econ`.
     pooled = pd.read_csv(out_dir / "pooled_metrics.csv")
-    assert set(pooled["set_id"]) == {"B1", "E4", "S1", "C1"}
-    for col in ("mcnemar_pval_vs_b1", "significant_vs_b1",
+    assert set(pooled["set_id"]) == {"ECON", "SENT_VAD_L", "ECON_VAD_F"}
+    for col in ("mcnemar_pval_vs_econ", "significant_vs_econ",
                 "mcnemar_pval", "significant_vs_benchmark"):
         assert col in pooled.columns
-    # B1's McNemar columns are NaN; sentiment/combined have a real test
-    bench = pooled[pooled["set_id"] == "B1"].iloc[0]
-    assert pd.isna(bench["mcnemar_pval_vs_b1"])
-    sent = pooled[pooled["set_id"] == "S1"].iloc[0]
-    assert pd.notna(sent["mcnemar_pval_vs_b1"])
-    # Backward-compat alias mirrors the B1 value.
+    # ECON's McNemar columns are NaN (you don't test ECON vs ECON);
+    # sentiment/combined have a real test.
+    bench = pooled[pooled["set_id"] == "ECON"].iloc[0]
+    assert pd.isna(bench["mcnemar_pval_vs_econ"])
+    sent = pooled[pooled["set_id"] == "SENT_VAD_L"].iloc[0]
+    assert pd.notna(sent["mcnemar_pval_vs_econ"])
+    # Backward-compat alias mirrors the ECON value.
     assert pd.isna(bench["mcnemar_pval"])
     assert pd.notna(sent["mcnemar_pval"])
 
@@ -439,7 +442,7 @@ def test_full_evaluation_writes_excel_and_csvs(signals_env):
     # carry lift_accuracy = accuracy_model − accuracy_benchmark.
     lift = pd.read_csv(out_dir / "threshold_lift.csv")
     assert not lift.empty
-    assert set(lift["set_id"]) == {"S1", "C1"}
+    assert set(lift["set_id"]) == {"SENT_VAD_L", "ECON_VAD_F"}
     assert set(lift["threshold"]) == {0.50, 0.55, 0.60, 0.65}
     # Algebraic invariant: lift_accuracy == accuracy_model − accuracy_benchmark.
     valid = lift.dropna(subset=["accuracy_model", "accuracy_benchmark", "lift_accuracy"])
@@ -531,7 +534,7 @@ def test_full_evaluation_writes_economic_diagnostics(signals_env):
     assert diag_path.exists(), "economic_diagnostics.csv missing"
     diag = pd.read_csv(diag_path)
     # All four signal sets in the fixture must appear in diagnostics.
-    assert set(diag["set_id"]) == {"B1", "E4", "S1", "C1"}
+    assert set(diag["set_id"]) == {"ECON", "SENT_VAD_L", "ECON_VAD_F"}
     for col in ("horizon", "set_id", "sentiment_model", "model_type",
                 "panel_mode", "hpo_variant", "category", "label",
                 "n_signal_rows", "n_unique_timestamps", "n_unique_tickers",
@@ -558,7 +561,7 @@ def test_full_evaluation_economic_csv_contains_all_groups(signals_env):
     # the one that pins the bug fix here.
     diag = pd.read_csv(out_dir / "economic_diagnostics.csv")
     # All four model sets attempted, none collapsed.
-    assert set(diag["set_id"]) == {"B1", "E4", "S1", "C1"}
+    assert set(diag["set_id"]) == {"ECON", "SENT_VAD_L", "ECON_VAD_F"}
     # BUY_HOLD still present in the metrics CSV (per the rest of the design).
     assert "BUY_HOLD" in econ["set_id"].astype(str).tolist()
 
@@ -583,7 +586,8 @@ def test_strict_feature_set_ids_drops_stale_signals(signals_env, tmp_path):
     pooled = pd.read_csv(out_dir / "pooled_metrics.csv")
     assert "ZZ_STALE" not in pooled["set_id"].astype(str).unique()
     # Registered sets still present.
-    assert {"B1", "S1", "C1"}.issubset(set(pooled["set_id"].astype(str)))
+    assert {"ECON", "SENT_VAD_L", "ECON_VAD_F"}.issubset(
+        set(pooled["set_id"].astype(str)))
 
 
 def test_non_strict_feature_set_ids_keeps_stale_signals(signals_env):
@@ -629,10 +633,15 @@ def test_volatility_regime_join_dtype_stable(tmp_path):
     # date column must be tz-aware datetime64
     assert pd.api.types.is_datetime64_any_dtype(out["date"])
 
-    # Build a fake regime lookup
+    # Build a fake regime lookup. We add one leading row so the
+    # availability-based as-of join (commit 3 Section E) can match the
+    # very first signal — strict-< excludes same-instant availability.
+    lookup_dates = pd.DatetimeIndex(
+        [start - pd.Timedelta(days=1)]
+    ).append(pd.DatetimeIndex(out["date"]))
     lookup = pd.DataFrame({
-        "ticker": "BTC", "date": out["date"],
-        "regime": (["low"] * 20) + (["mid"] * 20) + (["high"] * 20),
+        "ticker": "BTC", "date": lookup_dates,
+        "regime": ["low"] + (["low"] * 20) + (["mid"] * 20) + (["high"] * 20),
     })
 
     # Signals with naive timestamps — attach_regimes must still join.

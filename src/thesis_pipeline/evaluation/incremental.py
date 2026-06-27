@@ -1,21 +1,22 @@
 """Matched economic-benchmark comparison for combined feature sets.
 
 The thesis asks whether sentiment adds **incremental** predictive value beyond
-the corresponding economic backbone. The simple B1 benchmark only answers
-"better than a lag-feature baseline". For every combined feature set C1–C6 we
-also need the stricter "did sentiment help **on top of** the economic-only
-predictors it shares with this combined set" comparison.
+the corresponding economic backbone. The v4 17-set registry holds exactly one
+economic-only benchmark — ``ECON`` — and every combined set
+(``ECON_VAD_*`` / ``ECON_CBT_*``) shares that backbone identically. The
+nested comparison is therefore "did the sentiment block help **on top of**
+the ECON core?" and the matched benchmark is always ``ECON``.
 
 This module is a **pure evaluation layer** — no model is retrained. We re-use
-the signal frames that ``run-models`` already produced for the economic
-benchmark sets E2 / E4 and inner-join them with the combined-set signal frames
-on ``(horizon, timestamp, ticker)`` within the same model family (same
-``model_type``, ``panel_mode``, training-window configuration and HPO
-variant).
+the signal frames that ``run-models`` already produced for ``ECON`` and the
+combined sets, inner-join them on ``(horizon, timestamp, ticker)`` within
+the same model family (same ``model_type`` / ``panel_mode`` / training-
+window configuration / HPO variant), and compute the McNemar test plus
+accuracy / Brier / log-loss lifts.
 
-The mapping is intentionally explicit (Option A in the spec): the C-set design
-is fixed and transparent, and a static dict makes the comparison auditable
-without an additional XLSX round-trip.
+This is the **primary H1 path** in v4 (Aufgabe 6.1). The legacy "vs B1 /
+vs B2" comparison was removed — ``B1`` is now the NAIVE evaluation reference
+(see :mod:`thesis_pipeline.modeling.benchmarks`), not a feature set.
 """
 
 from __future__ import annotations
@@ -35,30 +36,57 @@ from .significance import SIGNIFICANCE_ALPHA, mcnemar_continuity_corrected
 # Mapping
 # ---------------------------------------------------------------------------
 
-#: Matched economic-only benchmark for every combined / multi feature set.
-#:
-#: After the family refactor (with FinBERT removed), each combined / multi set
-#: ``X_k`` pairs benchmark level ``k`` with sentiment level ``k`` (using the
-#: hierarchical mapping from ``feature_sets.xlsx``), so the matched benchmark
-#: is simply ``B_k``:
-#:
-#: * ``C_k``  (Benchmark + CryptoBERT)         → ``B_k``
-#: * ``CV_k`` (Benchmark + VADER)              → ``B_k``
-#: * ``M_k``  (Benchmark + CryptoBERT + VADER) → ``B_k``
+#: Matched economic-only benchmark for every combined feature set in the
+#: v4 registry. Every ``ECON_{VAD,CBT}_{L,LD,DA,F}`` shares the same
+#: ``ECON`` core, so the matched benchmark is identical for the whole
+#: combined family — making the incremental-value comparison transparent
+#: ("did the sentiment block add information beyond ECON?").
 MATCHED_ECONOMIC_BENCHMARK: dict[str, str] = {
-    **{f"C{k}":  f"B{k}" for k in range(1, 7)},
-    **{f"CV{k}": f"B{k}" for k in range(1, 7)},
-    **{f"M{k}":  f"B{k}" for k in range(1, 7)},
+    **{f"ECON_VAD_{block}": "ECON" for block in ("L", "LD", "DA", "F")},
+    **{f"ECON_CBT_{block}": "ECON" for block in ("L", "LD", "DA", "F")},
 }
 
 
 def matched_economic_benchmark_for_combined(set_id: str) -> str | None:
     """Return the matched economic-only benchmark set_id for a combined set.
 
-    Returns ``None`` when ``set_id`` is not one of C1–C6 so the caller can
-    skip the row silently rather than crash.
+    Returns ``None`` when ``set_id`` is not one of the v4 ``ECON_*`` sets,
+    so the caller can skip the row silently rather than crash.
     """
     return MATCHED_ECONOMIC_BENCHMARK.get(str(set_id))
+
+
+# ---------------------------------------------------------------------------
+# NAIVE — separate evaluation reference (Aufgabe 6.3)
+# ---------------------------------------------------------------------------
+
+#: Canonical label for the historical-majority rolling-probability benchmark.
+#: NAIVE is a separate **evaluation reference** in v4 — never a feature set
+#: in :data:`~thesis_pipeline.features.feature_registry.SET_ID_PATTERN`. It
+#: answers a different question ("does the model beat the no-information
+#: rule?") from the H1 nested test ("does sentiment beat ECON?"). The two
+#: are reported side by side, never pooled.
+NAIVE_REFERENCE_LABEL = "NAIVE"
+
+
+def is_naive_signal_row(row: pd.Series) -> bool:
+    """True iff ``row`` is part of a rolling-probability NAIVE signal frame.
+
+    Two markers count:
+
+    * ``set_id`` is the canonical ``NAIVE`` label, or
+    * a ``benchmark_model`` column is present with a
+      ``"rolling_probability"`` substring (panel rolling-prob writes
+      ``"ticker_rolling_probability_with_pooled_fallback"``; per-asset
+      rolling-prob currently writes no such column but is identifiable
+      from its set_id label upstream).
+    """
+    if row is None:
+        return False
+    if str(row.get("set_id", "")).upper() == NAIVE_REFERENCE_LABEL:
+        return True
+    bm = str(row.get("benchmark_model", "") or "")
+    return "rolling_probability" in bm
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +180,9 @@ _OUTPUT_COLUMNS = [
     "horizon", "set_id", "sentiment_model", "model_type", "panel_mode",
     "train_window_mode", "train_window_timestamps", "rolling_window_days",
     "hpo_variant", "benchmark_set_id", "benchmark_sentiment_model",
-    "benchmark_hpo_variant", "n_matched",
+    "benchmark_hpo_variant",
+    "test_role", "hypothesis_family",
+    "n_matched",
     "model_accuracy", "benchmark_accuracy", "accuracy_lift",
     "model_balanced_accuracy", "benchmark_balanced_accuracy",
     "balanced_accuracy_lift",
@@ -161,8 +191,31 @@ _OUTPUT_COLUMNS = [
     "model_f1", "benchmark_f1", "f1_lift",
     "mcnemar_b", "mcnemar_c", "mcnemar_stat", "mcnemar_p_value",
     "model_correct", "benchmark_correct",
-    "interpretation_flag", "status",
+    "interpretation_flag",
+    # v4 BH (Aufgabe 6 follow-up B) — populated by the table builder
+    # after every row is gathered. Always present (NaN/False for
+    # rows that did not enter the BH pool).
+    "q_value_bh", "significant_raw_5pct",
+    "significant_bh_5pct", "significant_bh_10pct",
+    "interpretation_bh",
+    "status",
 ]
+
+# Test-role tags (Aufgabe 6 follow-up C). The primary H1 incremental-value
+# test is ECON_* (the v4 combined sets that share the ECON core) compared
+# to ECON. The BH-corrected H1 family contains only these rows. A
+# sentiment-only set (SENT_*) compared to ECON would be a *different*
+# information-set comparison and does not enter H1.
+TEST_ROLE_PRIMARY = "primary_H1_nested"
+TEST_ROLE_SECONDARY = "secondary_non_nested"
+
+#: Documented scope of the BH-corrected H1 family. The thesis multiplicity
+#: plan groups ALL primary-nested ECON_* vs ECON comparisons across the
+#: three horizons into one family, so the BH pool size is 8 sets × 3
+#: horizons = 24 tests when every horizon has the full panel. The constant
+#: is exposed so tests can assert on it and so external configs can
+#: override it (e.g. "per_horizon") with an explicit decision.
+H1_BH_SCOPE = "all_primary_h1_tests"
 
 
 def _identity_row(*, horizon, set_id, sentiment_model, model_type, panel_mode,
@@ -180,10 +233,16 @@ def _identity_row(*, horizon, set_id, sentiment_model, model_type, panel_mode,
         "benchmark_set_id": benchmark_set_id,
         "benchmark_sentiment_model": "-",
         "benchmark_hpo_variant": benchmark_hpo_variant,
+        "test_role": TEST_ROLE_PRIMARY,  # only primary rows are emitted here
+        "hypothesis_family": "H1_incremental",
         "n_matched": 0,
         "mcnemar_b": 0, "mcnemar_c": 0,
         "model_correct": 0, "benchmark_correct": 0,
         "interpretation_flag": "n/a",
+        "significant_raw_5pct": False,
+        "significant_bh_5pct":  False,
+        "significant_bh_10pct": False,
+        "interpretation_bh":    "n/a",
         "status": status,
     })
     return row
@@ -324,6 +383,11 @@ def incremental_sentiment_value_table(
             "benchmark_set_id":      bench_set_id,
             "benchmark_sentiment_model": "-",
             "benchmark_hpo_variant": chosen_hpo,
+            # v4 (Aufgabe 6 follow-up C): every row this table emits is by
+            # construction a primary H1 nested comparison — only ECON_*
+            # sets enter MATCHED_ECONOMIC_BENCHMARK.
+            "test_role":         TEST_ROLE_PRIMARY,
+            "hypothesis_family": "H1_incremental",
             "n_matched": n_matched,
             "model_accuracy":            m_metrics["accuracy"],
             "benchmark_accuracy":        b_metrics["accuracy"],
@@ -345,13 +409,69 @@ def incremental_sentiment_value_table(
             "mcnemar_stat": float(mcn_stat), "mcnemar_p_value": float(mcn_p),
             "model_correct": int(correct_m.sum()),
             "benchmark_correct": int(correct_b.sum()),
-            "interpretation_flag": _classify(acc_lift, mcn_p),
+            "interpretation_flag":   _classify(acc_lift, mcn_p),
+            "significant_raw_5pct":  bool(np.isfinite(mcn_p)
+                                          and mcn_p < SIGNIFICANCE_ALPHA),
             "status": "ok",
         })
 
     out = pd.DataFrame(rows)
     if out.empty:
         return pd.DataFrame(columns=_OUTPUT_COLUMNS)
+
+    # ── Family-aware BH correction (Aufgabe 6 follow-up B) ────────
+    # H1_BH_SCOPE = "all_primary_h1_tests" — every valid ok row from every
+    # horizon enters one BH pool. Invalid / missing_benchmark / no_overlap
+    # rows are excluded.
+    out = _apply_bh_within_family(out)
+
     # Stable column order — write the schema columns first, anything extra last.
     extras = [c for c in out.columns if c not in _OUTPUT_COLUMNS]
     return out[_OUTPUT_COLUMNS + extras].reset_index(drop=True)
+
+
+def _apply_bh_within_family(df: pd.DataFrame) -> pd.DataFrame:
+    """Add ``q_value_bh`` / ``significant_bh_*`` / ``interpretation_bh``.
+
+    Uses :func:`thesis_pipeline.evaluation.diff_in_improvement
+    .adjust_pvalues_bh_within_family` so H1 reuses the same family-aware
+    helper as H2/H3. Only valid ``status='ok'`` rows enter the BH pool.
+    """
+    out = df.copy()
+    # Default columns to NaN/False/"n/a" for rows that do not enter BH.
+    out["q_value_bh"]           = np.nan
+    out["significant_bh_5pct"]  = False
+    out["significant_bh_10pct"] = False
+    out["interpretation_bh"]    = "n/a"
+
+    valid_mask = (out["status"].astype(str) == "ok") \
+                 & out["mcnemar_p_value"].notna()
+    if not valid_mask.any():
+        return out
+
+    # Delegate to the family-aware utility for the actual BH math.
+    from .diff_in_improvement import adjust_pvalues_bh_within_family
+    sub = out.loc[valid_mask].copy()
+    sub = adjust_pvalues_bh_within_family(
+        sub,
+        family_col="hypothesis_family",
+        p_col="mcnemar_p_value",
+        q_col="q_value_bh",
+        sig5_col="significant_bh_5pct",
+        sig10_col="significant_bh_10pct",
+    )
+    out.loc[valid_mask, "q_value_bh"]           = sub["q_value_bh"].values
+    out.loc[valid_mask, "significant_bh_5pct"]  = sub["significant_bh_5pct"].values
+    out.loc[valid_mask, "significant_bh_10pct"] = sub["significant_bh_10pct"].values
+    # BH interpretation mirrors the raw direction but is gated on the BH flag.
+    direction = np.sign(out.loc[valid_mask, "accuracy_lift"].fillna(0.0).values)
+    bh5 = out.loc[valid_mask, "significant_bh_5pct"].values
+    interp = np.where(
+        direction > 0,
+        np.where(bh5, "improved_bh_significant", "improved_bh_ns"),
+        np.where(direction < 0,
+                 np.where(bh5, "degraded_bh_significant", "degraded_bh_ns"),
+                 "no_change"),
+    )
+    out.loc[valid_mask, "interpretation_bh"] = interp
+    return out

@@ -65,11 +65,12 @@ crypto_calendar_days: 365
 
 risk_free_rate: 0.0
 
-# Sets to use as economic benchmarks (lift columns vs B1 / B2 are appended
-# to the pooled economic table).
+# Sets to use as economic benchmarks for lift columns (v4: ECON only —
+# the legacy `B1` rolling-probability sentinel is the NAIVE evaluation
+# reference, not a feature set, and the old `B2` lag-only logistic was
+# folded into the v4 ECON information set).
 benchmark_ids:
-  - B1
-  - B2
+  - ECON
 
 # Equal-weight long-only buy-and-hold reference computed from raw close
 # prices when locally available. One row per (horizon × cost_bps).

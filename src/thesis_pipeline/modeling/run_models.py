@@ -1,29 +1,54 @@
-"""Modeling stage — Ridge logistic regression with expanding-window walk-forward.
+"""Modeling stage — Ridge logistic regression / panel-logit walk-forward.
 
-This module owns the **canonical** modeling logic. The original root-level
-``Run_Models.py`` is now a one-line legacy redirect; ``scripts/run_models.py``
-is a thin entry point on the same ``main()``; the package CLI
-(``thesis_pipeline.cli``) also calls this ``main()`` directly.
+This module owns the **canonical** modeling logic. The package CLI
+(``thesis_pipeline.cli``) and ``scripts/run_models.py`` are thin entry
+points that both invoke ``main()`` below.
 
-Validation design and methodology are unchanged from the previous root-level
-implementation:
+v4 canonical defaults (Aufgabe 5)
+---------------------------------
+A bare ``python -m thesis_pipeline.cli run-models`` runs the intended
+production pipeline:
 
-* Initial train split = first ``INIT_TRAIN_FRAC`` (50%) of chronologically
-  sorted observations per ticker.
-* Expanding walk-forward, step size 1; train on ``[0, t-1]``, predict at t.
+* ``--model-type panel_logit``
+* ``--panel-mode ticker_fixed_effects`` (coin dummies, shared slopes)
+* ``--train-window rolling_fixed`` with ``--rolling-window-days 180``
+  (180 CALENDAR days — identical wall-clock across 1d / 6h / 1h)
+* ``--tune-hyperparams`` (BooleanOptionalAction, default ON)
+* ``--hpo-objective log_loss``
+* Per-ticker / per-chunk checkpointing on (resume from prior runs).
+
+Pass ``--no-tune-hyperparams``, ``--model-type per_asset``, or
+``--train-window expanding`` to opt back into the historical behaviour.
+
+Validation invariants (unchanged from earlier versions)
+-------------------------------------------------------
+* Initial train split = first ``INIT_TRAIN_FRAC`` (50 %) of
+  chronologically sorted observations per ticker.
+* Walk-forward, step size 1; train on rows with ``timestamp < τ``, predict τ.
 * ``StandardScaler`` re-fit on every training window only.
-* Logistic regression with L2 penalty, ``C = DEFAULT_C`` (1.0),
-  ``random_state = 42``.
+* Logistic regression with L2 penalty, ``DEFAULT_C = 1.0`` as the fixed
+  fallback when ``--no-tune-hyperparams`` is set.
 * Benchmark sentinel ``__majority_class__`` is mapped to
-  ``__rolling_probability__`` and uses ``run_rolling_probability``.
+  ``__rolling_probability__`` and uses ``run_rolling_probability`` —
+  this is the NAIVE evaluation reference, not a v4 feature set.
 
-CLI is intentionally permissive about argument names so that
+CLI is intentionally permissive about argument names — both dashed and
+underscored spellings work, and the singular legacy ``--ticker`` /
+``--coin`` aliases route to the same destination as ``--coins``. All
+three of the following are equivalent and run the v4 canonical
+pipeline against the ECON feature set:
 
-    python Run_Models.py        --set_id B1 --ticker BTC
-    python scripts/run_models.py --set-id B1 --coins BTC ETH
-    python -m thesis_pipeline.cli run-models --set-id B1 --coins BTC ETH
+    python -m thesis_pipeline.modeling.run_models --set_id ECON --ticker BTC
+    python scripts/run_models.py                  --set-id ECON --coins BTC ETH
+    python -m thesis_pipeline.cli run-models      --set-id ECON --coins BTC ETH
 
-all work.
+The historical ``B1`` set was the rolling-probability benchmark; it is
+no longer a feature set in v4. ``B1`` was removed from the registry
+(see :data:`thesis_pipeline.features.feature_registry.REMOVED_SET_IDS`)
+and any ``--set-id B1`` invocation now raises a clear migration error —
+do not try to run ``--set-id B1``; the rolling-probability behaviour
+moved to the NAIVE evaluation reference in
+:mod:`thesis_pipeline.modeling.benchmarks`.
 """
 
 from __future__ import annotations
@@ -197,7 +222,11 @@ def run_walk_forward(df_ticker: pd.DataFrame,
             PER_ASSET, hpo_row_columns, predict_proba, tune_logistic_hyperparams,
         )
         hpo_config = hpo_config or {}
-        objective = hpo_config.get("objective", "brier_score")
+        # v4 canonical objective is log_loss. A caller that passes an
+        # `hpo_config` with no `objective` key (e.g. an old YAML, or a
+        # synthetic dict in a test) inherits the same v4 default as
+        # `load_hpo_config()` — never the v3 "brier_score" sentinel.
+        objective = hpo_config.get("objective", "log_loss")
         search_space = hpo_config.get("search_space", {})
 
     results = []
@@ -401,15 +430,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--C", type=float, default=DEFAULT_C,
                         help=f"Ridge regularisation strength (default: {DEFAULT_C})")
     parser.add_argument("--model-type", "--model_type", dest="model_type",
-                        default="per_asset", choices=["per_asset", "panel_logit"],
-                        help="per_asset (canonical, default) or panel_logit "
-                             "(pooled / ticker-FE panel regression).")
+                        default="panel_logit",
+                        choices=["per_asset", "panel_logit"],
+                        help="Default: panel_logit (v4 canonical pipeline). "
+                             "Use per_asset to opt back into the historical "
+                             "ticker-by-ticker logistic-ridge.")
     parser.add_argument("--panel-mode", "--panel_mode", dest="panel_mode",
-                        default="pooled", choices=["pooled", "ticker_fixed_effects"],
-                        help="Panel-logit variant (only used when "
-                             "--model-type panel_logit).")
+                        default="ticker_fixed_effects",
+                        choices=["pooled", "ticker_fixed_effects"],
+                        help="Default: ticker_fixed_effects (shared slopes + "
+                             "coin dummies). Use pooled for a single shared "
+                             "intercept across all coins.")
     parser.add_argument("--smoke", action="store_true",
-                        help="Smoke mode: defaults to horizon=1d, coins=[BTC, ETH], set_id=B1.")
+                        help="Smoke mode: defaults to horizon=1d, coins=[BTC, ETH], set_id=ECON.")
     parser.add_argument("--dry-run", "--dry_run", dest="dry_run",
                         action="store_true",
                         help="Print planned inputs/outputs and exit.")
@@ -419,14 +452,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Ignore cached signal parquets and rerun every set.")
     # ── Hyperparameter tuning (conservative, leakage-safe grid search) ──
     parser.add_argument("--tune-hyperparams", "--tune_hyperparams",
-                        dest="tune_hyperparams", action="store_true",
-                        help="Enable nested grid-search HPO inside each "
-                             "walk-forward training window (overrides "
-                             "model_specs.yaml enabled).")
+                        dest="tune_hyperparams",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Run nested grid-search HPO inside each "
+                             "walk-forward training window (v4 default: ON). "
+                             "Use --no-tune-hyperparams to fall back to the "
+                             "fixed-C estimator.")
     parser.add_argument("--hpo-objective", "--hpo_objective",
-                        dest="hpo_objective", default=None,
+                        dest="hpo_objective", default="log_loss",
                         choices=["brier_score", "log_loss", "accuracy"],
-                        help="HPO selection metric (default from model_specs.yaml).")
+                        help="HPO selection metric (v4 default: log_loss).")
     parser.add_argument("--hpo-config", "--hpo_config", dest="hpo_config",
                         default=None,
                         help="Path to a YAML holding a hyperparameter_tuning "
@@ -459,15 +494,34 @@ def build_parser() -> argparse.ArgumentParser:
     # Manual rolling-window controls (panel-logit only); structural breaks are
     # diagnostic and never automatically set the rolling window length.
     parser.add_argument("--train-window", "--train_window",
-                        dest="train_window", default="expanding",
+                        dest="train_window", default="rolling_fixed",
                         choices=["expanding", "rolling_fixed"],
-                        help="Panel training window (default: expanding).")
+                        help="Panel training window (v4 default: "
+                             "rolling_fixed). Use expanding to opt back into "
+                             "the historical all-of-history training set.")
     parser.add_argument("--rolling-window-timestamps", "--rolling_window_timestamps",
                         dest="rolling_window_timestamps", type=int, default=None,
-                        help="Manual number of pre-tau unique timestamps.")
+                        help="Manual number of pre-tau unique timestamps. "
+                             "Mutually exclusive with --rolling-window-days.")
     parser.add_argument("--rolling-window-days", "--rolling_window_days",
-                        dest="rolling_window_days", type=float, default=None,
-                        help="Manual day-distance rolling window.")
+                        dest="rolling_window_days", type=float, default=180.0,
+                        help="Day-distance rolling window in CALENDAR DAYS "
+                             "(v4 default: 180). 180 days is identical "
+                             "wall-clock across 1d / 6h / 1h horizons — "
+                             "180 timestamps would mean ~180 days at 1d "
+                             "but only 45 days at 6h and 7.5 days at 1h.")
+    # ── NAIVE reference auto-generation (Task 6 follow-up) ─────
+    parser.add_argument(
+        "--generate-naive-reference", "--generate_naive_reference",
+        dest="generate_naive_reference",
+        action=argparse.BooleanOptionalAction, default=True,
+        help="Generate the NAIVE rolling-probability reference signal once "
+             "per (horizon, model_type, panel_mode, training-window) "
+             "configuration, independently of the feature-set grid. "
+             "Default ON; use --no-generate-naive-reference to suppress. "
+             "NAIVE is never tuned and is never written into "
+             "feature_sets.xlsx.",
+    )
     return parser
 
 
@@ -504,6 +558,28 @@ def _attach_per_asset_meta(sig: pd.DataFrame, *, set_id, sentiment_model,
         sig["hpo_objective"] = "-"
         sig["hpo_variant"] = "fixed"
     return sig
+
+
+def _guard_checkpoint_universe(ckpt_module, root, manifest_base: dict) -> None:
+    """Clear the run's checkpoint directory when its persisted manifest
+    disagrees with the new run's requested universe (commit 4 A.4).
+
+    The same guard exists in :mod:`panel_logit`; per-asset runs need it
+    too so a BTC/ETH smoke checkpoint can never silently feed a BTC/ETH/SOL
+    production run.
+    """
+    existing = ckpt_module.load_manifest(root)
+    if not existing:
+        return
+    for k in ("requested_coin_universe_hash", "requested_tickers",
+              "horizon", "set_id", "sentiment_model", "model_type",
+              "panel_mode", "hpo_variant", "hpo_objective",
+              "feature_cols"):
+        if existing.get(k) != manifest_base.get(k):
+            print(f"  [INFO] Existing checkpoint manifest is incompatible "
+                  f"({k} changed) — clearing.")
+            ckpt_module.clear_run_checkpoints(root)
+            return
 
 
 def _checkpointed_ticker_loop(tickers, df_all, compute_fn, *,
@@ -560,31 +636,63 @@ def _checkpointed_ticker_loop(tickers, df_all, compute_fn, *,
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
+def apply_smoke_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    """Resolve smoke-mode defaults in place — once, immediately after parse.
+
+    Aufgabe 6 follow-up B: this MUST run before any downstream resolution
+    (HPO config, NAIVE generation, dry-run logging, panel/per-asset
+    dispatch, filename construction, checkpoint construction). A bare
+    ``--smoke`` invocation must never iterate the full coin universe or
+    all horizons. Explicit user values always win over the smoke
+    defaults — only fields the user left empty are filled in.
+    """
+    if not getattr(args, "smoke", False):
+        return args
+    if not getattr(args, "horizon", None):
+        args.horizon = "1d"
+    if not getattr(args, "coins", None):
+        args.coins = ["BTC", "ETH"]
+    if not getattr(args, "set_id", None):
+        args.set_id = "ECON"
+    return args
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point used by the legacy ``Run_Models.py``, ``scripts/run_models.py``
     and the package CLI. Returns 0 on success."""
     args = build_parser().parse_args(argv)
 
-    # ── Legacy-ID guard (2026 family-structure refactor) ─────────────
-    # E* (economic) and the multi-source S4–S7 / C4–C6 IDs no longer exist:
-    # see ``thesis_pipeline.features.feature_registry.REMOVED_SET_IDS`` and
-    # the migration table in ``docs/refactor_log.md``. Detect the request up
-    # front so the user gets a clear, actionable error rather than the silent
-    # "Feature-set config is empty after filtering" log.
+    # ── Smoke defaults FIRST (Aufgabe 6 follow-up B) ─────────────────
+    # Resolve --smoke before any HPO / NAIVE / dispatch / dry-run logic
+    # so a smoke run never leaks the full coin universe into NAIVE,
+    # checkpoint directories, or stage-header output.
+    args = apply_smoke_defaults(args)
+
+    # ── Legacy-ID guard (v4 17-set registry refactor) ────────────────
+    # The v4 registry replaces the old B/E/S/SV/C/CV/M/SC/SF families with
+    # the explicit 17-set grid ECON / SENT_{VAD,CBT}_{L,LD,DA,F} /
+    # ECON_{VAD,CBT}_{L,LD,DA,F}. Production code MUST reject any removed
+    # ID up front, regardless of what the user's feature_sets.xlsx
+    # contains — otherwise a stale legacy fixture can silently reactivate
+    # a deprecated information set under the v4 registry. The error
+    # message carries the migration explanation from
+    # :data:`thesis_pipeline.features.feature_registry.REMOVED_SET_IDS`.
     if args.set_id:
         from ..features.feature_registry import REMOVED_SET_IDS as _REMOVED
         if args.set_id in _REMOVED:
-            replacement = _REMOVED[args.set_id]
             raise SystemExit(
-                f"[run-models] set_id {args.set_id!r} was removed in the 2026 "
-                f"family-structure refactor. Use {replacement!r} instead. "
+                f"[run-models] set_id {args.set_id!r} was removed in the v4 "
+                f"17-set registry refactor. {_REMOVED[args.set_id]} "
                 f"See docs/refactor_log.md for the full migration table."
             )
 
     # ── Resolve hyperparameter-tuning config (shared by both families) ──
     from .hyperparameter_tuning import hpo_variant_label, load_hpo_config
     hpo_cfg = load_hpo_config(
-        enabled_override=True if getattr(args, "tune_hyperparams", False) else None,
+        # ``--tune-hyperparams`` is now BooleanOptionalAction with default
+        # True (v4). Forward the explicit bool so ``--no-tune-hyperparams``
+        # really disables HPO regardless of the YAML default.
+        enabled_override=bool(getattr(args, "tune_hyperparams", True)),
         objective_override=getattr(args, "hpo_objective", None),
         c_grid=getattr(args, "hpo_grid_C", None),
         class_weight_grid=getattr(args, "hpo_class_weight", None),
@@ -595,18 +703,44 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # ── Alternative model family: delegate to the panel-logit module ──
     # The per-asset logic below is unchanged; panel_logit is purely additive.
+    # ── NAIVE auto-generation (Aufgabe 6 follow-up A) ─────────────
+    # NAIVE is never tuned and never lives in feature_sets.xlsx. Generate
+    # it once per (horizon × family × window) before the per-set loop so
+    # the evaluation layer can compare each ECON_* model to it as a
+    # separate absolute reference.
+    if (getattr(args, "generate_naive_reference", True)
+            and not getattr(args, "dry_run", False)):
+        from .naive_reference import generate_naive_reference
+        from ..logging_utils import get_logger
+        log = get_logger()
+        _horizons_to_naive = ([args.horizon] if args.horizon else list(HORIZONS))
+        for _hz in _horizons_to_naive:
+            try:
+                _written = generate_naive_reference(
+                    horizon=_hz,
+                    model_type=getattr(args, "model_type", "panel_logit") or "panel_logit",
+                    panel_mode=getattr(args, "panel_mode", "ticker_fixed_effects") or "ticker_fixed_effects",
+                    train_window_mode=getattr(args, "train_window", "rolling_fixed") or "rolling_fixed",
+                    rolling_window_timestamps=getattr(args, "rolling_window_timestamps", None),
+                    rolling_window_days=getattr(args, "rolling_window_days", 180.0),
+                    coins=getattr(args, "coins", None),
+                    output_dir=SIGNAL_DIR,
+                    resume=bool(getattr(args, "resume", True)),
+                    restart=bool(getattr(args, "restart", False)),
+                )
+                if _written is None:
+                    log.info("NAIVE reference cached or skipped for horizon=%s", _hz)
+                else:
+                    log.info("NAIVE reference written: %s", _written)
+            except Exception as exc:  # noqa: BLE001 — never break the main run
+                log.warning("NAIVE generation failed for horizon=%s: %s", _hz, exc)
+
     if getattr(args, "model_type", "per_asset") == "panel_logit":
         from .panel_logit import _run_panel
         return _run_panel(args, hpo_cfg=hpo_cfg)
 
-    # ── Smoke defaults ──────────────────────────────────────────
-    if args.smoke:
-        if not args.horizon:
-            args.horizon = "1d"
-        if not args.coins:
-            args.coins = ["BTC", "ETH"]
-        if not args.set_id:
-            args.set_id = "B1"
+    # Smoke defaults are already resolved by apply_smoke_defaults at the
+    # top of main(); no further per-asset-only smoke handling needed.
 
     # ── Checkpointing config ────────────────────────────────────
     ckpt_on   = bool(getattr(args, "checkpoint", True))
@@ -637,6 +771,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             if tune_on:
                 _base = f"{_base}_{hpo_variant}"
             out_name_example = f"Outputs/Signals/{args.horizon or '<horizon>'}/{_base}.parquet"
+        # Universe identity preview (commit 3 Section H). Resolve the
+        # requested universe up-front so the dry-run reports the same
+        # hash + expected NAIVE filename the real run would produce.
+        from .naive_reference import (
+            normalize_coin_universe as _nu,
+            coin_universe_hash as _nu_hash,
+            naive_output_name as _nu_name,
+            CACHE_SCHEMA_VERSION as _nu_cache_v,
+        )
+        _req_universe = _nu(args.coins) if args.coins else tuple()
+        _req_hash = _nu_hash(_req_universe) if _req_universe else "(resolved at run-time)"
+        _naive_name = _nu_name(
+            model_type=getattr(args, "model_type", "panel_logit") or "panel_logit",
+            panel_mode=getattr(args, "panel_mode", "ticker_fixed_effects") or "ticker_fixed_effects",
+            train_window_mode=getattr(args, "train_window", "rolling_fixed") or "rolling_fixed",
+            rolling_window_timestamps=getattr(args, "rolling_window_timestamps", None),
+            rolling_window_days=getattr(args, "rolling_window_days", 180.0),
+            coin_universe=_req_universe or None,
+        )
+
         log_stage_header(
             "run_models",
             mode="dry-run" if args.dry_run else ("smoke" if args.smoke else "full"),
@@ -646,6 +800,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "horizon":         args.horizon or "(all)",
                 "set_id":          args.set_id or "(all)",
                 "coins":           list(args.coins) if args.coins else "(all)",
+                "requested_tickers":            list(_req_universe) or "(all from features)",
+                "requested_coin_universe_hash": _req_hash,
+                "expected_naive_filename":      f"{_naive_name}.parquet",
+                "naive_cache_schema_version":   _nu_cache_v,
                 "sentiment_model": args.sentiment_model or "(per set_id default)",
                 "C":               args.C,
                 "restart":         args.restart,
@@ -715,9 +873,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             continue
 
         tickers = sorted(df_all["ticker"].unique())
-        if args.coins:
-            wanted = set(args.coins)
-            tickers = [t for t in tickers if t in wanted]
+        # Universe resolution (commit 4 A.1). REQUESTED is immutable per
+        # run; AVAILABLE is the subset present in the feature frame;
+        # estimation runs on AVAILABLE.
+        from .naive_reference import (
+            coin_universe_hash as _cu_hash,
+            resolve_universes as _resolve_universes,
+        )
+        uni = _resolve_universes(args.coins, tickers)
+        requested_tickers = list(uni["requested"])
+        available_tickers = list(uni["available"])
+        requested_hash    = uni["requested_hash"]
+        tickers = available_tickers
         print(f"  Tickers: {len(tickers)} — {', '.join(tickers)}")
         if tune_on:
             print(f"  Model: LogisticRegression(L2) + grid-search HPO "
@@ -744,7 +911,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             # File naming. Tuned (non-benchmark) runs get a variant suffix so
             # they never overwrite the fixed-C parquet (and caching/restart
-            # keys on the variant-specific path).
+            # keys on the variant-specific path). The REQUESTED-universe
+            # hash suffix (commit 4 A.2) guarantees smoke and full grids
+            # never collide on disk.
             if sent_model and str(sent_model) != "-" and str(sent_model) != "nan":
                 out_name = f"{set_id}_{sent_model}"
             else:
@@ -752,14 +921,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sent_model = "-"
             if tune_on and not is_benchmark:
                 out_name = f"{out_name}_{hpo_variant}"
+            if requested_hash:
+                out_name = f"{out_name}_u_{requested_hash}"
 
             out_path = os.path.join(hz_dir, f"{out_name}.parquet")
 
-            # ── Checkpoint: skip if already computed ──────────
+            # ── Cache validation (commit 4 A.3) ───────────────
+            # A legacy cache without requested-universe metadata is
+            # NEVER reused by a v4 production run. The cache is only
+            # honoured when the parquet carries the right requested
+            # hash AND its realized tickers are a subset of the
+            # requested set.
             if os.path.isfile(out_path) and not args.restart:
                 try:
                     from .hyperparameter_tuning import summarize_hpo_columns
                     cached = pd.read_parquet(out_path)
+                    cached_hash = (
+                        str(cached.get("requested_coin_universe_hash",
+                                        pd.Series([""])).iat[0])
+                        if not cached.empty else ""
+                    )
+                    realized = set(cached["ticker"].astype(str).str.upper().unique()) \
+                        if "ticker" in cached.columns and not cached.empty else set()
+                    if (not cached_hash) or cached_hash != requested_hash:
+                        print(f"\n  ── {out_name} ({label}) → legacy/incompatible "
+                              "cache (no requested-universe metadata or hash "
+                              "mismatch); recomputing")
+                        raise ValueError("legacy_cache")
+                    if not realized.issubset(set(requested_tickers)):
+                        print(f"\n  ── {out_name} ({label}) → cache realized "
+                              "tickers escape requested universe; recomputing")
+                        raise ValueError("realized_escapes_requested")
                     m = compute_metrics(cached, "pooled")
                     m.update({"horizon": hz, "set_id": set_id,
                               "sentiment_model": sent_model, "label": label,
@@ -785,9 +977,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             # ── Benchmark: rolling probability ────────────────
             if is_benchmark:
                 # Rolling probability is not a tuned model; under --tune-hyperparams
-                # skip it so the fixed-C B1 parquet is never overwritten or
-                # mislabelled. The tuned families compare against the (tuned)
-                # logistic benchmark B2 instead, when present.
+                # skip it so the fixed-C benchmark parquet (the NAIVE evaluation
+                # reference produced by run_rolling_probability) is never
+                # overwritten or mislabelled. The tuned families are compared
+                # against the panel-logit ECON baseline in the v4 evaluation
+                # pipeline; the old B1/B2 sentinel comparisons no longer exist.
                 if tune_on:
                     print("→ SKIP (rolling-probability benchmark is not tuned)")
                     continue
@@ -801,7 +995,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "model_type": "per_asset", "panel_mode": "-",
                     "hpo_variant": "fixed", "hpo_objective": "-",
                     "feature_cols": ["__rolling_probability__"],
+                    # Universe identity (commit 4 A.4).
+                    "requested_tickers":            list(requested_tickers),
+                    "requested_coin_universe_hash": requested_hash,
+                    "n_requested_tickers":          len(requested_tickers),
                 }
+                _guard_checkpoint_universe(ckpt, root, manifest_base)
                 all_signals, n_loaded, n_written = _checkpointed_ticker_loop(
                     tickers, df_all, run_rolling_probability,
                     root=root, ckpt_on=ckpt_on, resume=resume,
@@ -811,6 +1010,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
                 if all_signals:
                     signals = pd.concat(all_signals, ignore_index=True)
+                    # Universe identity stamp (commit 3 Section B + 4 A.5).
+                    from .naive_reference import stamp_universe_metadata
+                    signals = stamp_universe_metadata(
+                        signals,
+                        requested_universe=requested_tickers,
+                        available_universe=available_tickers,
+                    )
                     signals.to_parquet(out_path, index=False, engine="pyarrow")
                     if ckpt_on:
                         mf = ckpt.load_manifest(root)
@@ -863,7 +1069,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "hpo_variant": hpo_variant if tune_on else "fixed",
                 "hpo_objective": hpo_cfg["objective"] if tune_on else "-",
                 "feature_cols": feature_cols,
+                # Universe identity (commit 4 A.4).
+                "requested_tickers":            list(requested_tickers),
+                "requested_coin_universe_hash": requested_hash,
+                "n_requested_tickers":          len(requested_tickers),
             }
+            _guard_checkpoint_universe(ckpt, root, manifest_base)
             all_signals, n_loaded, n_written = _checkpointed_ticker_loop(
                 tickers, df_all,
                 lambda df_t: run_walk_forward(df_t, feature_cols, C=args.C,
@@ -881,6 +1092,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # so the concat (whether freshly computed or rebuilt purely from
                 # checkpoints) is the complete final signal frame.
                 signals = pd.concat(all_signals, ignore_index=True)
+                # Universe identity stamp (commit 3 Section B + 4 A.5).
+                from .naive_reference import stamp_universe_metadata
+                signals = stamp_universe_metadata(
+                    signals,
+                    requested_universe=requested_tickers,
+                    available_universe=available_tickers,
+                )
                 signals.to_parquet(out_path, index=False, engine="pyarrow")
                 if ckpt_on:
                     mf = ckpt.load_manifest(root)
@@ -960,20 +1178,32 @@ def run(*, horizon: str | None = None, set_id: str | None = None,
         force: bool = False, restart: bool = False,
         C: float | None = None,
         feature_config: str | None = None,
-        model_type: str = "per_asset",
-        panel_mode: str = "pooled",
-        tune_hyperparams: bool = False,
-        hpo_objective: str | None = None,
+        # v4 canonical defaults — match build_parser():
+        model_type: str = "panel_logit",
+        panel_mode: str = "ticker_fixed_effects",
+        tune_hyperparams: bool = True,
+        hpo_objective: str = "log_loss",
         hpo_config: str | None = None,
         hpo_grid_C: Sequence[float] | None = None,
         hpo_class_weight: Sequence[str] | None = None,
+        train_window: str = "rolling_fixed",
+        rolling_window_days: float | None = 180.0,
+        rolling_window_timestamps: int | None = None,
         checkpoint: bool = True,
         resume: bool = True,
         checkpoint_dir: str | None = None,
         checkpoint_chunk_size: int | None = None,
-        clear_checkpoints: bool = False) -> int:
+        clear_checkpoints: bool = False,
+        generate_naive_reference: bool = True) -> int:
     """Programmatic entry point. Translates keyword arguments to argv for
-    :func:`main`. Prefer calling :func:`main` directly with an argv list."""
+    :func:`main`. Prefer calling :func:`main` directly with an argv list.
+
+    The defaults match the v4 CLI: panel-logit / ticker fixed effects /
+    rolling 180-calendar-day window / HPO on / log-loss objective.
+    Pass ``model_type="per_asset"``, ``tune_hyperparams=False``, or
+    ``train_window="expanding"`` to opt back into the historical
+    behaviour.
+    """
     argv: list[str] = []
     if horizon:
         argv += ["--horizon", horizon]
@@ -991,10 +1221,20 @@ def run(*, horizon: str | None = None, set_id: str | None = None,
         argv += ["--model-type", model_type]
     if panel_mode:
         argv += ["--panel-mode", panel_mode]
-    if tune_hyperparams:
-        argv.append("--tune-hyperparams")
+    # ``--tune-hyperparams`` is BooleanOptionalAction in v4: emit the
+    # explicit negative flag when the caller has turned it off.
+    argv += ["--tune-hyperparams"] if tune_hyperparams else ["--no-tune-hyperparams"]
+    # ``--generate-naive-reference`` is also BooleanOptionalAction.
+    argv += (["--generate-naive-reference"] if generate_naive_reference
+             else ["--no-generate-naive-reference"])
     if hpo_objective:
         argv += ["--hpo-objective", hpo_objective]
+    if train_window:
+        argv += ["--train-window", train_window]
+    if rolling_window_timestamps is not None:
+        argv += ["--rolling-window-timestamps", str(rolling_window_timestamps)]
+    if rolling_window_days is not None and rolling_window_timestamps is None:
+        argv += ["--rolling-window-days", str(rolling_window_days)]
     if hpo_config:
         argv += ["--hpo-config", hpo_config]
     if hpo_grid_C:

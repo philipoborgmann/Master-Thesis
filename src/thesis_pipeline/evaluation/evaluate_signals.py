@@ -7,7 +7,7 @@ modules so that each piece is independently testable:
 * :mod:`.metrics`        — pooled + per-ticker metrics + confusion diagnostics
 * :mod:`.thresholds`     — high-conviction threshold analysis + lift vs benchmark
 * :mod:`.volatility`     — Garman-Klass + tertile regime stratification
-* :mod:`.significance`   — continuity-corrected McNemar vs B1 / B2
+* :mod:`.significance`   — continuity-corrected McNemar vs ECON
 * :mod:`.market_cap`     — daily cross-sectional cap tertiles + interaction
 * :mod:`.economic`       — turnover/cost-aware backtest with risk metrics
 * :mod:`.reporting`      — Excel + CSV + console summary
@@ -46,6 +46,7 @@ from .economic import (
     summarize_high_low_threshold_backtest,
 )
 from .incremental import incremental_sentiment_value_table
+from .naive_comparison import absolute_vs_naive_table
 from .reporting import (
     build_leaderboard, build_summary,
     print_console_summary, write_csv_outputs, write_excel_report,
@@ -54,6 +55,12 @@ from .significance import (
     DEFAULT_BENCHMARKS, build_regime_mcnemar_summary,
     mcnemar_table, mcnemar_wide, regime_mcnemar_table,
 )
+from .diff_in_improvement import (
+    adjust_pvalues_bh_within_family,
+    difference_in_improvement_table,
+    H_HYPOTHESIS_FAMILIES,
+)
+from .incremental import MATCHED_ECONOMIC_BENCHMARK
 from .thresholds import threshold_analysis_table, threshold_lift_table
 from .volatility import build_regime_lookup, volatility_stratification_table
 
@@ -102,8 +109,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Skip the turnover/cost-aware backtest step.")
     parser.add_argument("--no-regime-mcnemar", "--no_regime_mcnemar",
                         dest="no_regime_mcnemar", action="store_true",
-                        help="Skip the regime-specific (volatility / market-cap / "
-                             "interaction) McNemar tests.")
+                        help="Skip the SUPPLEMENTARY within-regime McNemar tests. "
+                             "Does NOT disable the H2/H3 headline "
+                             "difference-in-improvement layer — use "
+                             "--no-diff-in-improvement for that.")
+    parser.add_argument("--no-diff-in-improvement", "--no_diff_in_improvement",
+                        dest="no_diff_in_improvement", action="store_true",
+                        help="Skip the HEADLINE H2/H3 cluster-robust "
+                             "difference-in-improvement layer. Default ON when "
+                             "the corresponding regime lookup is available; "
+                             "independent of --no-regime-mcnemar.")
     parser.add_argument("--strict-feature-set-ids", "--strict_feature_set_ids",
                         dest="strict_feature_set_ids", action="store_true",
                         help="Only evaluate signal groups whose set_id appears in "
@@ -135,6 +150,7 @@ def run(*, horizon: str | None = None,
         force: bool = False, no_volatility: bool = False,
         no_market_cap: bool = False, no_economic: bool = False,
         no_regime_mcnemar: bool = False,
+        no_diff_in_improvement: bool = False,
         strict_feature_set_ids: bool = False,
         feature_config: str | None = None,
         backtest_config: str | None = None,
@@ -165,6 +181,8 @@ def run(*, horizon: str | None = None,
         argv.append("--no-economic")
     if no_regime_mcnemar:
         argv.append("--no-regime-mcnemar")
+    if no_diff_in_improvement:
+        argv.append("--no-diff-in-improvement")
     if strict_feature_set_ids:
         argv.append("--strict-feature-set-ids")
     return main(argv)
@@ -193,7 +211,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                out_root / "pooled_metrics.csv",
                out_root / "per_ticker_metrics.csv",
                out_root / "threshold_analysis.csv",
-               out_root / "volatility_stratification.csv"]
+               out_root / "volatility_stratification.csv",
+               out_root / "absolute_vs_naive.csv"]
     if not args.no_market_cap:
         outputs += [out_root / "market_cap_stratification.csv",
                     out_root / "regime_interaction.csv"]
@@ -206,6 +225,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         outputs.append(out_root / "regime_mcnemar_tests.csv")
         outputs.append(out_root / "regime_mcnemar_summary.csv")
 
+    # Universe-aware diagnostics for the dry-run (commit 3 Section H).
+    from .naive_comparison import (
+        NAIVE_IDENTITY_COLUMNS as _abs_identity,
+        HYPOTHESIS_FAMILY as _abs_family,
+        ABSOLUTE_BENCHMARK_ROLE as _abs_role,
+    )
     log_stage_header(
         "evaluate_signals",
         mode="dry-run" if args.dry_run else ("smoke" if args.smoke else "full"),
@@ -218,7 +243,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             "no_market_cap":         args.no_market_cap,
             "no_economic":           args.no_economic,
             "no_regime_mcnemar":     args.no_regime_mcnemar,
+            "no_diff_in_improvement": getattr(args, "no_diff_in_improvement", False),
             "strict_feature_set_ids": args.strict_feature_set_ids,
+            "strict_filter_keeps_naive": True,
+            # Section E — every regime consumer is on the shared
+            # availability-based strict-< as-of join.
+            "regime_join_strategy": "availability-based strict backward as-of",
+            "regime_match_strategy": "asof_backward_strict",
+            # Section H — surface the absolute_vs_naive identity columns
+            # AND the legacy-fallback flag in the dry-run so users can see
+            # the exact contract upfront.
+            "absolute_vs_naive_csv":        str(out_root / "absolute_vs_naive.csv"),
+            "absolute_vs_naive_hypothesis_family": _abs_family,
+            "absolute_vs_naive_benchmark_role":   _abs_role,
+            "absolute_vs_naive_identity_columns": ",".join(_abs_identity),
+            "legacy_universe_fallback_enabled":   True,
             "transaction_cost_bps":  args.transaction_cost_bps or "(from config)",
             "backtest_config":       args.backtest_config or "(default)",
             "force":                 args.force,
@@ -257,8 +296,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     # ── 2b. Optional strict feature-set-id filter ───────────────
     # Without the flag we evaluate every signal file on disk and let
     # economic_diagnostics.csv flag stale/legacy set_ids. With it, only
-    # set_ids registered in the active feature_sets.xlsx survive — useful
-    # when comparing across a fixed registry version.
+    # set_ids registered in the active feature_sets.xlsx (PLUS the
+    # documented evaluation references — NAIVE) survive. Aufgabe 6
+    # follow-up C: NAIVE is intentionally NOT a feature set in
+    # SET_ID_PATTERN, but it IS an explicitly allowed evaluation
+    # reference and must survive the filter alongside the 17-set grid.
     if args.strict_feature_set_ids:
         if "set_id" not in feature_sets.columns or feature_sets["set_id"].empty:
             logger.warning(
@@ -267,16 +309,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "would drop everything; ignoring the flag."
             )
         else:
+            from .incremental import NAIVE_REFERENCE_LABEL
             registered = set(feature_sets["set_id"].dropna().astype(str))
+            evaluation_refs = {NAIVE_REFERENCE_LABEL}
+            allowed = registered | evaluation_refs
             before_n = len(signals)
             present  = set(signals["set_id"].astype(str).unique())
-            stale    = sorted(present - registered)
-            signals  = signals[signals["set_id"].astype(str).isin(registered)]
+            stale    = sorted(present - allowed)
+            signals  = signals[signals["set_id"].astype(str).isin(allowed)]
             logger.info(
                 "evaluate-signals: --strict-feature-set-ids kept %d / %d rows "
-                "(%d set_ids in registry, %d dropped: %s)",
-                len(signals), before_n, len(registered), len(stale),
-                ", ".join(stale) if stale else "(none)",
+                "(%d registered feature-set IDs, %d evaluation references: %s, "
+                "%d stale IDs dropped: %s)",
+                len(signals), before_n, len(registered),
+                len(evaluation_refs), ", ".join(sorted(evaluation_refs)),
+                len(stale), ", ".join(stale) if stale else "(none)",
             )
             if signals.empty:
                 logger.warning("evaluate-signals: no signal rows survive strict "
@@ -291,7 +338,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     threshold_df      = threshold_analysis_table(signals)
     threshold_lift_df = threshold_lift_table(signals, benchmarks=DEFAULT_BENCHMARKS)
 
-    # ── 5. McNemar significance vs B1 and B2 ────────────────────
+    # ── 5. McNemar significance vs the v4 matched benchmark (ECON) ──
     mcnemar_df_long = mcnemar_table(signals, benchmarks=DEFAULT_BENCHMARKS)
     mcnemar_wide_df = mcnemar_wide(mcnemar_df_long, benchmarks=DEFAULT_BENCHMARKS)
     if not pooled.empty and not mcnemar_wide_df.empty:
@@ -301,10 +348,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "panel_mode", "hpo_variant"],
             how="left",
         )
-    if "mcnemar_pval_vs_b1" in pooled.columns and "mcnemar_pval" not in pooled.columns:
-        pooled["mcnemar_stat"]              = pooled["mcnemar_stat_vs_b1"]
-        pooled["mcnemar_pval"]              = pooled["mcnemar_pval_vs_b1"]
-        pooled["significant_vs_benchmark"]  = pooled.get("significant_vs_b1", False)
+    # Back-compat aliases for downstream consumers that grep on the bare
+    # ``mcnemar_*`` columns. v4 uses ECON as the single matched benchmark,
+    # but we still mirror the disambiguated columns under the bare names
+    # (mirroring whatever benchmark the wide pivot actually populated).
+    _bench_alias_source = None
+    for _bid in DEFAULT_BENCHMARKS:
+        _src = f"mcnemar_pval_vs_{_bid.lower()}"
+        if _src in pooled.columns:
+            _bench_alias_source = _bid.lower()
+            break
+    if _bench_alias_source is not None and "mcnemar_pval" not in pooled.columns:
+        pooled["mcnemar_stat"]             = pooled[f"mcnemar_stat_vs_{_bench_alias_source}"]
+        pooled["mcnemar_pval"]             = pooled[f"mcnemar_pval_vs_{_bench_alias_source}"]
+        pooled["significant_vs_benchmark"] = pooled.get(
+            f"significant_vs_{_bench_alias_source}", False,
+        )
 
     tickers = sorted(signals["ticker"].dropna().astype(str).str.upper().unique())
 
@@ -367,6 +426,52 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             regime_mcnemar_summary_df = build_regime_mcnemar_summary(regime_mcnemar_df)
 
+    # ── 7c. H2 / H3 difference-in-improvement (Aufgabe 6.4) ─────
+    # Cluster-robust regression of d_{i,t} = 1(aug correct) - 1(ECON correct)
+    # on a regime dummy, clustered by ticker. The HEADLINE H2/H3 test is
+    # independent of the SUPPLEMENTARY within-regime McNemar block above:
+    # --no-regime-mcnemar suppresses ONLY the supplementary tests, while
+    # --no-diff-in-improvement suppresses this headline block. By default
+    # H2 runs whenever the volatility lookup is non-empty and H3 runs
+    # whenever the market-cap lookup is non-empty.
+    diff_in_improvement_df = pd.DataFrame()
+    if not getattr(args, "no_diff_in_improvement", False):
+        h_blocks: list[pd.DataFrame] = []
+        if not vol_lookup.empty:
+            vol_lk = vol_lookup.copy()
+            if "regime" in vol_lk.columns and "vol_regime" not in vol_lk.columns:
+                vol_lk = vol_lk.rename(columns={"regime": "vol_regime"})
+            h_blocks.append(difference_in_improvement_table(
+                signals=signals,
+                matched_benchmark=MATCHED_ECONOMIC_BENCHMARK,
+                regime_lookup=vol_lk,
+                regime_col="vol_regime",
+                treatment_value="high",
+                control_value="low",
+                hypothesis_family="H2_volatility",
+            ))
+        if not mcap_lookup.empty:
+            mc_lk = mcap_lookup.copy()
+            if "regime" in mc_lk.columns and "mcap_regime" not in mc_lk.columns:
+                mc_lk = mc_lk.rename(columns={"regime": "mcap_regime"})
+            h_blocks.append(difference_in_improvement_table(
+                signals=signals,
+                matched_benchmark=MATCHED_ECONOMIC_BENCHMARK,
+                regime_lookup=mc_lk,
+                regime_col="mcap_regime",
+                treatment_value="small",
+                control_value="large",
+                hypothesis_family="H3_market_cap",
+            ))
+        if h_blocks:
+            diff_in_improvement_df = pd.concat(
+                [b for b in h_blocks if not b.empty], ignore_index=True,
+            )
+            if not diff_in_improvement_df.empty:
+                diff_in_improvement_df = adjust_pvalues_bh_within_family(
+                    diff_in_improvement_df,
+                )
+
     # ── 8. Economic / backtest layer ────────────────────────────
     economic_df      = pd.DataFrame()
     economic_thr_df  = pd.DataFrame()
@@ -421,7 +526,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Append per-benchmark lift columns (sharpe / cumulative_return).
         if not economic_df.empty:
             economic_df = attach_benchmark_lifts(
-                economic_df, bcfg.get("benchmark_ids", ["B1", "B2"]),
+                economic_df, bcfg.get("benchmark_ids", ["ECON"]),
             )
 
     # ── 8b. Incremental sentiment value vs matched economic benchmark ──
@@ -432,6 +537,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     incremental_df = incremental_sentiment_value_table(
         signals, warn_missing=_warn_missing_bench,
     )
+
+    # ── 8c. Absolute vs NAIVE comparison (v4 cleanup commit 2 Section F) ──
+    # One row per (model run × matched NAIVE) using the COMPLETE NAIVE
+    # identity (horizon, model_type, panel_mode, train_window_*,
+    # coin_universe_hash). Hypothesis family ``absolute_vs_naive`` —
+    # NEVER pooled with H1 / H2 / H3.
+    absolute_vs_naive_df = absolute_vs_naive_table(signals)
 
     # ── 9. Leaderboard + thesis-style summary ───────────────────
     leaderboard = build_leaderboard(pooled)
@@ -520,7 +632,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         regime_mcnemar=(regime_mcnemar_df if not args.no_regime_mcnemar else None),
         regime_mcnemar_summary=(regime_mcnemar_summary_df
                                 if not args.no_regime_mcnemar else None),
+        diff_in_improvement=(diff_in_improvement_df
+                              if not getattr(args, "no_diff_in_improvement",
+                                             False) else None),
         incremental_sentiment=incremental_df,
+        absolute_vs_naive=absolute_vs_naive_df,
     )
     xlsx = write_excel_report(
         xlsx_path,
@@ -537,7 +653,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         regime_mcnemar=(regime_mcnemar_df if not args.no_regime_mcnemar else None),
         regime_mcnemar_summary=(regime_mcnemar_summary_df
                                 if not args.no_regime_mcnemar else None),
+        diff_in_improvement=(diff_in_improvement_df
+                              if not getattr(args, "no_diff_in_improvement",
+                                             False) else None),
         incremental_sentiment=incremental_df,
+        absolute_vs_naive=absolute_vs_naive_df,
     )
     logger.info("evaluate-signals: wrote Excel report %s", xlsx)
     for label, path in csv_paths.items():
