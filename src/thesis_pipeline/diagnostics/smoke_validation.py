@@ -169,6 +169,23 @@ def _validate_econ_rows(df: pd.DataFrame, requested: str,
         msg = _check_constant(df, col, exp)
         if msg:
             errors.append(msg)
+    # Strengthened rolling_window_days contract (commit 10):
+    # the column must be numeric, strictly positive and constant
+    # within the file. ``_check_constant`` already enforces the
+    # constant-equal-to-180 part; here we add the numeric/positive
+    # guards so an ECON output that stamps a NaN or a negative
+    # value cannot silently slip past.
+    if "rolling_window_days" in df.columns:
+        s = df["rolling_window_days"]
+        try:
+            num = pd.to_numeric(s, errors="coerce")
+        except Exception:  # noqa: BLE001
+            num = pd.Series([float("nan")] * len(s))
+        if num.isna().any():
+            errors.append("'rolling_window_days' contains non-numeric "
+                          "or NaN values")
+        elif not (num > 0).all():
+            errors.append("'rolling_window_days' must be strictly > 0")
     return errors
 
 
