@@ -356,19 +356,33 @@ def merge_repo(tmp_path, monkeypatch):
     return tmp_path
 
 
-def test_merge_default_drops_low_coverage_ticker(merge_repo):
+def test_merge_default_keeps_low_coverage_ticker(merge_repo):
+    """v4 pooled main spec: the coverage filter is OFF by default so
+    SOL stays in the merged frame even though its sentiment coverage
+    is below threshold. Neutral fill remains on."""
     rc = fm.main(["--horizon", "1d"])
     assert rc == 0
     merged = pd.read_parquet(merge_repo / "Data" / "Final" / "features_1d.parquet")
-    # SOL is filtered out by default.
-    assert set(merged["ticker"]) == {"BTC", "ETH"}
-    # Default neutral-fill is on; BTC/ETH had full sentiment so no fill needed.
+    assert set(merged["ticker"]) == {"BTC", "ETH", "SOL"}
     report = pd.read_csv(merge_repo / "Data" / "Final" / "merge_report.csv")
-    assert bool(report.loc[0, "apply_coverage_filter"]) is True
+    assert bool(report.loc[0, "apply_coverage_filter"]) is False
     assert bool(report.loc[0, "neutral_fill_sentiment"]) is True
 
 
+def test_explicit_apply_coverage_filter_drops_low_coverage_ticker(merge_repo):
+    """Explicit robustness path: --apply-coverage-filter re-enables the
+    legacy behaviour and drops SOL."""
+    rc = fm.main(["--horizon", "1d", "--apply-coverage-filter"])
+    assert rc == 0
+    merged = pd.read_parquet(merge_repo / "Data" / "Final" / "features_1d.parquet")
+    assert set(merged["ticker"]) == {"BTC", "ETH"}
+    report = pd.read_csv(merge_repo / "Data" / "Final" / "merge_report.csv")
+    assert bool(report.loc[0, "apply_coverage_filter"]) is True
+
+
 def test_no_sentiment_coverage_filter_retains_low_coverage_coin(merge_repo):
+    """Legacy alias: --no-sentiment-coverage-filter still works and
+    matches the new default behaviour."""
     rc = fm.main(["--horizon", "1d", "--no-sentiment-coverage-filter"])
     assert rc == 0
     merged = pd.read_parquet(merge_repo / "Data" / "Final" / "features_1d.parquet")
