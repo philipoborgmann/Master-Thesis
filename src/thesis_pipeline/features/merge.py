@@ -4,7 +4,21 @@ This module owns the merge logic. The legacy ``Merge_Features.py`` script in
 the repository root is now a thin redirect to ``main()`` below; the package
 CLI calls ``main(argv)`` directly via ``cmd_merge_features``.
 
-No methodology change from the original ``Merge_Features.py``.
+Pooled-panel main specification (commit 11)
+-------------------------------------------
+The v4 main specification is a pooled panel logistic regression with
+ticker fixed effects and a rolling training window. Ticker-level
+sentiment coverage is NOT used as a hard inclusion filter on the
+pooled universe: missing sentiment slots are represented via the
+canonical Variante-A neutral fill plus the ``has_posts`` /
+``post_count`` / ``log1p_post_count`` diagnostics. The merge stage
+therefore defaults to ``apply_coverage_filter = False`` so the realised
+ticker universe equals the price-feature universe.
+
+Coverage-filtered universes are kept as an explicit robustness
+specification via ``--apply-coverage-filter`` (or the legacy
+``--no-sentiment-coverage-filter`` alias, which already matches the
+new default).
 """
 
 from __future__ import annotations
@@ -199,6 +213,15 @@ def merge_horizon(horizon: str, included_tickers: list[str],
     if df_price.empty or df_sent.empty:
         return pd.DataFrame(), {"horizon": horizon, "status": "missing_input"}
 
+    # Alias normalisation at the merge boundary (commit 11 §7).
+    # Sentiment data sometimes uses IOTA / XNO while the price archive
+    # uses MIOTA / NANO. Apply the existing canonical mapping ONCE so
+    # downstream code sees a single canonical identifier per asset.
+    from ..evaluation.market_cap import _normalise_ticker as _canonical_ticker
+    df_price["ticker"] = df_price["ticker"].astype(str).map(_canonical_ticker)
+    df_sent["ticker"]  = df_sent["ticker"].astype(str).map(_canonical_ticker)
+    included_tickers = sorted({_canonical_ticker(t) for t in included_tickers})
+
     price_tickers = set(df_price["ticker"].unique())
     sent_tickers  = set(df_sent["ticker"].unique())
     if apply_coverage_filter:
@@ -256,6 +279,14 @@ def merge_horizon(horizon: str, included_tickers: list[str],
 
     merged = merged.sort_values(["ticker", "timestamp"]).reset_index(drop=True)
 
+    # Transparency: separately record price-side / sentiment-side /
+    # coverage-qualified / realized counts so the merge log and
+    # downstream consumers can audit how the final universe was
+    # selected (commit 11 §8).
+    excluded_by_coverage = sorted(price_tickers - set(valid_tickers)) \
+        if apply_coverage_filter else []
+    excluded_by_other = sorted(price_tickers - set(valid_tickers)) \
+        if not apply_coverage_filter else []
     report = {
         "horizon": horizon,
         "status": "ok",
@@ -272,6 +303,13 @@ def merge_horizon(horizon: str, included_tickers: list[str],
         "n_tickers_dropped_low_coverage": int(n_dropped_low_coverage),
         "n_sentiment_nans_filled":     int(n_sentiment_nans_filled),
         "neutral_filled_columns":      ";".join(sorted(columns_filled)),
+        # Universe-selection transparency.
+        "n_price_tickers":              len(price_tickers),
+        "n_sentiment_tickers":          len(sent_tickers),
+        "n_coverage_qualified_tickers": len(included_tickers),
+        "n_realized_tickers":           len(valid_tickers),
+        "tickers_excluded_by_coverage": ", ".join(excluded_by_coverage),
+        "tickers_excluded_other":       ", ".join(excluded_by_other),
     }
 
     return merged, report
@@ -297,13 +335,29 @@ def build_parser() -> argparse.ArgumentParser:
                         dest="coverage_csv", type=str, default=COVERAGE_CSV)
     parser.add_argument("--horizon", default=None,
                         help="Restrict to a single horizon. Default: all of 1h/6h/1d.")
+    # ── Coverage-filter interface (commit 11) ───────────────────
+    # The v4 main specification is a POOLED panel logit with ticker
+    # fixed effects and rolling-window OOS estimation. Missing
+    # sentiment slots are handled via Variante-A neutral fill plus
+    # has_posts / log1p_post_count diagnostics, so the per-ticker
+    # sentiment-coverage filter is NOT methodologically required for
+    # universe selection. The filter is now OFF by default; it
+    # remains available as an explicit robustness option.
+    parser.add_argument("--apply-coverage-filter", "--apply_coverage_filter",
+                        dest="apply_coverage_filter",
+                        action="store_true", default=False,
+                        help="Robustness option: restrict the merged universe "
+                             "to tickers above --coverage-threshold sentiment "
+                             "coverage. Default: OFF (pooled main spec keeps "
+                             "every ticker with valid price data).")
+    # Legacy alias — accepted but does not change the v4 default.
     parser.add_argument("--no-sentiment-coverage-filter",
                         "--no_sentiment_coverage_filter",
                         dest="no_sentiment_coverage_filter",
                         action="store_true",
-                        help="Skip the per-horizon sentiment-coverage filter so "
-                             "low-coverage tickers are kept (useful for panel "
-                             "models). Default: filter is applied (legacy behaviour).")
+                        help="Legacy alias: explicitly disable the sentiment "
+                             "coverage filter. The v4 default already does "
+                             "this; flag is retained for back-compat.")
     parser.add_argument("--neutral-fill-missing-sentiment",
                         "--neutral_fill_missing_sentiment",
                         dest="neutral_fill_missing_sentiment",
@@ -362,7 +416,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     horizons = [args.horizon] if args.horizon else HORIZONS
     reports: list[dict] = []
-    apply_filter = not bool(getattr(args, "no_sentiment_coverage_filter", False))
+    # Coverage filter resolution (commit 11):
+    # * default: OFF — the pooled-panel main spec keeps every ticker
+    #   with valid price data, and missing sentiment slots are
+    #   handled via the existing Variante-A neutral fill + has_posts
+    #   / log1p_post_count diagnostics.
+    # * --apply-coverage-filter or --coverage-threshold supplied
+    #   explicitly: enable as a robustness option.
+    # * --no-sentiment-coverage-filter legacy flag: alias for the
+    #   default (kept so old scripts continue to work).
+    explicit_on  = bool(getattr(args, "apply_coverage_filter", False))
+    legacy_off   = bool(getattr(args, "no_sentiment_coverage_filter", False))
+    apply_filter = explicit_on and not legacy_off
     neutral_fill = bool(getattr(args, "neutral_fill_missing_sentiment", True))
 
     for hz in horizons:
@@ -374,12 +439,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         included = get_included_tickers(COVERAGE_CSV, hz, args.coverage_threshold)
         if apply_filter:
-            print(f"  Tickers with >={args.coverage_threshold}% coverage: {len(included)}")
+            print(f"  Coverage filter ENABLED (robustness specification) — "
+                  f"requires >= {args.coverage_threshold}% sentiment coverage")
+            print(f"  Tickers above threshold: {len(included)}")
         else:
-            print(f"  Coverage filter DISABLED — retaining every ticker that has "
-                  f"price data (was: {len(included)} above {args.coverage_threshold}% "
-                  f"coverage).")
-        print(f"    {', '.join(included)}")
+            print(f"  Coverage filter disabled (pooled main specification) — "
+                  f"retaining every ticker that has valid price data.")
+            print(f"  Diagnostic: {len(included)} ticker(s) would survive "
+                  f">={args.coverage_threshold}% threshold (not applied).")
+        print(f"    coverage-qualified: {', '.join(included)}")
 
         merged, report = merge_horizon(
             hz, included, feature_dir=FEATURE_DIR,
@@ -387,9 +455,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             neutral_fill_sentiment=neutral_fill,
         )
         if not merged.empty:
-            print(f"  retained tickers: {report['n_tickers']}  "
-                  f"(dropped by coverage filter: {report['n_tickers_dropped_low_coverage']}) "
-                  f"sentiment NaNs filled: {report['n_sentiment_nans_filled']}")
+            print(f"  ─ Universe selection ──")
+            print(f"    price tickers:        {report['n_price_tickers']:>3d}")
+            print(f"    sentiment tickers:    {report['n_sentiment_tickers']:>3d}")
+            print(f"    coverage-qualified:   {report['n_coverage_qualified_tickers']:>3d}")
+            print(f"    realized:             {report['n_realized_tickers']:>3d}  "
+                  f"({report['tickers']})")
+            if report.get("tickers_excluded_by_coverage"):
+                print(f"    excluded by coverage filter: "
+                      f"{report['tickers_excluded_by_coverage']}")
+            print(f"  sentiment NaNs filled: {report['n_sentiment_nans_filled']}")
         reports.append(report)
 
         if merged.empty:
