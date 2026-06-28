@@ -417,6 +417,165 @@ def _mode_suffix(panel_mode: str) -> str:
     return "panel_pooled" if panel_mode == "pooled" else "panel_ticker_fe"
 
 
+#: Re-exported from :mod:`thesis_pipeline.price.features` so the
+#: rolling-window metadata stamp uses the SAME canonical bar-per-day
+#: mapping as the feature generator. The horizon → days-to-bars
+#: conversion is the only place ``rolling_window_timestamps`` is
+#: derived from ``rolling_window_days``; without this single source
+#: of truth the two columns could quietly drift apart.
+from ..price.features import BARS_PER_DAY as _BARS_PER_DAY
+
+
+#: Columns the rolling-window output contract requires. Mirrors the
+#: set the smoke validator enforces and the v4 evaluation layer reads.
+ROLLING_WINDOW_METADATA_COLUMNS: tuple[str, ...] = (
+    "rolling_window_days",
+    "rolling_window_timestamps",
+    "train_window_mode",
+    "train_start_timestamp",
+    "train_end_timestamp",
+    "train_window_timestamps",
+)
+
+
+def _stamp_rolling_window_metadata(signals: pd.DataFrame,
+                                     *,
+                                     horizon: str,
+                                     train_window_mode: str,
+                                     rolling_window_days: float | None,
+                                     rolling_window_timestamps: int | None,
+                                     ) -> pd.DataFrame:
+    """Stamp the run's rolling-window configuration on every signal row.
+
+    ``rolling_window_days`` is the canonical configuration variable —
+    the value flows in from the CLI / ``run_models`` entry point and
+    is NEVER derived from a filename or from
+    ``train_window_timestamps`` (which is horizon-specific).
+
+    For ``rolling_fixed`` mode, ``rolling_window_timestamps`` is
+    deterministically derived from
+    ``rolling_window_days * BARS_PER_DAY[horizon]`` so the column is
+    horizon-correct on 6h / 1h runs (where the per-bar count is 4×
+    and 24× the day count). Expanding runs leave both columns at
+    ``NaN`` — they are conceptually undefined.
+    """
+    out = signals.copy()
+    out["train_window_mode"] = train_window_mode
+    if str(train_window_mode) == "rolling_fixed":
+        # Days from config (authoritative).
+        if rolling_window_days is None:
+            out["rolling_window_days"] = np.nan
+        else:
+            out["rolling_window_days"] = float(rolling_window_days)
+        # Timestamps from horizon × days, falling back to the
+        # explicitly-passed rolling_window_timestamps when the user
+        # invoked rolling-by-bar-count instead of rolling-by-day.
+        if rolling_window_timestamps is not None:
+            out["rolling_window_timestamps"] = int(rolling_window_timestamps)
+        elif rolling_window_days is not None and str(horizon) in _BARS_PER_DAY:
+            out["rolling_window_timestamps"] = int(
+                float(rolling_window_days) * _BARS_PER_DAY[str(horizon)]
+            )
+        else:
+            out["rolling_window_timestamps"] = np.nan
+    else:
+        # Expanding / other modes — explicit NaN keeps the schema
+        # uniform without misrepresenting the run.
+        out["rolling_window_days"] = np.nan
+        if "rolling_window_timestamps" not in out.columns:
+            out["rolling_window_timestamps"] = np.nan
+    return out
+
+
+def _assert_training_window_contract(signals: pd.DataFrame,
+                                       *,
+                                       horizon: str,
+                                       train_window_mode: str,
+                                       ) -> None:
+    """Refuse to write a rolling-window parquet that violates the v4
+    canonical training-window output schema.
+
+    Two production-supported window flavours under ``rolling_fixed``:
+
+    * **rolling-by-days** (``--rolling-window-days N``, the canonical
+      v4 path): ``rolling_window_days`` is the source of truth and
+      ``rolling_window_timestamps`` is derived as
+      ``days × BARS_PER_DAY[horizon]``.
+    * **rolling-by-timestamps** (``--rolling-window-timestamps N``,
+      legacy / debugging path): ``rolling_window_timestamps`` is the
+      source of truth and ``rolling_window_days`` is genuinely
+      undefined.
+
+    The assertion requires the schema columns to exist on both paths;
+    numeric / positive / constant invariants apply per column only when
+    that side of the configuration was actually supplied.
+    """
+    if str(train_window_mode) != "rolling_fixed":
+        return
+    required = ("rolling_window_days", "rolling_window_timestamps",
+                 "train_window_mode", "train_start_timestamp",
+                 "train_end_timestamp", "train_window_timestamps")
+    missing = [c for c in required if c not in signals.columns]
+    if missing:
+        raise AssertionError(
+            "panel_logit output is missing required training-window "
+            f"metadata columns: {missing}"
+        )
+    if signals["train_window_mode"].nunique() != 1:
+        raise AssertionError(
+            "panel_logit output 'train_window_mode' is not constant"
+        )
+    days_s = signals["rolling_window_days"]
+    ts_s   = signals["rolling_window_timestamps"]
+
+    def _check_col(name: str, s: pd.Series) -> bool:
+        """Return True when the column is fully populated, > 0 and
+        constant. Raise when ANY non-null value is non-positive or the
+        column has more than one distinct value (rules out tampered
+        per-row drift). A fully-NaN column is permitted on the
+        rolling-by-timestamps legacy path."""
+        non_null = s.dropna()
+        if non_null.empty:
+            return False
+        if s.isna().any():
+            raise AssertionError(
+                f"panel_logit output {name!r} is partially NaN; the "
+                "column must be either fully populated or fully NaN "
+                "within one parquet"
+            )
+        if not (non_null > 0).all():
+            raise AssertionError(
+                f"panel_logit output {name!r} contains non-positive values"
+            )
+        if s.nunique() != 1:
+            raise AssertionError(
+                f"panel_logit output {name!r} is not constant within the file "
+                f"(got {sorted(s.unique().tolist())[:3]}…)"
+            )
+        return True
+
+    days_ok = _check_col("rolling_window_days",       days_s)
+    ts_ok   = _check_col("rolling_window_timestamps", ts_s)
+    if not (days_ok or ts_ok):
+        raise AssertionError(
+            "panel_logit output: rolling_fixed run carries neither a "
+            "valid rolling_window_days nor a valid rolling_window_timestamps "
+            "column (numeric, > 0, constant)"
+        )
+    # Horizon-specific consistency rule applies only when BOTH sides
+    # of the configuration are present.
+    bpd = _BARS_PER_DAY.get(str(horizon))
+    if bpd is not None and days_ok and ts_ok:
+        days = float(days_s.iat[0])
+        ts   = int(ts_s.iat[0])
+        if ts != int(days * bpd):
+            raise AssertionError(
+                f"panel_logit output: rolling_window_timestamps={ts} "
+                f"does not equal rolling_window_days={days} * "
+                f"BARS_PER_DAY[{horizon!r}]={bpd}"
+            )
+
+
 def panel_output_name(set_id: str, sentiment_model: str, panel_mode: str,
                       hpo_variant: str = "fixed",
                       window_suffix: str = "",
@@ -815,6 +974,23 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                 signals["hpo_enabled"]   = False
                 signals["hpo_objective"] = "-"
                 signals["hpo_variant"]   = "fixed"
+            # ── Rolling-window metadata (commit 10) ────────────────
+            # Stamp the run's training-window configuration on every
+            # row at the canonical assembly site so freshly computed
+            # AND checkpoint-resumed paths both carry the contract.
+            # ``rolling_window_days`` comes straight from the run
+            # config — never derived from the filename or from
+            # ``train_window_timestamps`` (the two only coincide at
+            # the 1d horizon). The per-row ``train_window_*`` columns
+            # produced by select_panel_train_window remain untouched.
+            from .panel_logit import _stamp_rolling_window_metadata
+            signals = _stamp_rolling_window_metadata(
+                signals,
+                horizon=hz,
+                train_window_mode=train_window_mode,
+                rolling_window_days=rolling_window_days,
+                rolling_window_timestamps=rolling_window_timestamps,
+            )
             # Universe identity (commit 3 Section B + commit 4 A.5).
             # Stamp the REQUESTED universe (immutable) alongside the
             # AVAILABLE subset and the REALIZED ticker set so the
@@ -826,6 +1002,14 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                 requested_universe=requested_tickers,
                 available_universe=available_tickers,
             )
+            # ── Output-schema assertion (commit 10) ───────────────
+            # Refuse to write a rolling-window parquet that is missing
+            # any of the canonical training-window columns. This is
+            # the smoke validator's required set; failing here gives
+            # the user a clear stack trace instead of a downstream
+            # validator complaint after the fact.
+            _assert_training_window_contract(signals, horizon=hz,
+                                              train_window_mode=train_window_mode)
             signals.to_parquet(out_path, index=False, engine="pyarrow")
 
             from .hyperparameter_tuning import summarize_hpo_columns
