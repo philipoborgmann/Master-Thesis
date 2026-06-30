@@ -71,6 +71,32 @@ NAIVE_IDENTITY_COLUMNS = (
 )
 
 
+#: Columns used to GATE the NAIVE candidate match (commit 13). This is a
+#: deliberately *structural* subset of :data:`NAIVE_IDENTITY_COLUMNS`:
+#:
+#: * ``coin_universe_hash`` is EXCLUDED — NAIVE is intentionally run on
+#:   a broader universe than the coverage-filtered models, so gating on
+#:   universe equality would (and did) leave every row ``missing_naive``.
+#:   The universe hash is instead used only as a *disambiguator* when
+#:   several distinct NAIVE universes match the same structural family.
+#: * ``rolling_window_timestamps`` is EXCLUDED — the model writer stamps
+#:   it (``days × BARS_PER_DAY``) but the day-based NAIVE generator
+#:   leaves it NaN, so a byte-equality gate never matches. The
+#:   methodological window is already pinned by ``rolling_window_days``.
+#:
+#: The model vs NAIVE comparison is then computed on the
+#: coverage-intersection inner-join over ``(ticker, timestamp)`` — the
+#: same discipline as the incremental and difference-in-improvement
+#: writers.
+NAIVE_MATCH_COLUMNS = (
+    "horizon",
+    "model_type",
+    "panel_mode",
+    "train_window_mode",
+    "rolling_window_days",
+)
+
+
 #: COMPLETE model identity used to group signals before comparing to
 #: NAIVE (commit 3 Section C). Every column listed MUST be constant
 #: within a model group; otherwise the row is flagged
@@ -206,6 +232,30 @@ def _hash_equal(a, b) -> bool:
     return a_s == b_s
 
 
+def _split_by_resolved_universe(ngrp: pd.DataFrame):
+    """Split a structural NAIVE candidate into one sub-frame per distinct
+    coin-universe, yielding ``(resolved_hash, sub_frame)``.
+
+    Rows are grouped by their ``coin_universe_hash`` column value (with
+    every "absent" spelling collapsed into a single bucket); each bucket
+    then resolves its hash via :func:`_coin_universe_hash_from_signals`,
+    so a bucket with an empty column falls back to its realised-ticker
+    hash. In the common case (one NAIVE run) this returns a single
+    group.
+    """
+    col = ngrp.get("coin_universe_hash")
+    if col is None:
+        rh, _ = _coin_universe_hash_from_signals(ngrp)
+        return [(rh, ngrp)]
+    key = col.astype(str).str.strip().str.lower()
+    key = key.where(~key.isin({"", "nan", "none", "null"}), other="__absent__")
+    out = []
+    for _k, sub in ngrp.groupby(key, dropna=False):
+        rh, _ = _coin_universe_hash_from_signals(sub)
+        out.append((rh, sub))
+    return out
+
+
 def _empty_output() -> pd.DataFrame:
     return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
@@ -333,16 +383,15 @@ def absolute_vs_naive_table(signals: pd.DataFrame) -> pd.DataFrame:
             rows.append(base)
             continue
 
-        # ── NAIVE candidate filter on the structural identity ─────
-        # Match horizon / model_type / panel_mode / training-window on
-        # the raw columns, then match the coin universe on the RESOLVED
-        # hash (commit 12 Task D) — so a present hash on both sides
-        # matches AND a missing hash on one side still aligns by the
-        # realised ticker set.
-        nonhash_identity = [c for c in NAIVE_IDENTITY_COLUMNS
-                            if c != "coin_universe_hash"]
+        # ── NAIVE candidate filter on the structural family ───────
+        # Gate on the methodological family ONLY (horizon / model_type /
+        # panel_mode / train_window_mode / rolling_window_days). The
+        # universe hash and rolling_window_timestamps are deliberately
+        # NOT gated — NAIVE is run on a broader universe and the
+        # day-based generator leaves rolling_window_timestamps NaN, so
+        # gating on either left every row missing_naive (commit 13).
         cand_mask = pd.Series(True, index=naive_df.index)
-        for col in nonhash_identity:
+        for col in NAIVE_MATCH_COLUMNS:
             cand_mask &= _series_eq_nan_safe(naive_df[col], ident_values.get(col))
         cand = naive_df[cand_mask]
         if cand.empty:
@@ -351,26 +400,31 @@ def absolute_vs_naive_table(signals: pd.DataFrame) -> pd.DataFrame:
             rows.append(base)
             continue
 
-        # Group the structural candidates by their non-hash identity,
-        # resolve each group's coin-universe hash, and keep only the
-        # group whose resolved hash matches the model's.
-        hash_matched_groups = []
-        for nk, ngrp in cand.groupby(nonhash_identity, dropna=False):
-            nhash, _ = _coin_universe_hash_from_signals(ngrp)
-            if _hash_equal(nhash, m_hash_resolved):
-                hash_matched_groups.append((nhash, ngrp))
-        base["n_naive"] = int(sum(len(g) for _, g in hash_matched_groups))
-        if not hash_matched_groups:
-            base["status"] = "missing_naive"
-            base["skip_reason"] = "no_matched_naive_identity"
-            rows.append(base)
-            continue
-        if len(hash_matched_groups) > 1:
-            base["status"]      = "ambiguous_naive_identity"
-            base["skip_reason"] = "multiple_naive_groups_for_identity"
-            rows.append(base)
-            continue
-        naive_hash_resolved, naive_grp = hash_matched_groups[0]
+        # Group the structural candidates by their resolved coin-universe
+        # hash. The universe hash is a DISAMBIGUATOR, not a gate:
+        #   * if exactly one NAIVE universe matches → use it (the real
+        #     case: one NAIVE run on a larger universe than the model);
+        #   * if several distinct NAIVE universes match the same family
+        #     → prefer the one whose hash equals the model's; if none
+        #     equals, the choice is genuinely ambiguous.
+        naive_universe_groups = []
+        for _nk, ngrp in cand.groupby(list(NAIVE_MATCH_COLUMNS), dropna=False):
+            for nhash, uni_grp in _split_by_resolved_universe(ngrp):
+                naive_universe_groups.append((nhash, uni_grp))
+
+        if len(naive_universe_groups) == 1:
+            naive_hash_resolved, naive_grp = naive_universe_groups[0]
+        else:
+            exact = [(h, g) for (h, g) in naive_universe_groups
+                     if _hash_equal(h, m_hash_resolved)]
+            if len(exact) == 1:
+                naive_hash_resolved, naive_grp = exact[0]
+            else:
+                base["n_naive"] = int(sum(len(g) for _, g in naive_universe_groups))
+                base["status"]      = "ambiguous_naive_identity"
+                base["skip_reason"] = "multiple_naive_universes_for_family"
+                rows.append(base)
+                continue
         # Populate the NAIVE-side hash from the NAIVE rows themselves.
         base["naive_coin_universe_hash"] = naive_hash_resolved
 
