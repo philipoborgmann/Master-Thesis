@@ -296,13 +296,18 @@ def incremental_sentiment_value_table(
                              else int(window_key_model[1]))
         window_days_label = window_key_model[2]
 
-        # Same horizon / model_type / panel_mode + benchmark set_id + sentiment_model "-"
+        # Same horizon / model_type / panel_mode + benchmark set_id +
+        # canonical no-sentiment key. ECON is written under the literal
+        # ``"none"`` in feature_sets.xlsx; canonicalising both sides
+        # (commit 12 Task C) makes the benchmark join key identical
+        # regardless of the spelling ("none" / "None" / "-" / "").
+        from .loading import canonical_sentiment_model as _canon_sm
         cand = df[
             (df["horizon"] == horizon)
             & (df["model_type"] == model_type)
             & (df["panel_mode"] == panel_mode)
             & (df["set_id"] == bench_set_id)
-            & (df["sentiment_model"].astype(str) == "-")
+            & (df["sentiment_model"].map(_canon_sm) == "-")
         ]
         # Filter to the same training-window configuration.
         if not cand.empty:
@@ -342,6 +347,13 @@ def incremental_sentiment_value_table(
         # The benchmark target is by construction identical to the model target
         # at the same (horizon, timestamp, ticker), so the merge picks one copy.
         b = b.drop(columns=["target"])
+        # Strict coverage intersection (commit 12 Task B): dedupe each
+        # side on the observation key so the nested H1 comparison runs on
+        # the candidate's true matched coverage and the inner join never
+        # fans out when ECON carries coin-timestamps the combined set
+        # lacks. Clean equal-coverage families (6h) are unaffected.
+        m = m.drop_duplicates(subset=keys_join, keep="first")
+        b = b.drop_duplicates(subset=keys_join, keep="first")
         merged = m.merge(b, on=keys_join, how="inner")
         n_matched = int(len(merged))
 

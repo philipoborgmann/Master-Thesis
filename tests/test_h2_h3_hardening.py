@@ -218,9 +218,12 @@ def test_diff_in_improvement_refuses_mismatched_window_family():
     assert (out["test_valid"]   == False).all()  # noqa: E712
 
 
-def test_diff_in_improvement_detects_duplicate_keys():
-    """Two ECON rows for the same (ticker, timestamp) → duplicate guard
-    trips and the comparison is skipped."""
+def test_diff_in_improvement_dedupes_duplicate_keys_and_runs():
+    """Two ECON rows for the same (ticker, timestamp) no longer abort
+    the comparison (commit 12 Task B). The duplicate is recorded and
+    the comparison proceeds on the deduplicated intersection — a
+    duplicate prediction is a data quirk, not a reason to drop the
+    whole horizon."""
     aug  = _signals_for_diff("ECON_VAD_F", "vader", base_acc=0.6, seed=20)
     econ = _signals_for_diff("ECON", "-", base_acc=0.5, seed=21)
     econ["target"] = aug["target"].values
@@ -237,9 +240,13 @@ def test_diff_in_improvement_detects_duplicate_keys():
         hypothesis_family="H2_volatility",
     )
     row = out.iloc[0]
+    # The duplicate is recorded honestly …
     assert row["n_duplicate_econ_keys"] >= 1
-    assert row["skip_reason"] == "duplicate_keys_within_family"
-    assert not row["test_valid"]
+    # … but the comparison is NOT aborted: the deduped intersection
+    # produced matched observations and targets aligned.
+    assert row["skip_reason"] != "duplicate_keys_within_family"
+    assert row["n_matched"] > 0
+    assert bool(row["targets_identical"])
 
 
 def test_diff_in_improvement_target_mismatch_guard():
