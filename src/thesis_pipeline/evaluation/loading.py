@@ -34,6 +34,30 @@ META_DEFAULTS = {
     "hpo_variant":     "fixed",
 }
 
+#: Tokens that all denote "no sentiment model" and must canonicalise to
+#: the single ``"-"`` sentinel. ECON / economic-only sets are written
+#: under the literal ``"none"`` in feature_sets.xlsx (filename
+#: ``ECON_none_...``); the incremental joiner looks them up with ``"-"``.
+#: Normalising both sides to ``"-"`` is the canonical key fix (commit 12
+#: Task C) — preferred over hard-coding a one-sided literal.
+_NO_SENTIMENT_TOKENS = ("", "nan", "none", "null", "na", "n/a")
+
+
+def canonical_sentiment_model(value) -> str:
+    """Return the canonical sentiment-model key.
+
+    Every "absent sentiment" spelling (``""``, ``"nan"``, ``"none"``,
+    ``"None"``, ``"NULL"``, ``"-"`` …) collapses to ``"-"``; any real
+    scorer name (``vader`` / ``cryptobert``) is returned stripped with
+    its case preserved (so existing grouping keys are unaffected). This
+    makes the benchmark-lookup key identical on the ECON (``none``) and
+    combined (``-``) sides.
+    """
+    s = str(value).strip()
+    if s == "-" or s.lower() in _NO_SENTIMENT_TOKENS:
+        return "-"
+    return s
+
 
 def discover_signal_files(horizon: str | None = None) -> list[Path]:
     """List every signal parquet under ``Outputs/Signals/{horizon}/``.
@@ -144,8 +168,10 @@ def load_all_signals(horizon: str | None = None,
     if not frames:
         return pd.DataFrame(columns=list(REQUIRED_COLUMNS) + list(META_COLUMNS))
     out = pd.concat(frames, ignore_index=True)
-    # Normalise sentiment_model: missing/blank → "-"
-    out["sentiment_model"] = out["sentiment_model"].replace({"": "-", "nan": "-"})
+    # Canonicalise sentiment_model: every "no-sentiment" spelling
+    # (""/"nan"/"none"/"None"/…) → "-" so ECON ("none") and combined
+    # ("-") sets share the same benchmark-lookup key (commit 12 Task C).
+    out["sentiment_model"] = out["sentiment_model"].map(canonical_sentiment_model)
     # Model-family identity: blank → canonical defaults (defensive — the
     # per-file normaliser already applies these, but a concat of mixed-vintage
     # files is cheap to re-guard).

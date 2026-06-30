@@ -463,34 +463,44 @@ def difference_in_improvement_table(
             rows.append(diag_row)
             continue
 
-        # ── Duplicate-key guard (Section D) ─────────────────────
-        dup_aug  = int(aug_grp.duplicated(subset=["ticker", "timestamp"]).sum())
-        dup_econ = int(cand.duplicated(subset=["ticker", "timestamp"]).sum())
-        diag_row["n_duplicate_augmented_keys"] = dup_aug
-        diag_row["n_duplicate_econ_keys"]      = dup_econ
-        if dup_aug or dup_econ:
-            diag_row["skip_reason"] = "duplicate_keys_within_family"
+        # ── Coverage intersection (commit 12 Task B) ────────────
+        # ECON is evaluated on its FULL coin-timestamp coverage while
+        # augmented/sentiment sets drop coin-timestamps with no
+        # sentiment coverage. Rather than abort on the resulting key
+        # asymmetry (the previous ``duplicate_keys_within_family``
+        # behaviour, which silently lost 1d/1h), restrict BOTH sides to
+        # the common (ticker, timestamp) sample, deduplicate defensively
+        # to prevent inner-join fan-out, and report the counts honestly.
+        # 6h (equal, clean coverage) is a no-op so its numbers are
+        # unchanged.
+        from .coverage import coverage_intersection
+        ci = coverage_intersection(
+            aug_grp, cand, key_cols=("ticker", "timestamp"),
+        )
+        diag_row["n_duplicate_augmented_keys"] = ci.n_duplicate_candidate
+        diag_row["n_duplicate_econ_keys"]      = ci.n_duplicate_reference
+        diag_row["n_matched"]                  = ci.n_matched
+        diag_row["n_unmatched_augmented"]      = ci.n_unmatched_candidate
+        diag_row["n_unmatched_econ"]           = ci.n_unmatched_reference
+
+        if ci.n_matched == 0:
+            diag_row["skip_reason"] = "no_matched_observations"
             rows.append(diag_row)
             continue
 
-        d_frame = observation_improvement_indicator(aug_grp, cand)
-        diag_row["n_matched"] = int(len(d_frame))
-        diag_row["n_unmatched_augmented"] = int(len(aug_grp) - len(d_frame))
-        diag_row["n_unmatched_econ"]      = int(len(cand)    - len(d_frame))
-
+        # Improvement indicator on the byte-identical matched sample.
+        d_frame = observation_improvement_indicator(ci.candidate, ci.reference)
         if d_frame.empty:
             diag_row["skip_reason"] = "no_matched_observations"
             rows.append(diag_row)
             continue
 
         # ── Target-equality verification (Section D) ────────────
-        # observation_improvement_indicator preserves the augmented-side
-        # target. Compare per (ticker, ts) with the ECON-side target.
-        bench_for_check = cand.merge(
-            d_frame[["ticker", "timestamp"]].drop_duplicates(),
-            on=["ticker", "timestamp"], how="inner",
-        ).sort_values(["ticker", "timestamp"]).reset_index(drop=True)
-        aug_for_check = d_frame.sort_values(["ticker", "timestamp"]).reset_index(drop=True)
+        # ci.candidate and ci.reference are aligned row-for-row on the
+        # matched keys, so the augmented- and ECON-side targets must be
+        # byte-identical on the intersection.
+        aug_for_check = ci.candidate.sort_values(["ticker", "timestamp"]).reset_index(drop=True)
+        bench_for_check = ci.reference.sort_values(["ticker", "timestamp"]).reset_index(drop=True)
         targets_identical = bool(
             (aug_for_check["target"].astype(int).values
              == bench_for_check["target"].astype(int).values).all()

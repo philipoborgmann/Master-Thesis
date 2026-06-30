@@ -194,6 +194,18 @@ def _coin_universe_hash_from_signals(grp: pd.DataFrame) -> tuple[str | None, str
     return coin_universe_hash(list(tickers)), "legacy_realized_tickers_fallback"
 
 
+def _hash_equal(a, b) -> bool:
+    """True iff two resolved coin-universe hashes are the same non-empty
+    value. Two unresolved (None / empty) hashes never match — an
+    identity comparison with no universe information is meaningless."""
+    if a is None or b is None:
+        return False
+    a_s, b_s = str(a).strip(), str(b).strip()
+    if not a_s or not b_s or a_s.lower() == "nan" or b_s.lower() == "nan":
+        return False
+    return a_s == b_s
+
+
 def _empty_output() -> pd.DataFrame:
     return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
@@ -281,10 +293,12 @@ def absolute_vs_naive_table(signals: pd.DataFrame) -> pd.DataFrame:
          train_window_mode, rolling_window_days, rolling_window_timestamps,
          m_hash) = keys
 
-        # Resolve universe-identity provenance from any row in the group
-        # (NAIVE-generator runs stamp "requested_metadata"; legacy frames
-        # without a coin_universe_hash fall back to realised tickers).
-        _, universe_src = _coin_universe_hash_from_signals(m_grp)
+        # Resolve the model group's coin-universe hash + provenance.
+        # ``_coin_universe_hash_from_signals`` prefers a stamped
+        # ``coin_universe_hash`` column and falls back to the realised
+        # ticker set — so a model row whose hash column is empty still
+        # resolves to a comparable value (commit 12 Task D).
+        m_hash_resolved, universe_src = _coin_universe_hash_from_signals(m_grp)
 
         base = _identity_row(
             horizon=horizon, set_id=set_id, sentiment_model=sm,
@@ -294,8 +308,7 @@ def absolute_vs_naive_table(signals: pd.DataFrame) -> pd.DataFrame:
             train_window_mode=train_window_mode,
             rolling_window_days=rolling_window_days,
             rolling_window_timestamps=rolling_window_timestamps,
-            coin_universe_hash=m_hash if m_hash is not None and not (
-                isinstance(m_hash, float) and np.isnan(m_hash)) else None,
+            coin_universe_hash=m_hash_resolved,
             universe_identity_source=universe_src,
             n_model=int(len(m_grp)),
         )
@@ -307,7 +320,6 @@ def absolute_vs_naive_table(signals: pd.DataFrame) -> pd.DataFrame:
             "train_window_mode":         train_window_mode,
             "rolling_window_days":       rolling_window_days,
             "rolling_window_timestamps": rolling_window_timestamps,
-            "coin_universe_hash":        m_hash,
         }
 
         # ── Identity-metadata consistency guard (Section B.2) ─────
@@ -321,54 +333,69 @@ def absolute_vs_naive_table(signals: pd.DataFrame) -> pd.DataFrame:
             rows.append(base)
             continue
 
-        # ── NAIVE candidate filter on full identity ───────────────
+        # ── NAIVE candidate filter on the structural identity ─────
+        # Match horizon / model_type / panel_mode / training-window on
+        # the raw columns, then match the coin universe on the RESOLVED
+        # hash (commit 12 Task D) — so a present hash on both sides
+        # matches AND a missing hash on one side still aligns by the
+        # realised ticker set.
+        nonhash_identity = [c for c in NAIVE_IDENTITY_COLUMNS
+                            if c != "coin_universe_hash"]
         cand_mask = pd.Series(True, index=naive_df.index)
-        for col in NAIVE_IDENTITY_COLUMNS:
+        for col in nonhash_identity:
             cand_mask &= _series_eq_nan_safe(naive_df[col], ident_values.get(col))
         cand = naive_df[cand_mask]
-        base["n_naive"] = int(len(cand))
         if cand.empty:
             base["status"] = "missing_naive"
             base["skip_reason"] = "no_matched_naive_identity"
             rows.append(base)
             continue
 
-        # ── NAIVE ambiguity guard (Section C) ─────────────────────
-        # The NAIVE side must collapse to exactly ONE identity group;
-        # multiple distinct groups under the same complete identity
-        # would force an arbitrary choice, so we refuse to pick.
-        naive_groups = list(cand.groupby(
-            list(NAIVE_IDENTITY_COLUMNS), dropna=False,
-        ))
-        if len(naive_groups) > 1:
+        # Group the structural candidates by their non-hash identity,
+        # resolve each group's coin-universe hash, and keep only the
+        # group whose resolved hash matches the model's.
+        hash_matched_groups = []
+        for nk, ngrp in cand.groupby(nonhash_identity, dropna=False):
+            nhash, _ = _coin_universe_hash_from_signals(ngrp)
+            if _hash_equal(nhash, m_hash_resolved):
+                hash_matched_groups.append((nhash, ngrp))
+        base["n_naive"] = int(sum(len(g) for _, g in hash_matched_groups))
+        if not hash_matched_groups:
+            base["status"] = "missing_naive"
+            base["skip_reason"] = "no_matched_naive_identity"
+            rows.append(base)
+            continue
+        if len(hash_matched_groups) > 1:
             base["status"]      = "ambiguous_naive_identity"
             base["skip_reason"] = "multiple_naive_groups_for_identity"
             rows.append(base)
             continue
-        (_naive_key, naive_grp), = naive_groups
-        base["naive_coin_universe_hash"] = m_hash  # by identity-match
+        naive_hash_resolved, naive_grp = hash_matched_groups[0]
+        # Populate the NAIVE-side hash from the NAIVE rows themselves.
+        base["naive_coin_universe_hash"] = naive_hash_resolved
 
-        # ── Duplicate-key guard ──────────────────────────────────
-        dup_model = int(m_grp.duplicated(subset=["ticker", "timestamp"]).sum())
-        dup_naive = int(naive_grp.duplicated(subset=["ticker", "timestamp"]).sum())
-        base["n_duplicate_model_keys"] = dup_model
-        base["n_duplicate_naive_keys"] = dup_naive
-        if dup_model or dup_naive:
-            base["status"]      = "duplicate_keys"
-            base["skip_reason"] = "duplicate_keys_within_identity"
+        # ── Coverage intersection (commit 12 Task B) ──────────────
+        # Restrict model and NAIVE to their common (ticker, timestamp)
+        # sample, deduplicate defensively, and report honest counts —
+        # mirroring the economic backtest's common-sample discipline.
+        from .coverage import coverage_intersection
+        ci = coverage_intersection(
+            m_grp, naive_grp, key_cols=("ticker", "timestamp"),
+        )
+        base["n_model"]                = ci.n_candidate
+        base["n_naive"]                = ci.n_reference
+        base["n_matched"]              = ci.n_matched
+        base["n_unmatched_model"]      = ci.n_unmatched_candidate
+        base["n_unmatched_naive"]      = ci.n_unmatched_reference
+        base["n_duplicate_model_keys"] = ci.n_duplicate_candidate
+        base["n_duplicate_naive_keys"] = ci.n_duplicate_reference
+        if ci.n_matched == 0:
+            base["status"]      = "no_overlap"
+            base["skip_reason"] = "no_overlap"
             rows.append(base)
             continue
 
-        joined = _inner_join_on_keys(m_grp, naive_grp)
-        n_matched = int(len(joined))
-        # ``n_unmatched_*`` after duplicate verification.
-        n_model_unique = int(m_grp.drop_duplicates(subset=["ticker", "timestamp"]).shape[0])
-        n_naive_unique = int(naive_grp.drop_duplicates(subset=["ticker", "timestamp"]).shape[0])
-        base["n_model"]            = n_model_unique
-        base["n_naive"]            = n_naive_unique
-        base["n_matched"]          = n_matched
-        base["n_unmatched_model"]  = max(n_model_unique - n_matched, 0)
-        base["n_unmatched_naive"]  = max(n_naive_unique - n_matched, 0)
+        joined = _inner_join_on_keys(ci.candidate, ci.reference)
         if joined.empty:
             base["status"]      = "no_overlap"
             base["skip_reason"] = "no_overlap"

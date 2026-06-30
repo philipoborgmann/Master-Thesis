@@ -122,11 +122,23 @@ def _correctness(df: pd.DataFrame) -> pd.Series:
 
 def _match_against_benchmark(model_df: pd.DataFrame,
                              benchmark_df: pd.DataFrame) -> pd.DataFrame:
-    """Inner-join on ``(timestamp, ticker)`` and return matched correctness."""
+    """Inner-join model vs benchmark on the strict ``(timestamp, ticker)``
+    intersection and return matched correctness.
+
+    Both sides are deduplicated to one row per ``(timestamp, ticker)``
+    before the join (commit 12 Task E) so the McNemar ``n_matched``
+    equals the candidate's true matched coverage rather than fanning out
+    when the ECON benchmark carries coin-timestamps the candidate lacks
+    (the 1d/1h coverage-asymmetry case). When both sides already have
+    one clean row per key (the 6h case) the dedup is a no-op and the
+    statistic is unchanged.
+    """
     m = model_df[["timestamp", "ticker", "target", "prediction"]].copy()
     b = benchmark_df[["timestamp", "ticker", "target", "prediction"]].copy()
     m["correct_model"]     = _correctness(m)
     b["correct_benchmark"] = _correctness(b)
+    m = m.drop_duplicates(subset=["timestamp", "ticker"], keep="first")
+    b = b.drop_duplicates(subset=["timestamp", "ticker"], keep="first")
     return m.merge(
         b[["timestamp", "ticker", "correct_benchmark"]],
         on=["timestamp", "ticker"], how="inner",
@@ -299,6 +311,11 @@ def _match_against_benchmark_grouped(model_df: pd.DataFrame,
     b = benchmark_df[base].copy()
     m["correct_model"]     = _correctness(m)
     b["correct_benchmark"] = _correctness(b)
+    # Strict intersection: dedupe each side on the observation key so the
+    # regime-stratified McNemar matches on the candidate's true coverage
+    # (commit 12 Task E). No-op when both sides are already clean.
+    m = m.drop_duplicates(subset=["timestamp", "ticker"], keep="first")
+    b = b.drop_duplicates(subset=["timestamp", "ticker"], keep="first")
     return m.merge(
         b[["timestamp", "ticker", "correct_benchmark"]],
         on=["timestamp", "ticker"], how="inner",
