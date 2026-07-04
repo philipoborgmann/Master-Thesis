@@ -46,6 +46,7 @@ from .economic import (
     summarize_high_low_threshold_backtest,
 )
 from .incremental import incremental_sentiment_value_table
+from .confirmatory import finalize_confirmatory_families
 from .naive_comparison import absolute_vs_naive_table
 from .reporting import (
     build_leaderboard, build_summary,
@@ -542,8 +543,38 @@ def main(argv: Sequence[str] | None = None) -> int:
     # One row per (model run × matched NAIVE) using the COMPLETE NAIVE
     # identity (horizon, model_type, panel_mode, train_window_*,
     # coin_universe_hash). Hypothesis family ``absolute_vs_naive`` —
-    # NEVER pooled with H1 / H2 / H3.
+    # NEVER pooled with H1 / H2 / H3. It is a DIAGNOSTIC FLOOR: it reports
+    # only ``p_value_raw`` + ``significant_raw`` (at ALPHA_PRESPECIFIED) and
+    # carries NO BH q-value / confirmatory family.
     absolute_vs_naive_df = absolute_vs_naive_table(signals)
+    if not absolute_vs_naive_df.empty:
+        absolute_vs_naive_df = absolute_vs_naive_df.copy()
+        absolute_vs_naive_df["p_value_raw"] = absolute_vs_naive_df["mcnemar_p_value"]
+        absolute_vs_naive_df["significant_raw"] = (
+            absolute_vs_naive_df["significant_raw_5pct"].astype(bool))
+        # A diagnostic floor never carries a corrected q-value / family.
+        for _c in ("q_value_bh", "significant_bh"):
+            if _c in absolute_vs_naive_df.columns:
+                absolute_vs_naive_df = absolute_vs_naive_df.drop(columns=_c)
+
+    # ── 8d. Confirmatory multiplicity (Parts 1 + 2A/2B) ──────────
+    # ONE centralized family-aware BH pooled ACROSS horizons within each
+    # confirmatory family (A/B/C/D/E1/E2). Emits the enriched incremental
+    # (Family A log-loss DM + Family B directional) and diff-in-improvement
+    # (Families C/D) surfaces plus the horizon-comparison table (E1/E2),
+    # the multiple-testing manifest, the metric-roles table and the
+    # class-balance table. This SUPERSEDES the diff table's own BH.
+    confirmatory = finalize_confirmatory_families(
+        signals=signals,
+        incremental_df=incremental_df,
+        diff_df=diff_in_improvement_df,
+    )
+    incremental_df          = confirmatory.incremental
+    diff_in_improvement_df  = confirmatory.diff
+    horizon_comparison_df   = confirmatory.horizon_comparison
+    multiple_testing_manifest_df = confirmatory.manifest
+    metric_roles_df         = confirmatory.metric_roles
+    class_balance_df        = confirmatory.class_balance
 
     # ── 9. Leaderboard + thesis-style summary ───────────────────
     leaderboard = build_leaderboard(pooled)
@@ -637,6 +668,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                                              False) else None),
         incremental_sentiment=incremental_df,
         absolute_vs_naive=absolute_vs_naive_df,
+        horizon_comparison=horizon_comparison_df,
+        multiple_testing_manifest=multiple_testing_manifest_df,
+        metric_roles=metric_roles_df,
+        class_balance=class_balance_df,
     )
     xlsx = write_excel_report(
         xlsx_path,

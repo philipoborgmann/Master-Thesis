@@ -116,3 +116,16 @@ def test_manifest_counts_significant():
     a = manifest[manifest["family"] == "A_H1_logloss"].iloc[0]
     assert a["n_tests"] == 3
     assert a["n_significant_bh"] == 2
+
+
+# ---------------------------------------------------------------------------
+# (v) H1 support-class taxonomy
+# ---------------------------------------------------------------------------
+
+def test_h1_support_class_taxonomy_all_four_cases():
+    from thesis_pipeline.evaluation.confirmatory import _h1_support_class
+    # (probabilistic H1a, directional H1b) -> support class.
+    assert _h1_support_class(True, True) == "strong"
+    assert _h1_support_class(True, False) == "probabilistic"
+    assert _h1_support_class(False, True) == "directional"
+    assert _h1_support_class(False, False) == "none"

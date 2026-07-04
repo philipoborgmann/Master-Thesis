@@ -450,6 +450,75 @@ def test_full_evaluation_writes_excel_and_csvs(signals_env):
     assert np.allclose(diff.values, valid["lift_accuracy"].values, atol=1e-6)
 
 
+def test_confirmatory_outputs_and_sanity(signals_env):
+    """The centralized confirmatory layer must write its four new CSVs,
+    enrich the incremental surface with Families A/B + the H1 decomposition,
+    reconcile the Nt-weighted log-loss effect with ``log_loss_improvement``,
+    keep the diagnostic floor family-free, and never emit a 10% flag."""
+    out_dir = signals_env["root"] / "Outputs" / "Evaluation_conf"
+    rc = eval_main.main([
+        "--horizon", "1d", "--force",
+        "--output-dir", str(out_dir),
+        "--feature-config", str(signals_env["feature_sets"]),
+    ])
+    assert rc == 0
+
+    # ── The four new confirmatory CSVs exist ──────────────────────
+    for name in ("horizon_comparison.csv", "multiple_testing_manifest.csv",
+                 "metric_roles.csv", "class_balance.csv",
+                 "incremental_sentiment_value.csv", "absolute_vs_naive.csv"):
+        assert (out_dir / name).exists(), name
+
+    # ── metric_roles taxonomy ─────────────────────────────────────
+    roles = pd.read_csv(out_dir / "metric_roles.csv")
+    role_map = dict(zip(roles["metric"], roles["role"]))
+    assert role_map["log_loss"] == "primary_probabilistic"
+    assert role_map["accuracy"] == "primary_directional"
+    assert bool(roles.loc[roles["metric"] == "log_loss", "used_for_hpo"].iloc[0])
+
+    # ── class_balance ─────────────────────────────────────────────
+    cb = pd.read_csv(out_dir / "class_balance.csv")
+    assert {"horizon", "n", "base_rate_up", "delta_from_0.5",
+            "imbalance_flag"}.issubset(cb.columns)
+
+    # ── incremental enrichment: Family A + B + H1 decomposition ────
+    inc = pd.read_csv(out_dir / "incremental_sentiment_value.csv")
+    for col in ("family", "p_value_raw", "q_value_bh", "significant_bh",
+                "ll_effect", "ll_effect_ntweighted", "ll_q_value_bh",
+                "ll_significant_bh", "h1a_supported_bh", "h1b_supported_bh",
+                "h1_support_class"):
+        assert col in inc.columns, col
+    # No 10% flag anywhere.
+    assert "significant_bh_10pct" not in inc.columns
+    # Family B is the directional confirmatory family for every row.
+    assert set(inc["family"].dropna()) <= {"B_H1_directional"}
+    # h1_support_class only ever takes the four taxonomy values.
+    assert set(inc["h1_support_class"].dropna()) <= {
+        "strong", "probabilistic", "directional", "none"}
+
+    # ── SANITY: Nt-weighted log-loss effect == log_loss_improvement ──
+    ok = inc[inc["status"] == "ok"].copy()
+    sane = ok.dropna(subset=["ll_effect_ntweighted", "log_loss_improvement"])
+    if not sane.empty:
+        assert np.allclose(sane["ll_effect_ntweighted"].to_numpy(float),
+                           sane["log_loss_improvement"].to_numpy(float),
+                           atol=1e-9)
+
+    # ── absolute_vs_naive is a diagnostic floor: raw only, no family/q ──
+    if (out_dir / "absolute_vs_naive.csv").exists():
+        avn = pd.read_csv(out_dir / "absolute_vs_naive.csv")
+        if not avn.empty:
+            assert "p_value_raw" in avn.columns
+            assert "significant_raw" in avn.columns
+            assert "q_value_bh" not in avn.columns
+            assert "significant_bh" not in avn.columns
+
+    # ── manifest lists only confirmatory families ─────────────────
+    man = pd.read_csv(out_dir / "multiple_testing_manifest.csv")
+    assert not man["family"].astype(str).str.contains("absolute_vs_naive").any()
+    assert not man["family"].astype(str).str.contains("regime_mcnemar").any()
+
+
 def test_no_volatility_flag_skips_regime_step(signals_env):
     out_dir = signals_env["root"] / "Outputs" / "Evaluation_NV"
     rc = eval_main.main([

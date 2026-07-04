@@ -188,7 +188,7 @@ def test_regime_mcnemar_volatility_only():
     assert set(out["regime_type"]) == {"volatility"}
     assert set(out["vol_regime"].dropna()) <= {"low", "mid", "high"}
     # BH columns present
-    for c in ("q_value_bh", "significant_bh_5pct", "significant_bh_10pct"):
+    for c in ("q_value_bh", "significant_bh_5pct"):
         assert c in out.columns
 
 
