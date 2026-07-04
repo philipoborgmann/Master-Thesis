@@ -251,6 +251,40 @@ def test_absolute_vs_naive_resolves_naive_hash_from_realized_tickers():
     assert row["naive_coin_universe_hash"] == h
 
 
+def test_absolute_vs_naive_matches_when_naive_on_larger_universe():
+    """The real production scenario (commit 13): NAIVE is estimated on a
+    LARGER universe than the coverage-filtered model AND its universe
+    hash therefore differs. The match must still succeed on the
+    overlapping (ticker, timestamp) key — not report missing_naive."""
+    model_hash = coin_universe_hash(("BTC", "ETH"))
+    naive_hash = coin_universe_hash(("BTC", "ETH", "SOL", "ADA", "XRP"))
+    assert model_hash != naive_hash
+    # Model: BTC + ETH only. NAIVE: BTC + ETH + three extra tickers, and
+    # also stamps a NaN rolling_window_timestamps (day-based generator).
+    model = _naive_or_model_row(set_id="ECON_VAD_F", hpo_variant="log_loss",
+                                seed=3, coin_hash=model_hash,
+                                tickers=("BTC", "ETH"))
+    naive = _naive_or_model_row(set_id="NAIVE", hpo_variant="naive",
+                                seed=3, coin_hash=naive_hash,
+                                tickers=("BTC", "ETH", "SOL", "ADA", "XRP"))
+    naive["rolling_window_timestamps"] = np.nan
+    # Model stamps the derived bar count; NAIVE leaves it NaN — this used
+    # to break the structural gate.
+    model["rolling_window_timestamps"] = 180
+    # Align targets on the shared BTC/ETH keys.
+    shared = naive["ticker"].isin(["BTC", "ETH"])
+    naive.loc[shared, "target"] = model.sort_values(["ticker", "timestamp"])["target"].values
+    out = nc.absolute_vs_naive_table(pd.concat([model, naive], ignore_index=True))
+    assert len(out) == 1
+    r = out.iloc[0]
+    assert r["status"] == "ok", r.get("skip_reason")
+    assert int(r["n_matched"]) > 0
+    assert r["naive_coin_universe_hash"] == naive_hash
+    assert r["coin_universe_hash"] == model_hash
+    # NAIVE covered more (ticker,timestamp) → honest unmatched count.
+    assert int(r["n_unmatched_naive"]) > 0
+
+
 def test_absolute_vs_naive_intersection_on_coverage_asymmetry():
     """NAIVE covers more (ticker,timestamp) than the model — the
     comparison runs on the overlap, reporting honest unmatched counts."""

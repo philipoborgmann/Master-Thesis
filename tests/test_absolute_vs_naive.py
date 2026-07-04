@@ -141,19 +141,27 @@ def test_one_row_per_model_run_with_metric_signs_correct():
     assert r["log_loss_improvement"] >= -1e-9
 
 
-def test_match_uses_complete_naive_identity(monkeypatch):
-    """A NAIVE row with a different coin_universe_hash MUST NOT match."""
+def test_naive_universe_hash_does_not_gate_the_match(monkeypatch):
+    """A NAIVE run on a different/larger universe STILL matches via the
+    coverage-intersection inner-join (commit 13). NAIVE is intentionally
+    estimated on a broader universe than the coverage-filtered models, so
+    the universe hash is recorded for transparency but is NOT a hard
+    gate. The model and NAIVE share the (ticker, timestamp) keys here, so
+    the comparison runs on that overlap."""
     sig = _build_signals()
-    # Tamper: rewrite the NAIVE rows' universe hash to something unrelated.
+    # Relabel the NAIVE rows' universe hash to a different universe — the
+    # actual (ticker, timestamp) predictions still overlap the model's.
     other_hash = coin_universe_hash(["SOL", "ADA"])
     sig.loc[sig["set_id"] == "NAIVE", "coin_universe_hash"] = other_hash
     out = nc.absolute_vs_naive_table(sig)
-    # The model row still appears but is flagged missing_naive.
     assert len(out) == 1
     r = out.iloc[0]
-    assert r["status"] == "missing_naive"
-    assert r["skip_reason"] == "no_matched_naive_identity"
-    assert r["n_matched"] == 0
+    # The comparison runs on the overlap rather than being dropped.
+    assert r["status"] == "ok"
+    assert int(r["n_matched"]) > 0
+    # The two universe hashes are recorded distinctly and honestly.
+    assert r["naive_coin_universe_hash"] == other_hash
+    assert r["coin_universe_hash"] != other_hash
 
 
 def test_match_rejects_different_window():
