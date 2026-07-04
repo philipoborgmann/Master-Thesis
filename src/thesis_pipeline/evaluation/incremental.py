@@ -196,7 +196,7 @@ _OUTPUT_COLUMNS = [
     # after every row is gathered. Always present (NaN/False for
     # rows that did not enter the BH pool).
     "q_value_bh", "significant_raw_5pct",
-    "significant_bh_5pct", "significant_bh_10pct",
+    "significant_bh_5pct",
     "interpretation_bh",
     "status",
 ]
@@ -241,11 +241,110 @@ def _identity_row(*, horizon, set_id, sentiment_model, model_type, panel_mode,
         "interpretation_flag": "n/a",
         "significant_raw_5pct": False,
         "significant_bh_5pct":  False,
-        "significant_bh_10pct": False,
         "interpretation_bh":    "n/a",
         "status": status,
     })
     return row
+
+
+# ---------------------------------------------------------------------------
+# Shared benchmark pairing (used by the table builder AND the timestamp-level
+# Diebold-Mariano forecast-diff layer, so both run on IDENTICAL observations)
+# ---------------------------------------------------------------------------
+
+_PAIR_JOIN_KEYS = ["horizon", "timestamp", "ticker"]
+
+
+def _select_benchmark_group(df: pd.DataFrame, *, horizon, model_type,
+                            panel_mode, hpo_variant, bench_set_id,
+                            window_key_model):
+    """Return ``(bench_grp, chosen_hpo)`` for one combined-set identity.
+
+    Mirrors the historical matching: same horizon / model_type / panel_mode,
+    the canonical no-sentiment key, the same training-window configuration,
+    and hpo preference ``same > "fixed" > first``. ``bench_grp`` is empty
+    (and ``chosen_hpo`` ``None``) when no benchmark matches.
+    """
+    from .loading import canonical_sentiment_model as _canon_sm
+    cand = df[
+        (df["horizon"] == horizon)
+        & (df["model_type"] == model_type)
+        & (df["panel_mode"] == panel_mode)
+        & (df["set_id"] == bench_set_id)
+        & (df["sentiment_model"].map(_canon_sm) == "-")
+    ]
+    if not cand.empty:
+        matching_groups = [g for _, g in cand.groupby("hpo_variant", dropna=False)
+                           if _window_key(g) == window_key_model]
+        cand = (pd.concat(matching_groups, ignore_index=False)
+                if matching_groups else cand.iloc[0:0])
+    if cand.empty:
+        return cand.iloc[0:0], None
+    variants = list(cand["hpo_variant"].astype(str).unique())
+    if str(hpo_variant) in variants:
+        chosen_hpo = str(hpo_variant)
+    elif "fixed" in variants:
+        chosen_hpo = "fixed"
+    else:
+        chosen_hpo = variants[0]
+    return cand[cand["hpo_variant"].astype(str) == chosen_hpo], chosen_hpo
+
+
+def _merge_prediction_pair(model_grp: pd.DataFrame,
+                           bench_grp: pd.DataFrame) -> pd.DataFrame:
+    """Strict coverage intersection of model vs benchmark predictions on
+    ``(horizon, timestamp, ticker)`` — each side deduped first so the
+    nested comparison runs on the candidate's true matched coverage."""
+    m = model_grp[_PAIR_JOIN_KEYS + ["target", "prediction", "probability"]].copy()
+    b = bench_grp[_PAIR_JOIN_KEYS + ["target", "prediction", "probability"]].rename(
+        columns={"prediction": "prediction_b", "probability": "probability_b"})
+    b = b.drop(columns=["target"])
+    m = m.drop_duplicates(subset=_PAIR_JOIN_KEYS, keep="first")
+    b = b.drop_duplicates(subset=_PAIR_JOIN_KEYS, keep="first")
+    return m.merge(b, on=_PAIR_JOIN_KEYS, how="inner")
+
+
+def iter_incremental_prediction_pairs(signals: pd.DataFrame,
+                                      benchmark_map: dict[str, str] | None = None):
+    """Yield ``(identity, merged)`` for every combined set that matches a
+    benchmark, where ``merged`` carries the aligned ``target``,
+    ``prediction`` / ``probability`` and ``prediction_b`` / ``probability_b``
+    columns on the shared observation intersection.
+
+    This is the single source of truth for the paired predictions, so the
+    timestamp-level forecast-diff tests (Part 2A) operate on EXACTLY the
+    observations the incremental metrics summarise — guaranteeing e.g. the
+    Nt-weighted log-loss effect equals ``log_loss_improvement``.
+    """
+    if signals is None or signals.empty:
+        return
+    mapping = dict(benchmark_map or MATCHED_ECONOMIC_BENCHMARK)
+    df = _ensure_window_columns(signals)
+    combined_mask = df["set_id"].astype(str).isin(mapping.keys())
+    if not combined_mask.any():
+        return
+    group_cols = ["horizon", "set_id", "sentiment_model", "model_type",
+                  "panel_mode", "hpo_variant"]
+    for keys, model_grp in df[combined_mask].groupby(group_cols, dropna=False):
+        horizon, set_id, sm, model_type, panel_mode, hpo_variant = keys
+        bench_set_id = mapping.get(str(set_id))
+        if bench_set_id is None:
+            continue
+        bench_grp, chosen_hpo = _select_benchmark_group(
+            df, horizon=horizon, model_type=model_type, panel_mode=panel_mode,
+            hpo_variant=hpo_variant, bench_set_id=bench_set_id,
+            window_key_model=_window_key(model_grp))
+        if bench_grp.empty:
+            continue
+        merged = _merge_prediction_pair(model_grp, bench_grp)
+        if merged.empty:
+            continue
+        yield ({
+            "horizon": horizon, "set_id": set_id, "sentiment_model": sm,
+            "model_type": model_type, "panel_mode": panel_mode,
+            "hpo_variant": hpo_variant, "benchmark_set_id": bench_set_id,
+            "benchmark_hpo_variant": chosen_hpo,
+        }, merged)
 
 
 # ---------------------------------------------------------------------------
@@ -297,26 +396,16 @@ def incremental_sentiment_value_table(
         window_days_label = window_key_model[2]
 
         # Same horizon / model_type / panel_mode + benchmark set_id +
-        # canonical no-sentiment key. ECON is written under the literal
-        # ``"none"`` in feature_sets.xlsx; canonicalising both sides
-        # (commit 12 Task C) makes the benchmark join key identical
-        # regardless of the spelling ("none" / "None" / "-" / "").
-        from .loading import canonical_sentiment_model as _canon_sm
-        cand = df[
-            (df["horizon"] == horizon)
-            & (df["model_type"] == model_type)
-            & (df["panel_mode"] == panel_mode)
-            & (df["set_id"] == bench_set_id)
-            & (df["sentiment_model"].map(_canon_sm) == "-")
-        ]
-        # Filter to the same training-window configuration.
-        if not cand.empty:
-            matching_groups = [g for _, g in cand.groupby("hpo_variant", dropna=False)
-                               if _window_key(g) == window_key_model]
-            cand = (pd.concat(matching_groups, ignore_index=False)
-                    if matching_groups else cand.iloc[0:0])
+        # canonical no-sentiment key + matching training-window config, with
+        # hpo preference (same > "fixed" > first). Shared with the
+        # forecast-diff layer via ``_select_benchmark_group`` so both run on
+        # identical benchmark selection.
+        bench_grp, chosen_hpo = _select_benchmark_group(
+            df, horizon=horizon, model_type=model_type, panel_mode=panel_mode,
+            hpo_variant=hpo_variant, bench_set_id=bench_set_id,
+            window_key_model=window_key_model)
 
-        if cand.empty:
+        if bench_grp.empty:
             row = _identity_row(
                 horizon=horizon, set_id=set_id, sentiment_model=sm,
                 model_type=model_type, panel_mode=panel_mode,
@@ -330,31 +419,10 @@ def incremental_sentiment_value_table(
                 warn_missing(str(horizon), str(set_id), str(sm), str(bench_set_id))
             continue
 
-        # Choose benchmark hpo_variant: same variant > "fixed" > anything else.
-        variants = list(cand["hpo_variant"].astype(str).unique())
-        if str(hpo_variant) in variants:
-            chosen_hpo = str(hpo_variant)
-        elif "fixed" in variants:
-            chosen_hpo = "fixed"
-        else:
-            chosen_hpo = variants[0]
-        bench_grp = cand[cand["hpo_variant"].astype(str) == chosen_hpo]
-
-        keys_join = ["horizon", "timestamp", "ticker"]
-        m = model_grp[keys_join + ["target", "prediction", "probability"]].copy()
-        b = bench_grp[keys_join + ["target", "prediction", "probability"]].rename(
-            columns={"prediction": "prediction_b", "probability": "probability_b"})
-        # The benchmark target is by construction identical to the model target
-        # at the same (horizon, timestamp, ticker), so the merge picks one copy.
-        b = b.drop(columns=["target"])
-        # Strict coverage intersection (commit 12 Task B): dedupe each
-        # side on the observation key so the nested H1 comparison runs on
-        # the candidate's true matched coverage and the inner join never
-        # fans out when ECON carries coin-timestamps the combined set
-        # lacks. Clean equal-coverage families (6h) are unaffected.
-        m = m.drop_duplicates(subset=keys_join, keep="first")
-        b = b.drop_duplicates(subset=keys_join, keep="first")
-        merged = m.merge(b, on=keys_join, how="inner")
+        # Strict coverage intersection (commit 12 Task B) via the shared
+        # merge helper — dedupe each side on the observation key so the
+        # nested H1 comparison runs on the candidate's true matched coverage.
+        merged = _merge_prediction_pair(model_grp, bench_grp)
         n_matched = int(len(merged))
 
         if n_matched == 0:
@@ -453,7 +521,6 @@ def _apply_bh_within_family(df: pd.DataFrame) -> pd.DataFrame:
     # Default columns to NaN/False/"n/a" for rows that do not enter BH.
     out["q_value_bh"]           = np.nan
     out["significant_bh_5pct"]  = False
-    out["significant_bh_10pct"] = False
     out["interpretation_bh"]    = "n/a"
 
     valid_mask = (out["status"].astype(str) == "ok") \
@@ -470,11 +537,9 @@ def _apply_bh_within_family(df: pd.DataFrame) -> pd.DataFrame:
         p_col="mcnemar_p_value",
         q_col="q_value_bh",
         sig5_col="significant_bh_5pct",
-        sig10_col="significant_bh_10pct",
     )
     out.loc[valid_mask, "q_value_bh"]           = sub["q_value_bh"].values
     out.loc[valid_mask, "significant_bh_5pct"]  = sub["significant_bh_5pct"].values
-    out.loc[valid_mask, "significant_bh_10pct"] = sub["significant_bh_10pct"].values
     # BH interpretation mirrors the raw direction but is gated on the BH flag.
     direction = np.sign(out.loc[valid_mask, "accuracy_lift"].fillna(0.0).values)
     bh5 = out.loc[valid_mask, "significant_bh_5pct"].values

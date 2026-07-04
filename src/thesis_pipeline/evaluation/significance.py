@@ -292,7 +292,7 @@ _REGIME_FRONT_COLS = [
     # Significance (p / q never hidden)
     "mcnemar_stat", "mcnemar_pval", "q_value_bh",
     "significant_5pct", "significant_10pct",
-    "significant_bh_5pct", "significant_bh_10pct",
+    "significant_bh_5pct",
     # Direction-aware significance
     "model_better_raw_5pct", "benchmark_better_raw_5pct",
     "model_better_bh_5pct", "benchmark_better_bh_5pct",
@@ -472,17 +472,20 @@ def _bh_qvalues(pvals: np.ndarray) -> np.ndarray:
 
 
 def adjust_pvalues_bh(df: pd.DataFrame, p_col: str = "mcnemar_pval") -> pd.DataFrame:
-    """Append BH/FDR columns: ``q_value_bh``, ``significant_bh_5pct``,
-    ``significant_bh_10pct``.
+    """Append BH/FDR columns: ``q_value_bh``, ``significant_bh_5pct``.
 
     Only valid tests (non-NaN p-value) enter the FDR pool. Uses
     ``statsmodels.stats.multitest.multipletests`` when available, otherwise
     a pure-numpy BH fallback.
+
+    NOTE (commit 15): the regime-McNemar surface is DESCRIPTIVE ONLY —
+    it is superseded by the cluster-robust difference-in-improvement
+    (confirmatory Families C/D) and is never listed as a confirmatory
+    family. The 10% flag was removed globally.
     """
     out = df.copy()
     out["q_value_bh"] = np.nan
     out["significant_bh_5pct"] = False
-    out["significant_bh_10pct"] = False
     if out.empty or p_col not in out.columns:
         return out
 
@@ -491,19 +494,16 @@ def adjust_pvalues_bh(df: pd.DataFrame, p_col: str = "mcnemar_pval") -> pd.DataF
     if len(pvals) == 0:
         return out
 
-    q5 = q10 = rej5 = rej10 = None
+    q5 = rej5 = None
     try:
         from statsmodels.stats.multitest import multipletests
         rej5,  q5,  _, _ = multipletests(pvals, alpha=0.05, method="fdr_bh")
-        rej10, _,   _, _ = multipletests(pvals, alpha=0.10, method="fdr_bh")
     except Exception:  # noqa: BLE001 — fall back to the numpy BH
         q5 = _bh_qvalues(pvals)
         rej5  = q5 < 0.05
-        rej10 = q5 < 0.10
 
     out.loc[mask, "q_value_bh"]          = q5
     out.loc[mask, "significant_bh_5pct"] = rej5
-    out.loc[mask, "significant_bh_10pct"] = rej10
     return out
 
 

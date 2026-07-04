@@ -416,6 +416,10 @@ def write_csv_outputs(out_dir: Path, *,
                       diff_in_improvement: pd.DataFrame | None = None,
                       incremental_sentiment: pd.DataFrame | None = None,
                       absolute_vs_naive: pd.DataFrame | None = None,
+                      horizon_comparison: pd.DataFrame | None = None,
+                      multiple_testing_manifest: pd.DataFrame | None = None,
+                      metric_roles: pd.DataFrame | None = None,
+                      class_balance: pd.DataFrame | None = None,
                       ) -> dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
@@ -443,6 +447,11 @@ def write_csv_outputs(out_dir: Path, *,
     _emit("incremental_sentiment_value", incremental_sentiment,
           "incremental_sentiment_value.csv")
     _emit("absolute_vs_naive", absolute_vs_naive, "absolute_vs_naive.csv")
+    _emit("horizon_comparison", horizon_comparison, "horizon_comparison.csv")
+    _emit("multiple_testing_manifest", multiple_testing_manifest,
+          "multiple_testing_manifest.csv")
+    _emit("metric_roles", metric_roles, "metric_roles.csv")
+    _emit("class_balance", class_balance, "class_balance.csv")
     return paths
 
 

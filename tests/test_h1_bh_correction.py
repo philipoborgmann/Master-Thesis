@@ -51,9 +51,11 @@ def test_incremental_table_carries_h1_bh_columns():
         pd.concat([aug, econ], ignore_index=True))
     for col in ("test_role", "hypothesis_family",
                 "q_value_bh", "significant_raw_5pct",
-                "significant_bh_5pct", "significant_bh_10pct",
+                "significant_bh_5pct",
                 "interpretation_bh"):
         assert col in out.columns
+    # The 10% flag was removed globally (single significant_bh at 0.05).
+    assert "significant_bh_10pct" not in out.columns
 
 
 def test_every_emitted_row_is_primary_h1_nested():
@@ -112,7 +114,6 @@ def test_bh_pool_excludes_missing_benchmark_rows():
     assert row["status"] == "missing_benchmark"
     assert pd.isna(row["q_value_bh"])
     assert not bool(row["significant_bh_5pct"])
-    assert not bool(row["significant_bh_10pct"])
 
 
 def test_bh_pool_excludes_no_overlap_rows():

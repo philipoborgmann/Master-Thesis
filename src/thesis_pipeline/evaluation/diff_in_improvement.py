@@ -676,18 +676,22 @@ def adjust_pvalues_bh_within_family(
     p_col: str = "p_value",
     q_col: str = "q_value_bh",
     sig5_col: str = "significant_bh_5pct",
-    sig10_col: str = "significant_bh_10pct",
+    sig10_col: str | None = None,
 ) -> pd.DataFrame:
-    """Append BH/FDR columns ``q_value_bh`` / ``significant_bh_*`` computed
-    **separately within each hypothesis family** (per the v4 H1 / H2 / H3
-    convention).
+    """Append BH/FDR columns ``q_value_bh`` / ``significant_bh_5pct``
+    computed **separately within each hypothesis family** (per the v4
+    H1 / H2 / H3 convention).
 
     Tests with NaN p-values do not enter the FDR pool for their family.
+    The 10% flag was removed globally (single ``significant_bh`` at
+    α=0.05 is now the convention); ``sig10_col`` is retained only for
+    backward-compatible callers and is off by default.
     """
     out = df.copy()
     out[q_col]    = np.nan
     out[sig5_col]  = False
-    out[sig10_col] = False
+    if sig10_col is not None:
+        out[sig10_col] = False
     if out.empty or family_col not in out.columns or p_col not in out.columns:
         return out
 
@@ -704,7 +708,6 @@ def adjust_pvalues_bh_within_family(
             continue
         if _have_sm:
             rej5, q5, _, _ = multipletests(pvals, alpha=0.05, method="fdr_bh")
-            rej10, _, _, _ = multipletests(pvals, alpha=0.10, method="fdr_bh")
         else:
             # Pure-numpy fallback.
             order = np.argsort(pvals)
@@ -716,8 +719,9 @@ def adjust_pvalues_bh_within_family(
             q5 = np.empty(n, dtype=float)
             q5[order] = q
             rej5  = q5 < 0.05
-            rej10 = q5 < 0.10
         out.loc[mask, q_col]     = q5
         out.loc[mask, sig5_col]  = rej5
-        out.loc[mask, sig10_col] = rej10
+        if sig10_col is not None:
+            rej10 = q5 < 0.10
+            out.loc[mask, sig10_col] = rej10
     return out
