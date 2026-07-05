@@ -412,31 +412,39 @@ def test_full_evaluation_writes_excel_and_csvs(signals_env):
                  "threshold_lift.csv", "mcnemar_tests.csv",
                  "regime_mcnemar_tests.csv", "regime_mcnemar_summary.csv"):
         assert (out_dir / name).exists()
-    # The regime McNemar table must carry the BH/FDR + direction columns even
-    # if every cell is below the validity thresholds on this small sample.
+    # The regime McNemar table is DESCRIPTIVE ONLY: raw direction + effect
+    # columns, but NO BH q-value / BH significance (superseded by the
+    # confirmatory difference-in-improvement, Families C/D).
     regime = pd.read_csv(out_dir / "regime_mcnemar_tests.csv")
     for col in ("regime_type", "direction", "net_improvement",
-                "discordant_advantage", "q_value_bh", "test_valid",
-                "significant_bh_5pct", "model_better_bh_5pct",
-                "benchmark_better_bh_5pct"):
+                "discordant_advantage", "mcnemar_pval", "test_valid"):
         assert col in regime.columns
-    # Pooled CSV must carry both the disambiguated McNemar columns AND the
-    # legacy back-compat aliases. v4: the single matched benchmark is ECON,
-    # so the disambiguated column is `mcnemar_pval_vs_econ`.
+    for col in ("q_value_bh", "significant_bh_5pct", "model_better_bh_5pct",
+                "benchmark_better_bh_5pct"):
+        assert col not in regime.columns
+    # Pooled CSV carries the raw McNemar-vs-econ reference AND a single
+    # BH-corrected directional verdict; the uncorrected booleans are gone.
     pooled = pd.read_csv(out_dir / "pooled_metrics.csv")
     assert set(pooled["set_id"]) == {"ECON", "SENT_VAD_L", "ECON_VAD_F"}
-    for col in ("mcnemar_pval_vs_econ", "significant_vs_econ",
-                "mcnemar_pval", "significant_vs_benchmark"):
+    for col in ("mcnemar_pval_vs_econ", "mcnemar_q_value_bh_vs_econ",
+                "mcnemar_significant_bh_vs_econ", "family"):
         assert col in pooled.columns
+    # No uncorrected directional significance boolean survives.
+    assert "significant_vs_econ" not in pooled.columns
+    assert "significant_vs_benchmark" not in pooled.columns
     # ECON's McNemar columns are NaN (you don't test ECON vs ECON);
     # sentiment/combined have a real test.
     bench = pooled[pooled["set_id"] == "ECON"].iloc[0]
     assert pd.isna(bench["mcnemar_pval_vs_econ"])
     sent = pooled[pooled["set_id"] == "SENT_VAD_L"].iloc[0]
     assert pd.notna(sent["mcnemar_pval_vs_econ"])
-    # Backward-compat alias mirrors the ECON value.
-    assert pd.isna(bench["mcnemar_pval"])
-    assert pd.notna(sent["mcnemar_pval"])
+    # The ECON benchmark row carries no directional verdict at all.
+    assert pd.isna(bench["mcnemar_q_value_bh_vs_econ"])
+    # Combined (ECON_VAD_F) rows are tagged Family B; sentiment-only (SENT_*)
+    # rows are tagged the exploratory family.
+    comb = pooled[pooled["set_id"] == "ECON_VAD_F"].iloc[0]
+    assert comb["family"] == "B_H1_directional"
+    assert sent["family"] == "EXPL_sentiment_only_directional"
 
     # threshold_lift.csv must be populated for sentiment/combined sets and
     # carry lift_accuracy = accuracy_model − accuracy_benchmark.
@@ -513,10 +521,52 @@ def test_confirmatory_outputs_and_sanity(signals_env):
             assert "q_value_bh" not in avn.columns
             assert "significant_bh" not in avn.columns
 
-    # ── manifest lists only confirmatory families ─────────────────
+    # ── manifest: confirmatory A–E + exploratory sentiment-only ───
     man = pd.read_csv(out_dir / "multiple_testing_manifest.csv")
     assert not man["family"].astype(str).str.contains("absolute_vs_naive").any()
     assert not man["family"].astype(str).str.contains("regime_mcnemar").any()
+    assert "family_role" in man.columns
+    conf = man[man["family_role"] == "confirmatory"]
+    assert set(conf["family"]) == {
+        "A_H1_logloss", "B_H1_directional", "C_H2_volatility",
+        "D_H3_marketcap", "E1_horizon_logloss", "E2_horizon_accuracy"}
+    # The exploratory sentiment-only directional family is present and
+    # marked exploratory (SENT_VAD_L is in the fixture).
+    expl = man[man["family_role"] == "exploratory"]
+    assert list(expl["family"]) == ["EXPL_sentiment_only_directional"]
+
+    # ── FIX 2: pooled directional dedup — one BH verdict per (h,set) ──
+    pooled = pd.read_csv(out_dir / "pooled_metrics.csv")
+    assert "significant_vs_econ" not in pooled.columns
+    assert "significant_vs_benchmark" not in pooled.columns
+    for col in ("mcnemar_q_value_bh_vs_econ", "mcnemar_significant_bh_vs_econ",
+                "family"):
+        assert col in pooled.columns
+    # No NaN verdict on any row that carries a non-null raw p-value.
+    tested = pooled[pooled["mcnemar_pval_vs_econ"].notna()]
+    assert tested["mcnemar_q_value_bh_vs_econ"].notna().all()
+    assert tested["mcnemar_significant_bh_vs_econ"].notna().all()
+    # Combined rows equal Family B; sentiment-only rows equal the EXPL BH.
+    b_lookup = ok.set_index(["horizon", "set_id"])[
+        ["q_value_bh", "significant_bh"]]
+    for _, pr in pooled[pooled["set_id"] == "ECON_VAD_F"].iterrows():
+        assert pr["family"] == "B_H1_directional"
+        key = (pr["horizon"], pr["set_id"])
+        if key in b_lookup.index:
+            fam_b = b_lookup.loc[key]
+            assert np.isclose(float(pr["mcnemar_q_value_bh_vs_econ"]),
+                              float(fam_b["q_value_bh"]), atol=1e-12)
+            assert (bool(pr["mcnemar_significant_bh_vs_econ"])
+                    == bool(fam_b["significant_bh"]))
+    for _, pr in pooled[pooled["set_id"] == "SENT_VAD_L"].iterrows():
+        assert pr["family"] == "EXPL_sentiment_only_directional"
+
+    # ── FIX 3: accuracy-effect parity column ──────────────────────
+    assert "acc_effect_ntweighted" in inc.columns
+    parity = ok.dropna(subset=["acc_effect_ntweighted", "accuracy_lift"])
+    if not parity.empty:
+        assert np.allclose(parity["acc_effect_ntweighted"].to_numpy(float),
+                           parity["accuracy_lift"].to_numpy(float), atol=1e-9)
 
 
 def test_no_volatility_flag_skips_regime_step(signals_env):

@@ -289,13 +289,13 @@ _REGIME_FRONT_COLS = [
     "improvement_rate", "discordant_advantage",
     # Raw counts
     "b", "c", "n_matched", "discordant_n",
-    # Significance (p / q never hidden)
-    "mcnemar_stat", "mcnemar_pval", "q_value_bh",
+    # Significance — RAW ONLY. Regime McNemar is descriptive (superseded by
+    # the confirmatory difference-in-improvement, Families C/D): it carries
+    # the raw p-value and raw threshold flags but NO BH q-value.
+    "mcnemar_stat", "mcnemar_pval",
     "significant_5pct", "significant_10pct",
-    "significant_bh_5pct",
-    # Direction-aware significance
+    # Direction-aware RAW significance.
     "model_better_raw_5pct", "benchmark_better_raw_5pct",
-    "model_better_bh_5pct", "benchmark_better_bh_5pct",
     "practical_effect_flag", "test_valid",
 ]
 
@@ -612,13 +612,10 @@ def regime_mcnemar_table(signals: pd.DataFrame,
     for col in ("vol_regime", "mcap_regime", "interaction"):
         if col not in out.columns:
             out[col] = np.nan
-    out = adjust_pvalues_bh(out, "mcnemar_pval")
-
-    # Direction-aware BH flags (McNemar is symmetric → split by direction).
-    direction = out.get("direction", pd.Series(["tie"] * len(out)))
-    bh5 = out.get("significant_bh_5pct", pd.Series([False] * len(out))).fillna(False)
-    out["model_better_bh_5pct"]     = bh5 & (direction == "model_better")
-    out["benchmark_better_bh_5pct"] = bh5 & (direction == "benchmark_better")
+    # DESCRIPTIVE ONLY (commit 16): the confirmatory H2/H3 surface is the
+    # cluster-robust difference-in-improvement (Families C/D). This
+    # superseded per-regime McNemar carries the RAW p-value only — no
+    # Benjamini-Hochberg q-value and no BH significance boolean.
 
     ordered = [c for c in _REGIME_FRONT_COLS if c in out.columns]
     rest = [c for c in out.columns if c not in ordered]
@@ -653,7 +650,7 @@ def build_regime_mcnemar_summary(regime_mcnemar_df: pd.DataFrame) -> pd.DataFram
             "regime_type", "mcap_regime", "vol_regime", "interaction",
             "direction", "net_improvement", "improvement_rate",
             "discordant_advantage", "n_matched", "discordant_n",
-            "mcnemar_pval", "q_value_bh"]
+            "mcnemar_pval"]
     if regime_mcnemar_df is None or regime_mcnemar_df.empty:
         return pd.DataFrame(columns=cols)
 
@@ -670,20 +667,19 @@ def build_regime_mcnemar_summary(regime_mcnemar_df: pd.DataFrame) -> pd.DataFram
 
     rows: list[dict] = []
 
+    # Descriptive-only sorts: raw-significant first, then net_improvement.
+    # (Regime McNemar carries no BH q-value — Families C/D are confirmatory.)
     def _sorted_model(frame: pd.DataFrame) -> pd.DataFrame:
-        # BH-significant first, then q ascending, then net_improvement desc.
         f = frame.copy()
-        f["_bh"] = f.get("significant_bh_5pct", False).fillna(False).astype(int)
-        f["_q"] = f.get("q_value_bh", np.nan)
-        return f.sort_values(["_bh", "_q", "net_improvement"],
-                             ascending=[False, True, False])
+        f["_sig"] = f.get("significant_5pct", False).fillna(False).astype(int)
+        return f.sort_values(["_sig", "net_improvement"],
+                             ascending=[False, False])
 
     def _sorted_bench(frame: pd.DataFrame) -> pd.DataFrame:
         f = frame.copy()
-        f["_bh"] = f.get("significant_bh_5pct", False).fillna(False).astype(int)
-        f["_q"] = f.get("q_value_bh", np.nan)
-        return f.sort_values(["_bh", "_q", "net_improvement"],
-                             ascending=[False, True, True])
+        f["_sig"] = f.get("significant_5pct", False).fillna(False).astype(int)
+        return f.sort_values(["_sig", "net_improvement"],
+                             ascending=[False, True])
 
     model = df[df["direction"] == "model_better"]
     bench = df[df["direction"] == "benchmark_better"]
@@ -693,18 +689,12 @@ def build_regime_mcnemar_summary(regime_mcnemar_df: pd.DataFrame) -> pd.DataFram
                          _sorted_model(model[model.get("significant_5pct", False) == True]  # noqa: E712
                                        if (model.get("significant_5pct", False) == True).any()  # noqa: E712
                                        else model).iloc[0]))
-        bh_model = model[model.get("significant_bh_5pct", False) == True]  # noqa: E712
-        if not bh_model.empty:
-            rows.append(_row("top_model_better_bh", _sorted_model(bh_model).iloc[0]))
 
     if not bench.empty:
         rows.append(_row("top_benchmark_better_raw",
                          _sorted_bench(bench[bench.get("significant_5pct", False) == True]  # noqa: E712
                                        if (bench.get("significant_5pct", False) == True).any()  # noqa: E712
                                        else bench).iloc[0]))
-        bh_bench = bench[bench.get("significant_bh_5pct", False) == True]  # noqa: E712
-        if not bh_bench.empty:
-            rows.append(_row("top_benchmark_better_bh", _sorted_bench(bh_bench).iloc[0]))
 
     # Interaction-specific highlights (model side).
     inter = model[model["regime_type"] == "interaction"]
