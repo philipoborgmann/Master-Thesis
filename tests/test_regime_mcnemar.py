@@ -187,9 +187,13 @@ def test_regime_mcnemar_volatility_only():
     assert not out.empty
     assert set(out["regime_type"]) == {"volatility"}
     assert set(out["vol_regime"].dropna()) <= {"low", "mid", "high"}
-    # BH columns present
-    for c in ("q_value_bh", "significant_bh_5pct"):
-        assert c in out.columns
+    # DESCRIPTIVE ONLY: regime McNemar carries the RAW p-value but NO BH
+    # q-value / BH significance (the confirmatory H2/H3 surface is the
+    # cluster-robust difference-in-improvement, Families C/D).
+    assert "mcnemar_pval" in out.columns
+    for c in ("q_value_bh", "significant_bh_5pct",
+              "model_better_bh_5pct", "benchmark_better_bh_5pct"):
+        assert c not in out.columns
 
 
 def test_regime_mcnemar_market_cap_only():
@@ -399,21 +403,23 @@ def test_raw_direction_flags():
         assert not high["benchmark_better_raw_5pct"]
 
 
-def test_bh_direction_flags_present_after_table():
+def test_regime_table_is_descriptive_raw_only():
     signals = _plain_signals(n=400, seed=20)
     dates = pd.date_range("2024-01-01", periods=400, freq="D", tz="UTC")
     out = sig.regime_mcnemar_table(signals, vol_lookup=_vol_lookup(dates),
                                    mcap_lookup=None, benchmarks=("B1",),
                                    min_n_matched=10, min_discordant=5)
-    for col in ("model_better_bh_5pct", "benchmark_better_bh_5pct",
-                "model_better_raw_5pct", "benchmark_better_raw_5pct",
-                "net_improvement", "direction", "discordant_advantage",
-                "improvement_rate", "practical_effect_flag"):
+    # Raw descriptive columns (p-value, direction, effect size) are present.
+    for col in ("mcnemar_pval", "model_better_raw_5pct",
+                "benchmark_better_raw_5pct", "net_improvement", "direction",
+                "discordant_advantage", "improvement_rate",
+                "practical_effect_flag"):
         assert col in out.columns
-    # BH flags are a subset of the symmetric BH significance.
-    bh = out["significant_bh_5pct"].fillna(False)
-    assert (out["model_better_bh_5pct"].fillna(False) <= bh).all()
-    assert (out["benchmark_better_bh_5pct"].fillna(False) <= bh).all()
+    # BH q-value / BH significance are NOT emitted (descriptive surface,
+    # superseded by the confirmatory difference-in-improvement C/D).
+    for col in ("q_value_bh", "significant_bh_5pct",
+                "model_better_bh_5pct", "benchmark_better_bh_5pct"):
+        assert col not in out.columns
 
 
 # ---------------------------------------------------------------------------
@@ -434,9 +440,11 @@ def test_build_regime_mcnemar_summary_top_rows():
         assert "section" in summary.columns
         # Each section appears at most once.
         assert summary["section"].is_unique
-        # Direction and net_improvement columns surfaced.
-        for c in ("direction", "net_improvement", "q_value_bh"):
+        # Direction and net_improvement columns surfaced; the raw p-value is
+        # kept but the BH q-value is NOT (descriptive-only surface).
+        for c in ("direction", "net_improvement", "mcnemar_pval"):
             assert c in summary.columns
+        assert "q_value_bh" not in summary.columns
 
 
 def test_build_regime_mcnemar_summary_empty_input_no_crash():

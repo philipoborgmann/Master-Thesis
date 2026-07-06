@@ -37,7 +37,7 @@ from .preregistration import (
     ALPHA_PRESPECIFIED, CLASS_IMBALANCE_DELTA, DM_INFERENCE, FAMILY_E_METRICS,
     FAMILY_A_H1_LOGLOSS, FAMILY_B_H1_DIRECTIONAL, FAMILY_C_H2_VOLATILITY,
     FAMILY_D_H3_MARKETCAP, FAMILY_E1_HORIZON_LOGLOSS, FAMILY_E2_HORIZON_ACCURACY,
-    METRIC_ROLES,
+    FAMILY_EXPL_SENTIMENT_DIRECTIONAL, METRIC_ROLES,
 )
 
 @dataclass
@@ -49,6 +49,7 @@ class ConfirmatoryResult:
     metric_roles: pd.DataFrame
     class_balance: pd.DataFrame
     dm_effects: pd.DataFrame = field(default_factory=pd.DataFrame)
+    pooled: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 # ---------------------------------------------------------------------------
@@ -209,10 +210,12 @@ def finalize_confirmatory_families(*,
                                    signals: pd.DataFrame,
                                    incremental_df: pd.DataFrame,
                                    diff_df: pd.DataFrame,
+                                   pooled_df: pd.DataFrame | None = None,
                                    alpha: float = ALPHA_PRESPECIFIED,
                                    ) -> ConfirmatoryResult:
     inc = incremental_df.copy() if incremental_df is not None else pd.DataFrame()
     dif = diff_df.copy() if diff_df is not None else pd.DataFrame()
+    pool = pooled_df.copy() if pooled_df is not None else pd.DataFrame()
 
     class_balance = build_class_balance(signals)
     metric_roles = build_metric_roles(class_balance)
@@ -282,11 +285,20 @@ def finalize_confirmatory_families(*,
     dif = _apply_families_to_diff(dif, corrected, alpha)
     horizon_comparison = _build_horizon_comparison(horizon_rows, corrected, alpha)
 
+    # ── pooled_metrics directional dedup (FIX 2) ─────────────────
+    # Exactly one BH-corrected directional verdict per (horizon, set):
+    # combined ECON_* rows inherit Family B; sentiment-only SENT_* rows form
+    # the exploratory EXPL family (BH within it). The exploratory family is
+    # appended to the manifest and NEVER alters the A–E counts.
+    pool, expl_manifest = _apply_directional_to_pooled(pool, corrected, alpha)
+    if expl_manifest is not None and not expl_manifest.empty:
+        manifest = pd.concat([manifest, expl_manifest], ignore_index=True)
+
     return ConfirmatoryResult(
         incremental=inc, diff=dif,
         horizon_comparison=horizon_comparison, manifest=manifest,
         metric_roles=metric_roles, class_balance=class_balance,
-        dm_effects=dm,
+        dm_effects=dm, pooled=pool,
     )
 
 
@@ -296,6 +308,93 @@ def _corrected_lookup(corrected: pd.DataFrame, family: str) -> dict:
     sub = corrected[corrected["family"] == family]
     return {tid: (q, sig) for tid, q, sig in
             zip(sub["test_id"], sub["q_value_bh"], sub["significant_bh"])}
+
+
+def _apply_directional_to_pooled(pool, corrected, alpha):
+    """Deduplicate the directional McNemar in pooled_metrics to a SINGLE
+    BH-corrected verdict per (horizon, set).
+
+    * Combined ``ECON_*`` rows (nested H1 members) inherit Family B's
+      corrected verdict.
+    * Sentiment-only ``SENT_*`` rows are NOT in Family B; they form the
+      exploratory ``EXPL_sentiment_only_directional`` family (ECON-vs-SENT
+      McNemar, BH within the family).
+    Both write into ``mcnemar_q_value_bh_vs_econ`` /
+    ``mcnemar_significant_bh_vs_econ`` tagged with the family label in
+    ``family``. The uncorrected booleans ``significant_vs_econ`` /
+    ``significant_vs_benchmark`` are dropped so no uncorrected directional
+    verdict survives. The ECON benchmark row (no McNemar) stays null.
+
+    Returns ``(pooled_enriched, exploratory_manifest_or_None)``.
+    """
+    if pool is None or pool.empty:
+        return pool, None
+    pool = pool.copy()
+    pv_col = "mcnemar_pval_vs_econ"
+
+    def _drop_uncorrected(df):
+        for c in ("significant_vs_econ", "significant_vs_benchmark"):
+            if c in df.columns:
+                df = df.drop(columns=c)
+        return df
+
+    if pv_col not in pool.columns:
+        # No McNemar surface to reconcile (e.g. regime/mcnemar disabled).
+        return _drop_uncorrected(pool), None
+
+    set_ids = pool["set_id"].astype(str)
+    is_combined = set_ids.isin(MATCHED_ECONOMIC_BENCHMARK)
+    has_p = pool[pv_col].notna()
+
+    # Build + BH-correct the exploratory sentiment-only family from the
+    # SENT_* (tested, non-combined) rows.
+    expl_records = []
+    for _, r in pool[has_p & (~is_combined)].iterrows():
+        expl_records.append({
+            "test_id": mt.make_test_id(FAMILY_EXPL_SENTIMENT_DIRECTIONAL,
+                                       r["horizon"], r["set_id"]),
+            "family": FAMILY_EXPL_SENTIMENT_DIRECTIONAL,
+            "horizon": r["horizon"], "model": r.get("sentiment_model"),
+            "set_id": r["set_id"], "metric": "accuracy",
+            "p_value_raw": r[pv_col],
+        })
+    expl_df = pd.DataFrame(expl_records, columns=list(mt.RECORD_COLUMNS))
+    expl_corrected = (mt.apply_family_bh(expl_df, alpha=alpha)
+                      if not expl_df.empty else expl_df)
+    expl_look = _corrected_lookup(expl_corrected,
+                                  FAMILY_EXPL_SENTIMENT_DIRECTIONAL)
+    b_look = _corrected_lookup(corrected, FAMILY_B_H1_DIRECTIONAL)
+
+    n = len(pool)
+    q = np.full(n, np.nan)
+    sig = np.array([None] * n, dtype=object)   # None ⇒ null (ECON row)
+    fam = np.array([None] * n, dtype=object)
+    for i, (_, r) in enumerate(pool.iterrows()):
+        sid = str(r["set_id"])
+        hz = r["horizon"]
+        if sid in MATCHED_ECONOMIC_BENCHMARK:
+            tid = mt.make_test_id(FAMILY_B_H1_DIRECTIONAL, hz, sid)
+            if tid in b_look:
+                qv, sv = b_look[tid]
+                q[i] = qv; sig[i] = bool(sv); fam[i] = FAMILY_B_H1_DIRECTIONAL
+        elif pd.notna(r[pv_col]):
+            tid = mt.make_test_id(FAMILY_EXPL_SENTIMENT_DIRECTIONAL, hz, sid)
+            if tid in expl_look:
+                qv, sv = expl_look[tid]
+                q[i] = qv; sig[i] = bool(sv)
+                fam[i] = FAMILY_EXPL_SENTIMENT_DIRECTIONAL
+    pool["family"] = fam
+    pool["mcnemar_q_value_bh_vs_econ"] = q
+    pool["mcnemar_significant_bh_vs_econ"] = sig
+    pool = _drop_uncorrected(pool)
+
+    expl_manifest = None
+    if not expl_df.empty:
+        expl_manifest = mt.build_manifest(
+            expl_corrected, alpha=alpha,
+            families=(FAMILY_EXPL_SENTIMENT_DIRECTIONAL,),
+            family_role="exploratory")
+    return pool, expl_manifest
 
 
 def _apply_families_to_incremental(inc, dm, corrected, alpha):
@@ -311,11 +410,15 @@ def _apply_families_to_incremental(inc, dm, corrected, alpha):
     inc["family"] = FAMILY_B_H1_DIRECTIONAL
     inc["alpha_prespecified"] = float(alpha)
     inc["p_value_raw"] = inc["mcnemar_p_value"]
-    # Merge the log-loss DM effect columns (Family A) by (horizon, set).
+    # Merge the log-loss DM effect columns (Family A) plus the accuracy
+    # timestamp-effect parity columns (mirroring ll_effect / ll_effect_
+    # ntweighted) by (horizon, set). acc_effect_ntweighted == accuracy_lift
+    # up to floating tolerance (Nt-weighting recovers the pooled lift).
     a_cols = ["ll_effect", "ll_effect_ntweighted", "ll_se_hac", "ll_se_boot",
               "ll_ci95_low", "ll_ci95_high", "ll_z_hac", "ll_p_hac",
               "ll_p_boot", "ll_p_value_raw", "dm_nested_caveat",
-              "n_timestamps", "hac_lag", "block_length"]
+              "n_timestamps", "hac_lag", "block_length",
+              "acc_effect", "acc_effect_ntweighted"]
     if not dm.empty:
         inc = inc.merge(dm[["horizon", "set_id"] + a_cols],
                         on=["horizon", "set_id"], how="left")

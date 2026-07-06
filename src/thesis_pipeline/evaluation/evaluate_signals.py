@@ -568,6 +568,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         signals=signals,
         incremental_df=incremental_df,
         diff_df=diff_in_improvement_df,
+        pooled_df=pooled,
     )
     incremental_df          = confirmatory.incremental
     diff_in_improvement_df  = confirmatory.diff
@@ -575,6 +576,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     multiple_testing_manifest_df = confirmatory.manifest
     metric_roles_df         = confirmatory.metric_roles
     class_balance_df        = confirmatory.class_balance
+    if not confirmatory.pooled.empty:
+        pooled = confirmatory.pooled
 
     # ── 9. Leaderboard + thesis-style summary ───────────────────
     leaderboard = build_leaderboard(pooled)

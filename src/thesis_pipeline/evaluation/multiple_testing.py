@@ -105,12 +105,17 @@ def apply_family_bh(records: pd.DataFrame,
 def build_manifest(corrected: pd.DataFrame,
                    *,
                    alpha: float = ALPHA_PRESPECIFIED,
-                   families: tuple = CONFIRMATORY_FAMILIES) -> pd.DataFrame:
-    """One row per confirmatory family: description, n_tests,
-    alpha_prespecified, n_significant_bh, correction, member test count.
+                   families: tuple = CONFIRMATORY_FAMILIES,
+                   family_role: str = "confirmatory") -> pd.DataFrame:
+    """One row per family: description, n_tests, alpha_prespecified,
+    n_significant_bh, correction, family_role, member test count.
 
-    Only the pre-registered confirmatory families are listed — descriptive
-    surfaces are excluded by construction (they never receive a family).
+    ``family_role`` tags every row emitted here (``"confirmatory"`` by
+    default). Exploratory families are appended by the caller with
+    ``family_role="exploratory"`` so a reviewer can tell the pre-registered
+    confirmatory set apart from post-hoc exploratory families at a glance.
+    Descriptive surfaces (regime_mcnemar, absolute_vs_naive) never receive a
+    family and so never appear here.
     """
     rows = []
     for fam in families:
@@ -123,6 +128,7 @@ def build_manifest(corrected: pd.DataFrame,
                       if n_tests else [])
         rows.append({
             "family":              fam,
+            "family_role":         family_role,
             "description":         FAMILY_DESCRIPTIONS.get(fam, ""),
             "n_tests":             n_tests,
             "alpha_prespecified":  float(alpha),

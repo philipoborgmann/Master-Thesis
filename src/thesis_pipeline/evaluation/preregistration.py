@@ -122,6 +122,23 @@ FAMILY_DESCRIPTIONS = {
         "(independent-sample z on bootstrap SEs).",
 }
 
+#: EXPLORATORY families. BH-corrected WITHIN the family (like the
+#: confirmatory ones) but reported as exploratory — they are NOT part of
+#: the pre-registered confirmatory set and must never alter the A–E
+#: counts. Listed in the manifest with ``family_role="exploratory"``.
+FAMILY_EXPL_SENTIMENT_DIRECTIONAL = "EXPL_sentiment_only_directional"
+
+EXPLORATORY_FAMILIES = (
+    FAMILY_EXPL_SENTIMENT_DIRECTIONAL,
+)
+
+FAMILY_DESCRIPTIONS[FAMILY_EXPL_SENTIMENT_DIRECTIONAL] = (
+    "EXPLORATORY (not confirmatory): sentiment-only SENT_* vs ECON "
+    "directional McNemar, 3 horizons × 8 SENT sets, BH within family. "
+    "These sets are not nested H1 members (Family B covers only the "
+    "combined ECON_* sets)."
+)
+
 #: Descriptive / separate surfaces that must NEVER be assigned a
 #: confirmatory family or a q-value.
 DESCRIPTIVE_SURFACES = (
