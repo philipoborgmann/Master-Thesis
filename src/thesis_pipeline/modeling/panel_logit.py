@@ -102,13 +102,21 @@ def build_panel_design_matrix(train_df: pd.DataFrame,
                               ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Build (X_train, y_train, X_test).
 
-    Continuous features are standardised with a scaler fit on the training
-    rows only. For ``ticker_fixed_effects`` the (unscaled 0/1) ticker dummies
-    are concatenated after the scaled continuous block.
+    Preprocessing is leakage-safe: continuous features are first winsorised
+    with training-window thresholds fit on ``train_df`` ONLY (ticker-specific
+    inside the window, pooled fallback), then standardised with a scaler also
+    fit on the (winsorised) training rows only. The same frozen thresholds and
+    scaler are applied to ``test_df``. For ``ticker_fixed_effects`` the
+    (unscaled 0/1) ticker dummies are concatenated after the scaled continuous
+    block.
     """
+    from .preprocessing import TrainingWindowWinsorizer
+    winsorizer = TrainingWindowWinsorizer(feature_cols).fit(train_df)
+    train_w = winsorizer.transform(train_df)
+    test_w = winsorizer.transform(test_df)
     scaler = StandardScaler()
-    X_tr = scaler.fit_transform(train_df[feature_cols].values.astype(float))
-    X_te = scaler.transform(test_df[feature_cols].values.astype(float))
+    X_tr = scaler.fit_transform(train_w[feature_cols].values.astype(float))
+    X_te = scaler.transform(test_w[feature_cols].values.astype(float))
 
     if panel_mode == "ticker_fixed_effects":
         tr_d, te_d = add_ticker_fixed_effects(train_df["ticker"], test_df["ticker"])
@@ -724,6 +732,19 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
     tune_on = bool(hpo_cfg["enabled"])
     hpo_variant = hpo_variant_label(tune_on, hpo_cfg["objective"])
 
+    # ── Preprocessing signature (Section 4 — cache/checkpoint invalidation) ──
+    # Covers winsorisation on/off + quantile bounds + grouping rule + feature
+    # allowlist (from modeling.preprocessing config) plus the model training
+    # window and the HPO objective. Old checkpoints / signal files produced
+    # under a different preprocessing methodology are detected and rejected.
+    from .preprocessing import preprocessing_signature as _preprocessing_signature
+    _preproc_window = (f"{train_window_mode}|days={rolling_window_days}"
+                       f"|ts={rolling_window_timestamps}")
+    preproc_sig = _preprocessing_signature(
+        model_window=_preproc_window,
+        hpo_objective=(hpo_cfg["objective"] if tune_on else "-"),
+    )
+
     # ── Checkpointing config ────────────────────────────────────
     from . import checkpointing as ckpt
     ckpt_on    = bool(getattr(args, "checkpoint", True))
@@ -857,6 +878,17 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                 try:
                     from .hyperparameter_tuning import summarize_hpo_columns
                     cached = pd.read_parquet(out_path)
+                    # Reject a cached signal file produced under a different
+                    # preprocessing methodology (Section 4.4) — a pre-winsoriser
+                    # signal must never be mistaken for the corrected final run.
+                    cached_sig = (str(cached.get("preprocessing_signature",
+                                                 pd.Series([""])).iat[0])
+                                  if not cached.empty else "")
+                    if cached_sig != preproc_sig:
+                        print(f"\n  ── {out_name} ({label}) → cache preprocessing "
+                              f"signature mismatch (cached={cached_sig or 'none'} "
+                              f"!= {preproc_sig}); recomputing")
+                        raise ValueError("preprocessing_signature_mismatch")
                     m = compute_metrics(cached, "pooled")
                     m.update({"horizon": hz, "set_id": set_id,
                               "sentiment_model": sent_model, "label": label,
@@ -902,6 +934,8 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                 "rolling_window_timestamps": rolling_window_timestamps,
                 "rolling_window_days":       rolling_window_days,
                 "benchmark":                 bool(is_benchmark),
+                # Preprocessing methodology signature (Section 4).
+                "preprocessing_signature":   preproc_sig,
                 # Universe identity (commit 4 A.4). Checkpoints created
                 # for a smaller universe must NOT resume a larger run.
                 "requested_tickers":            list(requested_tickers),
@@ -916,6 +950,7 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                 guard_keys = ("train_window_mode", "rolling_window_timestamps",
                               "rolling_window_days", "feature_cols",
                               "hpo_objective", "panel_mode", "benchmark",
+                              "preprocessing_signature",
                               "requested_coin_universe_hash",
                               "requested_tickers")
                 if existing and any(existing.get(k) != manifest_base.get(k)
@@ -1002,6 +1037,9 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                 requested_universe=requested_tickers,
                 available_universe=available_tickers,
             )
+            # Preprocessing-methodology stamp (Section 4.4): so an old signal
+            # file can never be mistaken for the corrected final run.
+            signals["preprocessing_signature"] = preproc_sig
             # ── Output-schema assertion (commit 10) ───────────────
             # Refuse to write a rolling-window parquet that is missing
             # any of the canonical training-window columns. This is

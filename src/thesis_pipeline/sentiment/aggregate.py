@@ -19,10 +19,18 @@ This module therefore:
 * never uses ``retrieved`` as an input to a feature.
 
 Bucketing is unchanged (post ``date`` → ``ticker × timestamp`` slots, all
-floored to the slot start), and per-slot moments (mean / median / std),
-the per-model bullishness ratio, post_count, and winsorisation are
-unchanged. New per-model column ``{m}_directional_post_count`` records
-the count of non-neutral posts in the slot for diagnostics.
+floored to the slot start — ``timestamp`` is the interval-START label of the
+completed interval ``[t, t+h)``), and per-slot moments (mean / median / std),
+the per-model bullishness ratio and post_count are unchanged. New per-model
+column ``{m}_directional_post_count`` records the count of non-neutral posts
+in the slot for diagnostics.
+
+Full-sample winsorisation of the aggregated sentiment features was REMOVED:
+clipping every slot at quantiles computed over the whole horizon sample uses
+future observations to transform earlier ones (look-ahead leakage). Sentiment
+features are written RAW; leakage-safe outlier control (for the unbounded
+``log1p_post_count``) happens inside the model via the training-window
+winsoriser (:mod:`thesis_pipeline.modeling.preprocessing`).
 
 Input:
     - Data/Transformed/Sentiment_Scored_Vader.csv
@@ -271,61 +279,15 @@ def aggregate_to_horizon(df: pd.DataFrame, freq: str,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5b. WINSORIZATION
+# 5b. (removed) FULL-SAMPLE WINSORIZATION
 # ══════════════════════════════════════════════════════════════════════════════
-
-# Percentile bounds for winsorization (0.5% each tail)
-WINSOR_LOWER = 0.005
-WINSOR_UPPER = 0.995
-
-
-def winsorize_features(aggregated: dict) -> dict:
-    """
-    Clips numeric feature columns at the 0.5th and 99.5th percentile to
-    reduce the influence of extreme outliers on downstream models.
-
-    Winsorization is applied globally per column (across all tickers and
-    time slots within a horizon). Columns excluded from clipping: ticker,
-    timestamp, post_count, and any boolean/string columns.
-
-    Returns the same dict with clipped DataFrames.
-    """
-    # Columns that should never be winsorized. Per-model directional counts
-    # are integers and are kept exact.
-    skip_cols = {"ticker", "timestamp", "post_count"}
-    for hz_label, df_hz in aggregated.items():
-        skip_dyn = skip_cols | {c for c in df_hz.columns
-                                if c.endswith("_directional_post_count")}
-        numeric_cols = [
-            c for c in df_hz.select_dtypes(include=[np.number]).columns
-            if c not in skip_dyn
-        ]
-
-        n_clipped_total = 0
-        n_values_total = 0
-
-        for col in numeric_cols:
-            vals = df_hz[col].dropna()
-            if len(vals) < 20:
-                continue
-
-            lo = vals.quantile(WINSOR_LOWER)
-            hi = vals.quantile(WINSOR_UPPER)
-
-            n_below = (df_hz[col] < lo).sum()
-            n_above = (df_hz[col] > hi).sum()
-            n_clipped_total += n_below + n_above
-            n_values_total += vals.shape[0]
-
-            df_hz[col] = df_hz[col].clip(lower=lo, upper=hi)
-
-        pct = n_clipped_total / n_values_total * 100 if n_values_total > 0 else 0
-        print(f"  {hz_label}: {n_clipped_total:,} values clipped across "
-              f"{len(numeric_cols)} columns ({pct:.2f}%)")
-
-        aggregated[hz_label] = df_hz
-
-    return aggregated
+#
+# The former ``winsorize_features`` helper clipped every aggregated sentiment
+# column at the 0.5 / 99.5 percentile computed over the WHOLE horizon sample.
+# That transforms earlier slots using future observations (look-ahead leakage)
+# and has been removed. Sentiment features are written raw; leakage-safe
+# outlier control lives in :mod:`thesis_pipeline.modeling.preprocessing`
+# (training-window winsorisation, fitted only on the current training data).
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -610,11 +572,13 @@ def main(argv=None):
     for label, freq in HORIZONS.items():
         aggregated[label] = aggregate_to_horizon(df, freq, label)
 
-    # Step 4: Winsorize outliers
+    # Step 4: (removed) full-sample winsorisation — sentiment features are
+    # written RAW. Leakage-safe outlier control happens inside the model via
+    # the training-window winsoriser (thesis_pipeline.modeling.preprocessing).
     print("\n" + "=" * 60)
-    print("STEP 4: Winsorizing outliers (0.5th / 99.5th percentile)")
+    print("STEP 4: Outlier control — DISABLED at feature time "
+          "(leakage-safe training-window winsorisation runs in-model)")
     print("=" * 60)
-    aggregated = winsorize_features(aggregated)
 
     # Step 5: Coverage statistics
     print("\n" + "=" * 60)

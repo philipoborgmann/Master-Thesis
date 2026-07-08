@@ -407,8 +407,17 @@ def fit_logistic_model(train_df: pd.DataFrame,
         max_iter=_MAX_ITER,
         random_state=_RANDOM_STATE,
     )
+    # ── Leakage-safe preprocessing order: winsorise (thresholds fit on THIS
+    # training frame only) → StandardScaler.fit → model.fit. When this is
+    # called with the inner-train block (during the grid search) the
+    # thresholds see only inner-train; when called with the full outer
+    # training window (final refit) they see only that window. The scaler is
+    # always fit AFTER winsorisation and only on training data.
+    from .preprocessing import TrainingWindowWinsorizer
+    winsorizer = TrainingWindowWinsorizer(feature_cols).fit(train_df)
+    train_w = winsorizer.transform(train_df)
     scaler = StandardScaler()
-    X = scaler.fit_transform(train_df[feature_cols].values.astype(float))
+    X = scaler.fit_transform(train_w[feature_cols].values.astype(float))
     dummy_cols: list[str] | None = None
     if family == PANEL and panel_mode == "ticker_fixed_effects":
         dummy_cols, tr_dummies = _train_ticker_dummies(train_df["ticker"])
@@ -419,6 +428,7 @@ def fit_logistic_model(train_df: pd.DataFrame,
     return {
         "model": model,
         "scaler": scaler,
+        "winsorizer": winsorizer,
         "dummy_cols": dummy_cols,
         "family": family,
         "panel_mode": panel_mode,
@@ -439,12 +449,17 @@ def predict_proba(artifacts: Mapping[str, Any],
     """
     model = artifacts["model"]
     scaler = artifacts["scaler"]
+    winsorizer = artifacts.get("winsorizer")
     dummy_cols = artifacts.get("dummy_cols")
     family = family or artifacts.get("family", PER_ASSET)
     panel_mode = panel_mode or artifacts.get("panel_mode", "pooled")
     feature_cols = feature_cols or artifacts.get("feature_cols")
 
-    X = scaler.transform(df[feature_cols].values.astype(float))
+    # Apply the FROZEN training-window winsorisation thresholds before scaling.
+    # ``df`` here is the inner-HPO validation block or the outer test
+    # observation — neither was seen when the thresholds were fit.
+    df_w = winsorizer.transform(df) if winsorizer is not None else df
+    X = scaler.transform(df_w[feature_cols].values.astype(float))
     if family == PANEL and panel_mode == "ticker_fixed_effects" and dummy_cols:
         te = _align_ticker_dummies(df["ticker"], dummy_cols)
         X = np.hstack([X, te])

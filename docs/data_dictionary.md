@@ -5,6 +5,16 @@ was confirmed against the original code; items marked `(inferred)` follow
 the dominant naming convention used by `Sentiment_feature_engineering.py`
 but have not been hand-verified.
 
+> **Timestamp convention (all tables).** `timestamp` is the **interval-START
+> label**, i.e. the raw CCXT bar-start timestamp. A row labelled `t` describes
+> the *completed* interval `[t, t+h)` — its `open` is the first intraday open,
+> its `close` the final intraday close, and its `high`/`low` the intraday
+> extrema. The market + Reddit information for `[t, t+h)` becomes usable at
+> `t+h`, and the row forecasts the sign of the return of the NEXT interval
+> `[t+h, t+2h)` (`target`). No timestamp shift is applied on either the price
+> or the sentiment side. See
+> `thesis_pipeline.diagnostics.timing_invariant`.
+
 ---
 
 ## Raw OHLCV — `Data/Raw/Price/<horizon>/<TICKER>USDT_<suffix>.parquet`
@@ -14,7 +24,7 @@ but have not been hand-verified.
 
 | column     | dtype           | notes |
 |------------|-----------------|-------|
-| `timestamp`| int64 / datetime| Bar end time; UTC. Loader normalises ms → datetime. |
+| `timestamp`| int64 / datetime| Interval-START label; UTC (raw CCXT bar-start). Row = completed interval `[t, t+h)`. Loader normalises ms → datetime. |
 | `open`     | float64         | |
 | `high`     | float64         | |
 | `low`      | float64         | |
@@ -85,7 +95,7 @@ P(pos) − P(neg); CryptoBERT uses P(bullish) − P(bearish). See
 
 | column                | dtype    | notes |
 |-----------------------|----------|-------|
-| `timestamp`           | datetime | Bar end timestamp |
+| `timestamp`           | datetime | Interval-START label (completed interval `[t, t+h)`); the row forecasts `[t+h, t+2h)` |
 | `date`                | date     | Calendar date used for CMC matching |
 | `ticker`              | string   | |
 | `horizon`             | string   | `1h` / `6h` / `1d` |
@@ -120,7 +130,7 @@ Identifier columns:
 
 | column     | notes |
 |------------|-------|
-| `timestamp`| Bar end |
+| `timestamp`| Interval-START label (posts floored to the slot start of `[t, t+h)`) |
 | `ticker`   | Mapped via `subreddit_ticker_mapping.xlsx` |
 | `horizon`  | Same as price |
 
