@@ -28,11 +28,27 @@ Market-cap merge is strictly as-of: only values with
 ``market_cap_available_at < prediction_timestamp`` enter the feature row
 (``pd.merge_asof(..., direction='backward', allow_exact_matches=False)``).
 
+Timestamp convention:
+  ``timestamp`` is the **interval-start label**. A row labelled ``t`` refers
+  to the completed interval ``[t, t+h)``; its market and Reddit information
+  become usable at ``t+h``, and the row forecasts the sign of the return of
+  the NEXT interval ``[t+h, t+2h)`` (``target``). No timestamp shift is applied
+  — see :mod:`thesis_pipeline.diagnostics.timing_invariant`.
+
 Outlier treatment:
-  - log_return_t and volume_diff are winsorized per coin and horizon
-  - lower tail is clipped at the 0.5% quantile
-  - upper tail is clipped at the 99.5% quantile
-  - cumulative log returns are computed from the winsorized log returns
+  NONE at feature-construction time. Full-sample winsorisation was removed
+  because clipping earlier observations at quantiles computed over the whole
+  series uses future information (look-ahead leakage). All feature columns are
+  therefore RAW point-in-time values:
+
+    - log_return_t        — raw log return
+    - volume_diff         — raw first difference of volume
+    - cum_log_return_*d   — cumulative sum of RAW log returns
+    - realized_vol_14d    — rolling std of RAW log returns
+
+  Outlier control now happens INSIDE the model as leakage-safe,
+  training-window winsorisation fitted only on the current training data —
+  see :mod:`thesis_pipeline.modeling.preprocessing`.
 
 Expected input structure:
   Data/Raw/Price/1h/{SYMBOL}USDT_1h.parquet
@@ -42,11 +58,10 @@ Expected input structure:
   Data/Raw/Price/CoinMarketCap/MetaData.csv       optional but recommended
 
 Output:
-  Data/Features/features_1h.parquet
-  Data/Features/features_6h.parquet
-  Data/Features/features_1d.parquet
+  Data/Features/price_features_1h.parquet
+  Data/Features/price_features_6h.parquet
+  Data/Features/price_features_1d.parquet
   Data/Features/feature_generation_report.csv
-  Data/Features/winsorization_thresholds.csv
   Data/Features/cmc_marketcap_column_matches.csv
 
 Usage:
@@ -266,19 +281,10 @@ def detect_timestamp_column(df: pd.DataFrame) -> str:
     return df.columns[0]
 
 
-def winsorize_series(s: pd.Series, p: float = 0.005) -> tuple[pd.Series, float, float]:
-    """
-    Clips a series at the p and 1-p quantiles.
-    Returns the winsorized series and the two thresholds.
-    """
-    s = pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    valid = s.dropna()
-    if valid.empty:
-        return s, np.nan, np.nan
-
-    lower = valid.quantile(p)
-    upper = valid.quantile(1.0 - p)
-    return s.clip(lower=lower, upper=upper), float(lower), float(upper)
+# NOTE: full-sample winsorisation was removed from feature construction (it
+# used future observations to clip earlier ones). Outlier control now lives in
+# the leakage-safe, training-window winsoriser
+# (:mod:`thesis_pipeline.modeling.preprocessing`).
 
 
 # =============================================================================
@@ -607,11 +613,17 @@ def create_features_for_coin_horizon(
     ticker: str,
     horizon: str,
     market_cap_series: Optional[pd.DataFrame],
-    winsor_p: float,
+    winsor_p: float = 0.005,  # noqa: ARG001 — DEPRECATED / IGNORED (see below).
     marketcap_lag_days: int = 0,  # noqa: ARG001 — accepted for CLI back-compat; ignored.
     ohlcv_override: Optional[pd.DataFrame] = None,
 ) -> tuple[pd.DataFrame, dict, list[dict]]:
     """Creates features for one ticker-horizon pair.
+
+    All feature columns are RAW point-in-time values — feature construction no
+    longer winsorises (full-sample clipping leaked future data). The
+    ``winsor_p`` argument is accepted for call-site back-compat but IGNORED;
+    outlier control is handled downstream by the leakage-safe training-window
+    winsoriser (:mod:`thesis_pipeline.modeling.preprocessing`).
 
     Windows are calendar-consistent across horizons: cum_log_return_7d /
     14d / 21d and realized_vol_14d use ``days * BARS_PER_DAY[horizon]``
@@ -655,19 +667,22 @@ def create_features_for_coin_horizon(
     df["horizon"] = horizon
     df["date"] = df["timestamp"].dt.date
 
-    # Raw transformations.
+    # RAW point-in-time transformations. Full-sample winsorisation was removed
+    # (it leaked future observations into earlier rows). Outlier control now
+    # happens inside the model via the leakage-safe training-window winsoriser.
     df["log_return_raw"] = np.log(df["close"] / df["close"].shift(1))
     df["log_return_raw"] = df["log_return_raw"].replace([np.inf, -np.inf], np.nan)
     df["volume_diff_raw"] = df["volume"].diff().replace([np.inf, -np.inf], np.nan)
 
-    # Winsorize per coin and horizon.
-    df["log_return_t"], lr_low, lr_high = winsorize_series(df["log_return_raw"], winsor_p)
-    df["volume_diff"], vd_low, vd_high = winsorize_series(df["volume_diff_raw"], winsor_p)
+    # ``log_return_t`` / ``volume_diff`` are the RAW values verbatim (no clip).
+    df["log_return_t"] = df["log_return_raw"]
+    df["volume_diff"] = df["volume_diff_raw"]
 
-    # Calendar-consistent rolling windows. ``bars`` is the count of horizon
-    # bars that fits the requested calendar days exactly (1d→1, 6h→4, 1h→24
-    # bars per day). ``min_periods = bars`` so we never emit a partial-window
-    # value, and the windows are identical wall-clock between horizons.
+    # Calendar-consistent rolling windows, computed from the RAW log returns.
+    # ``bars`` is the count of horizon bars that fits the requested calendar
+    # days exactly (1d→1, 6h→4, 1h→24 bars per day). ``min_periods = bars`` so
+    # we never emit a partial-window value, and the windows are identical
+    # wall-clock between horizons.
     bpd = BARS_PER_DAY[horizon]
     for n_days in CUM_RETURN_WINDOW_DAYS:
         bars = n_days * bpd
@@ -675,7 +690,7 @@ def create_features_for_coin_horizon(
             df["log_return_t"].rolling(window=bars, min_periods=bars).sum()
         )
 
-    # Realized volatility: rolling std of winsorized log returns over the
+    # Realized volatility: rolling std of RAW log returns over the
     # 14-calendar-day window. Captures the second moment of returns,
     # complementing the first-moment level features (volatility clustering;
     # Sung et al., 2022; Tang et al., 2024).
@@ -787,26 +802,10 @@ def create_features_for_coin_horizon(
             int(df["log_market_cap_lag1"].isna().sum()),
     }
 
-    thresholds = [
-        {
-            "ticker": ticker,
-            "horizon": horizon,
-            "variable": "log_return_t",
-            "winsor_lower_quantile": winsor_p,
-            "winsor_upper_quantile": 1.0 - winsor_p,
-            "lower_threshold": lr_low,
-            "upper_threshold": lr_high,
-        },
-        {
-            "ticker": ticker,
-            "horizon": horizon,
-            "variable": "volume_diff",
-            "winsor_lower_quantile": winsor_p,
-            "winsor_upper_quantile": 1.0 - winsor_p,
-            "lower_threshold": vd_low,
-            "upper_threshold": vd_high,
-        },
-    ]
+    # Feature construction no longer winsorises (leakage-free raw features).
+    # The third tuple element is retained as an empty list for call-site
+    # backward compatibility; no winsorization_thresholds.csv is produced.
+    thresholds: list[dict] = []
 
     return out, report, thresholds
 
@@ -821,7 +820,10 @@ def main(argv=None) -> int:
     parser.add_argument("--output_dir", type=str, default=str(DEFAULT_OUTPUT_DIR), help="Path to Data/Features")
     parser.add_argument("--coin", type=str, default=None, help="Optional: process only one ticker, e.g. BTC")
     parser.add_argument("--horizons", nargs="+", default=HORIZONS, choices=HORIZONS, help="Horizons to process")
-    parser.add_argument("--winsor_p", type=float, default=0.005, help="Tail probability for winsorization; default 0.005 = 0.5%%")
+    parser.add_argument("--winsor_p", type=float, default=0.005, help=(
+        "DEPRECATED / IGNORED. Feature construction no longer winsorises "
+        "(full-sample clipping leaked future data). Outlier control is now "
+        "leakage-safe training-window winsorisation inside the model."))
     parser.add_argument(
         "--marketcap_lag_days",
         type=int,
@@ -847,13 +849,11 @@ def main(argv=None) -> int:
     cmc_dir = price_dir / "CoinMarketCap"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.winsor_p <= 0 or args.winsor_p >= 0.5:
-        raise ValueError("--winsor_p must be between 0 and 0.5")
-
     print(f"[INFO] PRICE_DIR: {price_dir}")
     print(f"[INFO] CMC_DIR:   {cmc_dir}")
     print(f"[INFO] OUTPUT:    {output_dir}")
-    print(f"[INFO] Winsorization: lower={args.winsor_p:.4f}, upper={1 - args.winsor_p:.4f}")
+    print("[INFO] Winsorization: DISABLED at feature time — raw point-in-time "
+          "features; leakage-safe training-window winsorisation runs in-model.")
 
     tickers = [normalise_output_ticker(args.coin)] if args.coin else discover_tickers(price_dir)
     if not tickers:
@@ -964,16 +964,25 @@ def main(argv=None) -> int:
     report_path = output_dir / "feature_generation_report.csv"
     report_df.to_csv(report_path, index=False)
 
-    thresholds_df = pd.DataFrame(all_thresholds)
-    thresholds_path = output_dir / "winsorization_thresholds.csv"
-    thresholds_df.to_csv(thresholds_path, index=False)
+    # Full-sample winsorisation was removed — no winsorization_thresholds.csv
+    # is written (a leftover file would misleadingly imply the old procedure is
+    # still active). Remove a stale copy from a previous run if present.
+    stale_thresholds = output_dir / "winsorization_thresholds.csv"
+    if stale_thresholds.exists():
+        try:
+            stale_thresholds.unlink()
+            print(f"[INFO] Removed stale {stale_thresholds.name} "
+                  "(feature construction no longer winsorises).")
+        except OSError as exc:  # noqa: BLE001 — best-effort cleanup
+            print(f"[WARN] Could not remove stale {stale_thresholds.name}: {exc}")
 
     print("\n" + "=" * 70)
     print("DONE")
     print("=" * 70)
     print(f"[INFO] Feature files saved in: {output_dir}")
     print(f"[INFO] Report saved:          {report_path}")
-    print(f"[INFO] Thresholds saved:      {thresholds_path}")
+    print("[INFO] Outlier control: none at feature time — leakage-safe "
+          "training-window winsorisation happens inside the model.")
 
 
 if __name__ == "__main__":

@@ -272,10 +272,23 @@ def run_walk_forward(df_ticker: pd.DataFrame,
             results.append(row)
             continue
 
-        # ── Scale: fit on training only, transform test ───────
+        # ── Leakage-safe preprocessing: winsorise (thresholds fit on the
+        # training window only) → StandardScaler.fit(train) → transform test.
+        # ``df.iloc[:t][valid_mask]`` is exactly the rows behind (X_tr, y_tr);
+        # ``df.iloc[t:t+1]`` is the single test observation. Winsorisation is
+        # per-ticker inside the window (here a single ticker) so the previous
+        # per-coin outlier treatment is preserved without any look-ahead.
+        from .preprocessing import TrainingWindowWinsorizer
+        train_df_t = df.iloc[:t][valid_mask]
+        test_df_t = df.iloc[t:t + 1]
+        winsorizer = TrainingWindowWinsorizer(feature_cols).fit(train_df_t)
+        X_tr_w = winsorizer.transform(train_df_t)[feature_cols].values.astype(float)
+        X_te_w = winsorizer.transform(test_df_t)[feature_cols].values.astype(float)
+
+        # ── Scale: fit on winsorised training only, transform test ───────
         scaler = StandardScaler()
-        X_tr_s = scaler.fit_transform(X_tr)
-        X_te_s = scaler.transform(X_all[t:t+1])
+        X_tr_s = scaler.fit_transform(X_tr_w)
+        X_te_s = scaler.transform(X_te_w)
 
         # ── Fit Ridge logistic regression ─────────────────────
         model = LogisticRegression(
@@ -574,6 +587,7 @@ def _guard_checkpoint_universe(ckpt_module, root, manifest_base: dict) -> None:
     for k in ("requested_coin_universe_hash", "requested_tickers",
               "horizon", "set_id", "sentiment_model", "model_type",
               "panel_mode", "hpo_variant", "hpo_objective",
+              "preprocessing_signature",
               "feature_cols"):
         if existing.get(k) != manifest_base.get(k):
             print(f"  [INFO] Existing checkpoint manifest is incompatible "
@@ -700,6 +714,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     tune_on = bool(hpo_cfg["enabled"])
     hpo_variant = hpo_variant_label(tune_on, hpo_cfg["objective"])
+
+    # ── Preprocessing signature (Section 4 — cache/checkpoint invalidation) ──
+    # Per-asset runs always use an expanding training window. The signature
+    # covers the winsorisation config (modeling.preprocessing) + window + HPO
+    # objective so old (pre-winsoriser) checkpoints / signal files are rejected.
+    from .preprocessing import preprocessing_signature as _preprocessing_signature
+    preproc_sig = _preprocessing_signature(
+        model_window="per_asset_expanding",
+        hpo_objective=(hpo_cfg["objective"] if tune_on else "-"),
+    )
 
     # ── Alternative model family: delegate to the panel-logit module ──
     # The per-asset logic below is unchanged; panel_logit is purely additive.
@@ -943,11 +967,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                     realized = set(cached["ticker"].astype(str).str.upper().unique()) \
                         if "ticker" in cached.columns and not cached.empty else set()
+                    cached_sig = (
+                        str(cached.get("preprocessing_signature",
+                                        pd.Series([""])).iat[0])
+                        if not cached.empty else ""
+                    )
                     if (not cached_hash) or cached_hash != requested_hash:
                         print(f"\n  ── {out_name} ({label}) → legacy/incompatible "
                               "cache (no requested-universe metadata or hash "
                               "mismatch); recomputing")
                         raise ValueError("legacy_cache")
+                    if cached_sig != preproc_sig:
+                        print(f"\n  ── {out_name} ({label}) → cache preprocessing "
+                              f"signature mismatch (cached={cached_sig or 'none'} "
+                              f"!= {preproc_sig}); recomputing")
+                        raise ValueError("preprocessing_signature_mismatch")
                     if not realized.issubset(set(requested_tickers)):
                         print(f"\n  ── {out_name} ({label}) → cache realized "
                               "tickers escape requested universe; recomputing")
@@ -995,6 +1029,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "model_type": "per_asset", "panel_mode": "-",
                     "hpo_variant": "fixed", "hpo_objective": "-",
                     "feature_cols": ["__rolling_probability__"],
+                    "preprocessing_signature": preproc_sig,
                     # Universe identity (commit 4 A.4).
                     "requested_tickers":            list(requested_tickers),
                     "requested_coin_universe_hash": requested_hash,
@@ -1017,6 +1052,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         requested_universe=requested_tickers,
                         available_universe=available_tickers,
                     )
+                    signals["preprocessing_signature"] = preproc_sig
                     signals.to_parquet(out_path, index=False, engine="pyarrow")
                     if ckpt_on:
                         mf = ckpt.load_manifest(root)
@@ -1069,6 +1105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "hpo_variant": hpo_variant if tune_on else "fixed",
                 "hpo_objective": hpo_cfg["objective"] if tune_on else "-",
                 "feature_cols": feature_cols,
+                "preprocessing_signature": preproc_sig,
                 # Universe identity (commit 4 A.4).
                 "requested_tickers":            list(requested_tickers),
                 "requested_coin_universe_hash": requested_hash,
@@ -1099,6 +1136,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     requested_universe=requested_tickers,
                     available_universe=available_tickers,
                 )
+                # Preprocessing-methodology stamp (Section 4.4).
+                signals["preprocessing_signature"] = preproc_sig
                 signals.to_parquet(out_path, index=False, engine="pyarrow")
                 if ckpt_on:
                     mf = ckpt.load_manifest(root)

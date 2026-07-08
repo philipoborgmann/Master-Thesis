@@ -421,6 +421,39 @@ def cmd_diagnostics(args: argparse.Namespace) -> int:
     return run(horizon=args.horizon, smoke=args.smoke, dry_run=args.dry_run)
 
 
+def cmd_audit_ccxt_timestamps(args: argparse.Namespace) -> int:
+    """Inspect supplied CCXT OHLCV parquet files: timestamp grid, inferred
+    label convention, OHLC aggregation consistency, volume deviations.
+
+    Optional command — points at externally-supplied files (e.g. the audit
+    ADA parquets). Repository tests use synthetic fixtures instead.
+    """
+    from .diagnostics.timing_invariant import audit_ccxt_files, print_ccxt_audit
+    paths: dict[str, str] = {}
+    for hz in ("1h", "6h", "1d"):
+        p = getattr(args, hz, None)
+        if p:
+            paths[hz] = p
+    if not paths:
+        print("[ERROR] provide at least one of --1h / --6h / --1d parquet paths")
+        return 2
+    print_ccxt_audit(audit_ccxt_files(paths))
+    return 0
+
+
+def cmd_audit_price_sources(args: argparse.Namespace) -> int:
+    """Audit price-source provenance CSVs for cross-horizon consistency."""
+    from .diagnostics.price_source_audit import run_price_source_audit
+    _, summary = run_price_source_audit(
+        list(args.sources or []),
+        out_dir=args.out_dir,
+        strict=bool(getattr(args, "strict", False)),
+    )
+    # Non-zero exit when inconsistent AND strict was requested is handled by the
+    # raised ValueError; otherwise return 0 (prominent warning already printed).
+    return 0
+
+
 def cmd_evaluate_signals(args: argparse.Namespace) -> int:
     """Forward CLI flags directly to the evaluation module's argparse-based main()."""
     from .evaluation import evaluate_signals as _es
@@ -662,6 +695,28 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--horizon", default="1d")
     _add_common(sp)
     sp.set_defaults(func=cmd_diagnostics)
+
+    # audit-ccxt-timestamps (optional; inspects supplied parquet files)
+    sp = sub.add_parser("audit-ccxt-timestamps",
+                        help="Audit supplied CCXT OHLCV parquets: timestamp "
+                             "grid, label convention, OHLC/volume aggregation.")
+    sp.add_argument("--1h", dest="1h", default=None, help="Path to the 1H parquet.")
+    sp.add_argument("--6h", dest="6h", default=None, help="Path to the 6H parquet.")
+    sp.add_argument("--1d", dest="1d", default=None, help="Path to the 1D parquet.")
+    sp.set_defaults(func=cmd_audit_ccxt_timestamps)
+
+    # audit-price-sources (Section 3)
+    sp = sub.add_parser("audit-price-sources",
+                        help="Audit price_sources*.csv for cross-horizon "
+                             "exchange/symbol/quote consistency.")
+    sp.add_argument("sources", nargs="+",
+                    help="One or more price_sources*.csv paths.")
+    sp.add_argument("--out-dir", default="Data/Raw/Price/validation",
+                    help="Where to write price_source_consistency.csv.")
+    sp.add_argument("--strict", action="store_true",
+                    help="Exit non-zero (raise) on any cross-horizon "
+                         "source inconsistency instead of warning.")
+    sp.set_defaults(func=cmd_audit_price_sources)
 
     # evaluate-signals
     sp = sub.add_parser("evaluate-signals",
