@@ -419,6 +419,13 @@ def _attach_naive_metadata(sig: pd.DataFrame,
     return out
 
 
+def _forecast_sample_signature() -> str:
+    """Signature of the active forecast-origin sample contract (lazy import to
+    avoid any import cycle)."""
+    from .forecast_sample import forecast_sample_signature
+    return forecast_sample_signature()
+
+
 def _build_identity_payload(*, horizon: str, model_type: str,
                             panel_mode: str, train_window_mode: str,
                             rolling_window_days: float | None,
@@ -453,6 +460,9 @@ def _build_identity_payload(*, horizon: str, model_type: str,
         "requested_tickers":            list(requested),
         "requested_coin_universe_hash": coin_universe_hash(requested),
         "n_requested_tickers":          int(len(requested)),
+        # Forecast-origin sample contract (Objective B): a NAIVE file written
+        # under a different sample window is a cache MISS and is recomputed.
+        "forecast_sample_signature":    _forecast_sample_signature(),
         # Realized universe — recorded for validation against the parquet.
         "realized_tickers":            list(realized),
         "realized_coin_universe_hash": coin_universe_hash(realized) if realized else "",
@@ -521,7 +531,8 @@ def _cache_is_valid(parquet_path: Path, expected: dict) -> bool:
     if int(stored.get("cache_schema_version", 0)) != CACHE_SCHEMA_VERSION:
         return False
     for key in ("horizon", "model_type", "panel_mode", "train_window_mode",
-                "rolling_window_days", "rolling_window_timestamps"):
+                "rolling_window_days", "rolling_window_timestamps",
+                "forecast_sample_signature"):
         if stored.get(key) != expected.get(key):
             return False
     # ── Requested universe must match exactly ──────────────────
@@ -712,6 +723,11 @@ def generate_naive_reference(*,
         coin_universe_tuple=requested,
         realized_universe_tuple=realized,
     )
+    # Canonical output contract (Objective B): stamp forecast_origin and keep
+    # only rows whose forecast origin is in the configured 2022 sample window.
+    # NAIVE follows the SAME rule as every model specification.
+    from .forecast_sample import restrict_to_forecast_sample
+    out = restrict_to_forecast_sample(out, horizon)
     _atomic_write_parquet(out, out_path)
     _atomic_write_json(sidecar, _meta_path_for(out_path))
     return out_path

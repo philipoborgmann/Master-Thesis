@@ -464,6 +464,9 @@ def cmd_evaluate_signals(args: argparse.Namespace) -> int:
     output_dir = getattr(args, "output_dir", None)
     if output_dir:
         argv += ["--output-dir", str(output_dir)]
+    signals_root = getattr(args, "signals_root", None)
+    if signals_root:
+        argv += ["--signals-root", str(signals_root)]
     feature_config = getattr(args, "feature_config", None)
     if feature_config:
         argv += ["--feature-config", feature_config]
@@ -724,6 +727,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "regimes, market-cap interaction, backtest).")
     sp.add_argument("--horizon", default=None, choices=["1h", "6h", "1d"])
     sp.add_argument("--output-dir", dest="output_dir", default=None)
+    sp.add_argument("--signals-root", dest="signals_root", default=None,
+                    help="Override the signal-discovery root for THIS command "
+                         "only (does not edit paths.yaml).")
     sp.add_argument("--feature-config", dest="feature_config", default=None,
                     help="Override path to feature_sets.xlsx.")
     sp.add_argument("--backtest-config", dest="backtest_config", default=None,

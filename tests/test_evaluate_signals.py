@@ -521,19 +521,22 @@ def test_confirmatory_outputs_and_sanity(signals_env):
             assert "q_value_bh" not in avn.columns
             assert "significant_bh" not in avn.columns
 
-    # ── manifest: confirmatory A–E + exploratory sentiment-only ───
+    # ── manifest: confirmatory A–D + exploratory E1/E2 + sentiment-only ──
     man = pd.read_csv(out_dir / "multiple_testing_manifest.csv")
     assert not man["family"].astype(str).str.contains("absolute_vs_naive").any()
     assert not man["family"].astype(str).str.contains("regime_mcnemar").any()
     assert "family_role" in man.columns
+    # Only A–D are confirmatory; E1/E2 are NOT.
     conf = man[man["family_role"] == "confirmatory"]
     assert set(conf["family"]) == {
         "A_H1_logloss", "B_H1_directional", "C_H2_volatility",
-        "D_H3_marketcap", "E1_horizon_logloss", "E2_horizon_accuracy"}
-    # The exploratory sentiment-only directional family is present and
-    # marked exploratory (SENT_VAD_L is in the fixture).
-    expl = man[man["family_role"] == "exploratory"]
-    assert list(expl["family"]) == ["EXPL_sentiment_only_directional"]
+        "D_H3_marketcap"}
+    assert "E1_horizon_logloss" not in set(conf["family"])
+    assert "E2_horizon_accuracy" not in set(conf["family"])
+    # E1, E2 and the sentiment-only directional family are all exploratory.
+    expl = set(man[man["family_role"] == "exploratory"]["family"])
+    assert {"E1_horizon_logloss", "E2_horizon_accuracy",
+            "EXPL_sentiment_only_directional"}.issubset(expl)
 
     # ── FIX 2: pooled directional dedup — one BH verdict per (h,set) ──
     pooled = pd.read_csv(out_dir / "pooled_metrics.csv")

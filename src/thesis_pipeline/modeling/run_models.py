@@ -381,9 +381,15 @@ def compute_metrics(signals: pd.DataFrame, ticker_label: str = "pooled") -> dict
     out = {
         "ticker":       ticker_label,
         "n_obs":        n,
-        "first_test_timestamp": str(signals["timestamp"].min()),
-        "last_test_timestamp":  str(signals["timestamp"].max()),
+        # ``*_test_timestamp`` are RAW interval-start labels; the forecast
+        # origins (timestamp + h) are added below when the column is present so
+        # the summary is unambiguous and matches the FILTERED signal rows.
+        "first_test_timestamp": str(signals["timestamp"].min()) if n else "",
+        "last_test_timestamp":  str(signals["timestamp"].max()) if n else "",
     }
+    if "forecast_origin" in signals.columns and n:
+        out["first_forecast_origin"] = str(signals["forecast_origin"].min())
+        out["last_forecast_origin"]  = str(signals["forecast_origin"].max())
 
     if n == 0:
         for m in ["accuracy", "balanced_accuracy", "f1", "precision",
@@ -715,14 +721,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     tune_on = bool(hpo_cfg["enabled"])
     hpo_variant = hpo_variant_label(tune_on, hpo_cfg["objective"])
 
-    # ── Preprocessing signature (Section 4 — cache/checkpoint invalidation) ──
+    # ── Preprocessing + output signature (cache/checkpoint invalidation) ──
     # Per-asset runs always use an expanding training window. The signature
     # covers the winsorisation config (modeling.preprocessing) + window + HPO
-    # objective so old (pre-winsoriser) checkpoints / signal files are rejected.
+    # objective + the forecast-origin sample contract, so old (pre-winsoriser
+    # OR pre-forecast-sample) checkpoints / signal files are rejected.
     from .preprocessing import preprocessing_signature as _preprocessing_signature
+    from .forecast_sample import (
+        load_forecast_sample_config, restrict_to_forecast_sample,
+    )
+    _fs_cfg = load_forecast_sample_config()
     preproc_sig = _preprocessing_signature(
         model_window="per_asset_expanding",
         hpo_objective=(hpo_cfg["objective"] if tune_on else "-"),
+        forecast_sample=_fs_cfg,
     )
 
     # ── Alternative model family: delegate to the panel-logit module ──
@@ -1053,6 +1065,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         available_universe=available_tickers,
                     )
                     signals["preprocessing_signature"] = preproc_sig
+                    # Canonical output contract: stamp forecast_origin and keep
+                    # only rows whose forecast origin is in the configured
+                    # 2022 sample window (NAIVE follows the same rule).
+                    signals = restrict_to_forecast_sample(signals, hz, cfg=_fs_cfg)
                     signals.to_parquet(out_path, index=False, engine="pyarrow")
                     if ckpt_on:
                         mf = ckpt.load_manifest(root)
@@ -1138,6 +1154,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 # Preprocessing-methodology stamp (Section 4.4).
                 signals["preprocessing_signature"] = preproc_sig
+                # Canonical output contract: stamp forecast_origin + restrict to
+                # the configured 2022 forecast-origin sample window.
+                signals = restrict_to_forecast_sample(signals, hz, cfg=_fs_cfg)
                 signals.to_parquet(out_path, index=False, engine="pyarrow")
                 if ckpt_on:
                     mf = ckpt.load_manifest(root)
