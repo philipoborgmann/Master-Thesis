@@ -81,6 +81,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", "--output_dir", dest="output_dir",
                         default=None,
                         help="Override Outputs/Evaluation/.")
+    parser.add_argument("--signals-root", "--signals_root", dest="signals_root",
+                        default=None,
+                        help="Override the signal-discovery root for THIS "
+                             "command only (default: paths.yaml signals_root). "
+                             "Does not mutate any config file.")
     parser.add_argument("--feature_config", "--feature-config",
                         dest="feature_config", default=None,
                         help="Path to feature_sets.xlsx; defaults to configs/paths.yaml.")
@@ -199,7 +204,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     # ── Path resolution ─────────────────────────────────────────
     out_root = _output_root(args)
     xlsx_path = _xlsx_path(out_root)
-    inputs = [resolve_path("signals_root"),
+    # --signals-root overrides discovery for THIS command only.
+    signals_root = (Path(args.signals_root) if getattr(args, "signals_root", None)
+                    else resolve_path("signals_root"))
+    inputs = [signals_root,
               Path(args.feature_config) if args.feature_config
               else resolve_path("feature_sets_xlsx"),
               resolve_path("raw_price_1d")]
@@ -240,6 +248,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         extra={
             "horizon":               args.horizon or "(all)",
             "output_dir":            str(out_root),
+            "signals_root":          str(signals_root),
             "no_volatility":         args.no_volatility,
             "no_market_cap":         args.no_market_cap,
             "no_economic":           args.no_economic,
@@ -271,10 +280,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     logger = get_logger()
 
     # ── 1. Discover and load signal files ───────────────────────
-    files = discover_signal_files(args.horizon)
+    files = discover_signal_files(
+        args.horizon,
+        signals_root=getattr(args, "signals_root", None))
     if not files:
         logger.warning("evaluate-signals: no signal parquets found under %s — nothing to do",
-                       resolve_path("signals_root"))
+                       signals_root)
         return 0
     logger.info("evaluate-signals: discovered %d signal file(s)", len(files))
     signals = load_all_signals(args.horizon, paths=files)
@@ -557,11 +568,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             if _c in absolute_vs_naive_df.columns:
                 absolute_vs_naive_df = absolute_vs_naive_df.drop(columns=_c)
 
-    # ── 8d. Confirmatory multiplicity (Parts 1 + 2A/2B) ──────────
+    # ── 8d. Family-aware multiplicity (Parts 1 + 2A/2B) ──────────
     # ONE centralized family-aware BH pooled ACROSS horizons within each
-    # confirmatory family (A/B/C/D/E1/E2). Emits the enriched incremental
+    # family: CONFIRMATORY A/B/C/D and EXPLORATORY E1/E2 (+ the exploratory
+    # sentiment-only directional family). Emits the enriched incremental
     # (Family A log-loss DM + Family B directional) and diff-in-improvement
-    # (Families C/D) surfaces plus the horizon-comparison table (E1/E2),
+    # (Families C/D) surfaces plus the horizon-comparison table (E1/E2,
+    # exploratory),
     # the multiple-testing manifest, the metric-roles table and the
     # class-balance table. This SUPERSEDES the diff table's own BH.
     confirmatory = finalize_confirmatory_families(

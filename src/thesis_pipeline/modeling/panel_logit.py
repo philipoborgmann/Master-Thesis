@@ -738,11 +738,16 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
     # window and the HPO objective. Old checkpoints / signal files produced
     # under a different preprocessing methodology are detected and rejected.
     from .preprocessing import preprocessing_signature as _preprocessing_signature
+    from .forecast_sample import (
+        load_forecast_sample_config, restrict_to_forecast_sample,
+    )
+    _fs_cfg = load_forecast_sample_config()
     _preproc_window = (f"{train_window_mode}|days={rolling_window_days}"
                        f"|ts={rolling_window_timestamps}")
     preproc_sig = _preprocessing_signature(
         model_window=_preproc_window,
         hpo_objective=(hpo_cfg["objective"] if tune_on else "-"),
+        forecast_sample=_fs_cfg,
     )
 
     # ── Checkpointing config ────────────────────────────────────
@@ -1040,6 +1045,11 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
             # Preprocessing-methodology stamp (Section 4.4): so an old signal
             # file can never be mistaken for the corrected final run.
             signals["preprocessing_signature"] = preproc_sig
+            # Canonical output contract: stamp forecast_origin (= timestamp + h)
+            # and keep only rows whose forecast origin is in the configured 2022
+            # sample window. Covers the panel logit AND the panel NAIVE
+            # benchmark (both reach this single write site).
+            signals = restrict_to_forecast_sample(signals, hz, cfg=_fs_cfg)
             # ── Output-schema assertion (commit 10) ───────────────
             # Refuse to write a rolling-window parquet that is missing
             # any of the canonical training-window columns. This is

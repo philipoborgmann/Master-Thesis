@@ -8,7 +8,8 @@ correction, then decomposes H1 into probabilistic (H1a) and directional
 It consumes the already-built ``incremental_sentiment_value`` and
 ``diff_in_improvement`` tables plus the loaded signal frame, computes the
 timestamp-level Diebold-Mariano-type effects (Part 2A), assembles the
-confirmatory records for families A/B/C/D/E1/E2, runs the centralized BH
+records for families A/B/C/D (confirmatory) and E1/E2 (exploratory horizon
+contrasts), runs the centralized BH
 (:mod:`multiple_testing`), and distributes the corrected q-values /
 significance back onto each surface. It also emits the horizon-comparison
 table, the multiple-testing manifest, the metric-roles table and the
@@ -278,7 +279,17 @@ def finalize_confirmatory_families(*,
 
     records_df = pd.DataFrame(records, columns=list(mt.RECORD_COLUMNS))
     corrected = mt.apply_family_bh(records_df, alpha=alpha)
-    manifest = mt.build_manifest(corrected, alpha=alpha)
+    # Manifest: A–D as CONFIRMATORY, E1/E2 as EXPLORATORY. Both are corrected
+    # by the SAME family-aware BH pass above (WITHIN each family); the split is
+    # a pure role classification and does not change any q-value. E1 and E2 are
+    # each their own separate BH pool (never mixed with A–D nor with each
+    # other).
+    manifest = mt.build_manifest(corrected, alpha=alpha)  # A–D confirmatory
+    e_manifest = mt.build_manifest(
+        corrected, alpha=alpha,
+        families=(FAMILY_E1_HORIZON_LOGLOSS, FAMILY_E2_HORIZON_ACCURACY),
+        family_role="exploratory")
+    manifest = pd.concat([manifest, e_manifest], ignore_index=True)
 
     # ── Distribute q/sig back onto each surface ───────────────────
     inc = _apply_families_to_incremental(inc, dm, corrected, alpha)
@@ -289,7 +300,7 @@ def finalize_confirmatory_families(*,
     # Exactly one BH-corrected directional verdict per (horizon, set):
     # combined ECON_* rows inherit Family B; sentiment-only SENT_* rows form
     # the exploratory EXPL family (BH within it). The exploratory family is
-    # appended to the manifest and NEVER alters the A–E counts.
+    # appended to the manifest and NEVER alters the A–D counts.
     pool, expl_manifest = _apply_directional_to_pooled(pool, corrected, alpha)
     if expl_manifest is not None and not expl_manifest.empty:
         manifest = pd.concat([manifest, expl_manifest], ignore_index=True)
@@ -484,11 +495,13 @@ def _apply_families_to_diff(dif, corrected, alpha):
 
 
 def _build_horizon_comparison(horizon_rows, corrected, alpha):
-    if not horizon_rows:
-        return pd.DataFrame(columns=[
-            "family", "set_id", "model", "metric", "horizon_pair",
+    # E1/E2 horizon contrasts are EXPLORATORY — tag every row so the CSV is
+    # self-describing and consistent with the manifest.
+    cols = ["family", "family_role", "set_id", "model", "metric", "horizon_pair",
             "effect_h1", "effect_h2", "diff", "se_diff", "z_stat",
-            "p_value_raw", "q_value_bh", "significant_bh", "alpha_prespecified"])
+            "p_value_raw", "q_value_bh", "significant_bh", "alpha_prespecified"]
+    if not horizon_rows:
+        return pd.DataFrame(columns=cols)
     df = pd.DataFrame(horizon_rows)
     look = {}
     for fam in (FAMILY_E1_HORIZON_LOGLOSS, FAMILY_E2_HORIZON_ACCURACY):
@@ -500,8 +513,5 @@ def _build_horizon_comparison(horizon_rows, corrected, alpha):
     df["q_value_bh"] = q
     df["significant_bh"] = sig
     df["alpha_prespecified"] = float(alpha)
-    ordered = ["family", "set_id", "model", "metric", "horizon_pair",
-               "effect_h1", "effect_h2", "diff", "se_diff", "z_stat",
-               "p_value_raw", "q_value_bh", "significant_bh",
-               "alpha_prespecified"]
-    return df[ordered].reset_index(drop=True)
+    df["family_role"] = "exploratory"
+    return df[cols].reset_index(drop=True)

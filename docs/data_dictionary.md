@@ -154,21 +154,32 @@ sentiment values are filled per the policy in `Merge_Features.py`:
 
 (observed in `Run_Models.run_walk_forward` and `run_rolling_probability`)
 
-| column            | dtype    | notes |
-|-------------------|----------|-------|
-| `timestamp`       | datetime | Test-step timestamp |
-| `ticker`          | string   | |
-| `target`          | int8     | Realised direction |
-| `prediction`      | int8     | Predicted direction (threshold 0.5) |
-| `probability`     | float64  | Predicted P(class=1) |
-| `set_id`          | string   | E.g. `B1`, `E4`, `S1`, `C1` |
-| `sentiment_model` | string   | `vader` / `finbert` / `cryptobert` or null |
-| `horizon`         | string   | `1h` / `6h` / `1d` |
+| column                    | dtype        | notes |
+|---------------------------|--------------|-------|
+| `timestamp`               | datetime     | **Interval-START label** (raw). Completed interval `[t, t+h)`. |
+| `forecast_origin`         | datetime,UTC | `timestamp + h`. Canonical output is restricted to `2022-01-01T00:00:00Z <= forecast_origin < 2023-01-01T00:00:00Z` (end-exclusive). |
+| `ticker`                  | string       | |
+| `target`                  | int8         | Realised direction of the NEXT interval `[t+h, t+2h)` |
+| `prediction`              | int8         | Predicted direction (threshold 0.5) |
+| `probability`             | float64      | Predicted P(class=1) |
+| `set_id`                  | string       | E.g. `ECON`, `SENT_VAD_L`, `ECON_CBT_F`, `NAIVE` |
+| `sentiment_model`         | string       | `vader` / `cryptobert` or `-` |
+| `horizon`                 | string       | `1h` / `6h` / `1d` |
+| `preprocessing_signature` | string       | Preprocessing + forecast-sample contract hash (cache invalidation). |
+
+Row inclusion is decided on `forecast_origin`, **not** the raw `timestamp`, so
+the last retained raw timestamp differs by horizon. The single source of truth
+for the window is the `forecast_sample` block in `configs/model_specs.yaml`;
+the horizon→offset map and filter live in
+`thesis_pipeline.modeling.forecast_sample`. No external post-run pruning is
+part of the canonical workflow.
 
 `Outputs/Signals/metrics_summary.csv` contains pooled and per-ticker metrics
 (`accuracy`, `balanced_accuracy`, `f1`, `precision`, `recall`, `log_loss`,
-`brier_score`) joined with the `set_id`, `sentiment_model`, `label`, and
-`category` from `feature_sets.xlsx`.
+`brier_score`) computed from the **filtered** signal rows, plus
+`first_test_timestamp` / `last_test_timestamp` (raw interval-start labels) and
+`first_forecast_origin` / `last_forecast_origin`, joined with the `set_id`,
+`sentiment_model`, `label`, and `category` from `feature_sets.xlsx`.
 
 ---
 

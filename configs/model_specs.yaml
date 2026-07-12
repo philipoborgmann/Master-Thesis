@@ -39,6 +39,25 @@ scaler:
   type: "StandardScaler"
   fit_scope: "train_window_only"
 
+# Canonical production forecast-origin sample (SINGLE source of truth).
+#
+# The stored signal ``timestamp`` is the INTERVAL-START label. The completed
+# information interval is ``[timestamp, timestamp + h)``; the FORECAST ORIGIN
+# is ``timestamp + h`` (the instant the model stands at to forecast the NEXT
+# interval ``[timestamp + h, timestamp + 2h)``).
+#
+# Inclusion in the canonical signal sample is decided on the FORECAST ORIGIN,
+# NOT the raw stored timestamp — the correct final raw timestamp therefore
+# differs by horizon (1h/6h/1d). Rows are retained iff
+#     start <= forecast_origin < end_exclusive.
+# Do not hard-code these dates anywhere else; import this block.
+forecast_sample:
+  basis: forecast_origin
+  start: "2022-01-01T00:00:00Z"
+  end_exclusive: "2023-01-01T00:00:00Z"
+  retain_raw_timestamp: true          # keep the raw interval-start timestamp
+  write_forecast_origin_column: true  # add a tz-aware forecast_origin column
+
 # Classification threshold (applied to predicted probability).
 threshold: 0.5
 

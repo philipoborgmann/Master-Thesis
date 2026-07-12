@@ -5,6 +5,34 @@ full-sample winsorisation was removed from feature construction and replaced
 by leakage-safe **training-window** winsorisation inside the model
 (`thesis_pipeline.modeling.preprocessing`).
 
+## Forecast-origin sample (canonical, no post-run pruning)
+
+Signal output is now restricted **at write time** to the pre-specified 2022
+forecast-origin sample — there is **no separate post-run pruning step** in the
+canonical workflow.
+
+* The stored `timestamp` is the **interval-start label**; the completed
+  information interval is `[timestamp, timestamp + h)`.
+* The **forecast origin** is `timestamp + h`; the model forecasts the next
+  interval `[timestamp + h, timestamp + 2h)`.
+* Inclusion is decided on the **forecast origin** (not the raw timestamp):
+  a row is written iff `2022-01-01T00:00:00Z <= forecast_origin < 2023-01-01T00:00:00Z`
+  (end-exclusive). The correct final raw timestamp therefore differs by horizon.
+* Every canonical signal parquet carries a tz-aware `forecast_origin` column.
+* The single source of truth is the `forecast_sample` block in
+  `configs/model_specs.yaml`; the horizon→offset map and filter live in
+  `thesis_pipeline.modeling.forecast_sample`.
+* The legacy external pruning that produced `Outputs/Signals_2022` is **no
+  longer part of the canonical run** — keep it only as a non-canonical audit
+  utility if desired.
+
+## Family roles (evaluation)
+
+A–D (`A_H1_logloss`, `B_H1_directional`, `C_H2_volatility`, `D_H3_marketcap`)
+are **confirmatory**. `E1_horizon_logloss`, `E2_horizon_accuracy` and
+`EXPL_sentiment_only_directional` are **exploratory** (each still gets its own
+BH pass). The manifest exposes `family_role` per family.
+
 ## Why everything must be regenerated
 
 The preprocessing methodology changed, so **old features, signals and model

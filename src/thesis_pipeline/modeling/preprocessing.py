@@ -300,17 +300,24 @@ def winsorize_train_test(train_df: pd.DataFrame,
 def preprocessing_signature(*,
                             config: Mapping[str, Any] | None = None,
                             model_window: Any = None,
-                            hpo_objective: Any = None) -> str:
-    """Stable short hash of the preprocessing configuration.
+                            hpo_objective: Any = None,
+                            forecast_sample: Mapping[str, Any] | None = None
+                            ) -> str:
+    """Stable short hash of the preprocessing + output configuration.
 
     Covers (at least) winsorisation on/off, the quantile bounds, the grouping
-    rule, the feature allowlist, the model training window and the HPO
-    objective — so a checkpoint / signal file produced under a different
-    preprocessing methodology can be detected and rejected.
+    rule, the feature allowlist, the model training window, the HPO objective
+    AND the forecast-origin sample contract — so a checkpoint / signal file
+    produced under a different preprocessing methodology OR a different output
+    sample window can be detected and rejected.
     """
     cfg = dict(default_winsor_config())
     if config:
         cfg.update(config)
+    fs_sig = None
+    if forecast_sample is not None:
+        from .forecast_sample import forecast_sample_signature
+        fs_sig = forecast_sample_signature(forecast_sample)
     payload = {
         "winsor_enabled": bool(cfg["enabled"]),
         "lower_quantile": float(cfg["lower_quantile"]),
@@ -320,6 +327,7 @@ def preprocessing_signature(*,
         "allowlist": sorted(str(f) for f in cfg["allowlist"]),
         "model_window": _norm(model_window),
         "hpo_objective": _norm(hpo_objective),
+        "forecast_sample": fs_sig,
         "schema": "v5_training_window_winsor",
     }
     blob = json.dumps(payload, sort_keys=True, default=str)

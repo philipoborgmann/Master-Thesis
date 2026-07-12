@@ -1,10 +1,16 @@
-"""Pre-registration config for the evaluation-layer multiplicity plan.
+"""Pre-specified config for the evaluation-layer multiplicity plan.
 
 This is the SINGLE source of truth for the multiple-testing family
 structure, metric roles and the Diebold-Mariano-type inference settings.
 Nothing in this block may be hard-coded elsewhere — the writers import
-these constants so a reviewer can audit the entire pre-registration in
-one place.
+these constants so a reviewer can audit the entire multiplicity plan in
+one place. (No external pre-registration exists; the user-facing wording
+is "pre-specified".)
+
+Family roles: A–D are CONFIRMATORY; E1, E2 (pairwise horizon contrasts) and
+EXPL_sentiment_only_directional are EXPLORATORY. Every family — confirmatory
+or exploratory — is corrected by the SAME central family-aware BH pass,
+WITHIN the family only.
 
 Run mode (guardrail): evaluation is a SINGLE all-horizons
 ``evaluate-signals`` pass. Benjamini-Hochberg pools p-values across
@@ -77,26 +83,53 @@ DM_INFERENCE = {
 
 
 # ---------------------------------------------------------------------------
-# Pre-registered confirmatory families
+# Pre-specified confirmatory + exploratory families
 # ---------------------------------------------------------------------------
 
-#: Confirmatory family identifiers. Log-loss (A, E1) and directional
-#: (B, E2) p-values NEVER share a family; economic/backtest p-values
-#: never share a family with forecast-quality tests.
+#: Family identifiers. Log-loss (A, E1) and directional (B, E2) p-values
+#: NEVER share a family; economic/backtest p-values never share a family
+#: with forecast-quality tests.
+#:
+#: Roles (thesis design):
+#:   * CONFIRMATORY : A_H1_logloss, B_H1_directional, C_H2_volatility,
+#:                    D_H3_marketcap.
+#:   * EXPLORATORY  : E1_horizon_logloss, E2_horizon_accuracy (pairwise
+#:                    horizon contrasts) and EXPL_sentiment_only_directional.
+#: The horizon-comparison families E1/E2 are EXPLORATORY — they are pairwise
+#: horizon contrasts derived from the confirmatory effects, not part of the
+#: pre-specified confirmatory hypothesis set.
 FAMILY_A_H1_LOGLOSS      = "A_H1_logloss"
 FAMILY_B_H1_DIRECTIONAL  = "B_H1_directional"
 FAMILY_C_H2_VOLATILITY   = "C_H2_volatility"
 FAMILY_D_H3_MARKETCAP    = "D_H3_marketcap"
 FAMILY_E1_HORIZON_LOGLOSS  = "E1_horizon_logloss"
 FAMILY_E2_HORIZON_ACCURACY = "E2_horizon_accuracy"
+FAMILY_EXPL_SENTIMENT_DIRECTIONAL = "EXPL_sentiment_only_directional"
 
+#: The four pre-specified CONFIRMATORY families (A–D). E1/E2 are NOT here.
 CONFIRMATORY_FAMILIES = (
     FAMILY_A_H1_LOGLOSS,
     FAMILY_B_H1_DIRECTIONAL,
     FAMILY_C_H2_VOLATILITY,
     FAMILY_D_H3_MARKETCAP,
+)
+
+#: EXPLORATORY families. Each is BH-corrected WITHIN the family (exactly like
+#: the confirmatory ones — same central family-aware correction), but reported
+#: as exploratory: they are NOT part of the pre-specified confirmatory set and
+#: must never alter the A–D counts. Listed in the manifest with
+#: ``family_role="exploratory"``.
+#:
+#: * E1_horizon_logloss  — pairwise horizon contrasts of the log-loss effect
+#:   (its OWN BH pass; pooled over 3 horizon pairs × 2 sentiment methods × 4
+#:   feature blocks; never mixed with E2 or with A–D).
+#: * E2_horizon_accuracy — pairwise horizon contrasts of the accuracy effect
+#:   (its OWN BH pass; same pooling; never mixed with E1 or with A–D).
+#: * EXPL_sentiment_only_directional — sentiment-only SENT_* vs ECON McNemar.
+EXPLORATORY_FAMILIES = (
     FAMILY_E1_HORIZON_LOGLOSS,
     FAMILY_E2_HORIZON_ACCURACY,
+    FAMILY_EXPL_SENTIMENT_DIRECTIONAL,
 )
 
 #: Human-readable descriptions for the manifest.
@@ -115,29 +148,17 @@ FAMILY_DESCRIPTIONS = {
         "H3 market-cap regime: small-vs-large cap cluster-robust "
         "difference-in-improvement (accuracy-based).",
     FAMILY_E1_HORIZON_LOGLOSS:
-        "Pairwise horizon contrasts of the log-loss sentiment effect "
-        "(independent-sample z on bootstrap SEs).",
+        "EXPLORATORY: pairwise horizon contrasts of the log-loss sentiment "
+        "effect (independent-sample z on bootstrap SEs; own BH pass).",
     FAMILY_E2_HORIZON_ACCURACY:
-        "Pairwise horizon contrasts of the accuracy sentiment effect "
-        "(independent-sample z on bootstrap SEs).",
+        "EXPLORATORY: pairwise horizon contrasts of the accuracy sentiment "
+        "effect (independent-sample z on bootstrap SEs; own BH pass).",
+    FAMILY_EXPL_SENTIMENT_DIRECTIONAL:
+        "EXPLORATORY (not confirmatory): sentiment-only SENT_* vs ECON "
+        "directional McNemar, 3 horizons × 8 SENT sets, BH within family. "
+        "These sets are not nested H1 members (Family B covers only the "
+        "combined ECON_* sets).",
 }
-
-#: EXPLORATORY families. BH-corrected WITHIN the family (like the
-#: confirmatory ones) but reported as exploratory — they are NOT part of
-#: the pre-registered confirmatory set and must never alter the A–E
-#: counts. Listed in the manifest with ``family_role="exploratory"``.
-FAMILY_EXPL_SENTIMENT_DIRECTIONAL = "EXPL_sentiment_only_directional"
-
-EXPLORATORY_FAMILIES = (
-    FAMILY_EXPL_SENTIMENT_DIRECTIONAL,
-)
-
-FAMILY_DESCRIPTIONS[FAMILY_EXPL_SENTIMENT_DIRECTIONAL] = (
-    "EXPLORATORY (not confirmatory): sentiment-only SENT_* vs ECON "
-    "directional McNemar, 3 horizons × 8 SENT sets, BH within family. "
-    "These sets are not nested H1 members (Family B covers only the "
-    "combined ECON_* sets)."
-)
 
 #: Descriptive / separate surfaces that must NEVER be assigned a
 #: confirmatory family or a q-value.
@@ -149,7 +170,7 @@ DESCRIPTIVE_SURFACES = (
 )
 
 #: Economic/backtest p-values, if any, form their own separate family —
-#: never mixed with A–E.
+#: never mixed with A–D (confirmatory) or the exploratory families.
 FAMILY_F_ECONOMIC = "F_economic"
 
 

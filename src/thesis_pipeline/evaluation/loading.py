@@ -59,12 +59,16 @@ def canonical_sentiment_model(value) -> str:
     return s
 
 
-def discover_signal_files(horizon: str | None = None) -> list[Path]:
-    """List every signal parquet under ``Outputs/Signals/{horizon}/``.
+def discover_signal_files(horizon: str | None = None,
+                          signals_root: str | Path | None = None) -> list[Path]:
+    """List every signal parquet under ``{signals_root}/{horizon}/``.
 
     When ``horizon`` is ``None``, all known horizons are searched.
+    ``signals_root`` overrides the configured ``paths.yaml`` root for discovery
+    only (used by the evaluate-signals ``--signals-root`` flag); it never
+    mutates any configuration file.
     """
-    root = resolve_path("signals_root")
+    root = Path(signals_root) if signals_root else resolve_path("signals_root")
     if not root.exists():
         return []
     if horizon:
@@ -118,6 +122,68 @@ def _normalise_signal_frame(df: pd.DataFrame, *, source: Path) -> pd.DataFrame:
         df["hpo_enabled"] = (
             df["hpo_enabled"].map(_as_bool).fillna(False).astype(bool)
         )
+
+    # Forecast-origin compatibility (Objective B / Section 9): accept a
+    # ``forecast_origin`` column, derive it for older files that lack one,
+    # validate it equals ``timestamp + h`` (reporting mismatches), and enforce
+    # the configured sample window.
+    df = _apply_forecast_origin(df, source=source)
+    return df
+
+
+def _apply_forecast_origin(df: pd.DataFrame, *, source: Path) -> pd.DataFrame:
+    """Accept / derive / validate ``forecast_origin`` and enforce the sample
+    period. Backward compatible with files that predate the column.
+
+    * present column  → validate ``== timestamp + h``; inconsistent rows are
+      dropped with a clear WARNING (never silently corrected);
+    * absent column   → derived from ``timestamp`` + the per-row ``horizon``
+      metadata (never the filename) via the central utility;
+    * finally, rows whose forecast origin is outside the configured
+      ``[start, end_exclusive)`` window are dropped (when filtering is enabled).
+    """
+    from ..modeling.forecast_sample import (
+        FORECAST_ORIGIN_COLUMN, add_forecast_origin, load_forecast_sample_config,
+        sample_bounds, validate_forecast_origin,
+    )
+    logger = get_logger()
+    hz_vals = [h for h in df["horizon"].astype(str).unique()
+               if h and h.lower() not in ("nan", "none", "")]
+    if len(hz_vals) != 1 or str(hz_vals[0]).lower() not in ("1h", "6h", "1d"):
+        # Cannot unambiguously determine the horizon → leave the frame as-is
+        # (defensive backward compatibility; do not guess the offset).
+        if FORECAST_ORIGIN_COLUMN not in df.columns:
+            logger.warning(
+                "evaluate-signals: %s has no usable 'horizon' metadata — "
+                "forecast_origin not derived; period filter skipped.",
+                source.name)
+        return df
+    hz = str(hz_vals[0]).lower()
+
+    if FORECAST_ORIGIN_COLUMN in df.columns:
+        ok = validate_forecast_origin(df, hz).to_numpy()
+        n_mis = int((~ok).sum())
+        if n_mis:
+            logger.warning(
+                "evaluate-signals: %s has %d/%d rows where forecast_origin != "
+                "timestamp + %s — dropping the inconsistent rows (reported, "
+                "NOT silently corrected).", source.name, n_mis, len(df), hz)
+            df = df[ok].reset_index(drop=True)
+    # Normalise dtype (keeps a valid existing column) or derive for old files.
+    df = add_forecast_origin(df, hz)
+
+    fs = load_forecast_sample_config()
+    if fs.get("enabled", True) and not df.empty:
+        start, end = sample_bounds(fs)
+        fo = df[FORECAST_ORIGIN_COLUMN]
+        in_period = ((fo >= start) & (fo < end)).to_numpy()
+        n_out = int((~in_period).sum())
+        if n_out:
+            logger.warning(
+                "evaluate-signals: %s — dropping %d/%d rows with forecast_origin "
+                "outside the sample window [%s, %s).",
+                source.name, n_out, len(df), start, end)
+            df = df[in_period].reset_index(drop=True)
     return df
 
 
