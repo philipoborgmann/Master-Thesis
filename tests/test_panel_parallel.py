@@ -69,9 +69,12 @@ def test_n_jobs_arg_parsing_and_validation():
 
 
 def test_resolve_n_jobs():
+    import joblib
     assert pl._resolve_n_jobs(1) == 1
     assert pl._resolve_n_jobs(3) == 3
-    assert pl._resolve_n_jobs(-1) == (os.cpu_count() or 1)
+    # -1 means "all CPUs available to THIS process/container": use joblib's
+    # quota-aware count (respects cgroup/affinity limits), not os.cpu_count().
+    assert pl._resolve_n_jobs(-1) == max(int(joblib.cpu_count()), 1)
     for bad in (0, -2, -99):
         with pytest.raises(ValueError):
             pl._resolve_n_jobs(bad)
@@ -249,3 +252,97 @@ def _worker_threadpool_limits():
     from threadpoolctl import threadpool_info, threadpool_limits
     with threadpool_limits(limits=1):
         return [d.get("num_threads") for d in threadpool_info()]
+
+
+# --- 13. declared joblib floor stays >= the generator_unordered requirement --
+
+def _declared_joblib_min(text: str) -> tuple[int, ...]:
+    """Parse the ``joblib>=X.Y[.Z]`` lower bound from a requirements/pyproject
+    blob. Returns the version as an int tuple (e.g. (1, 4, 2))."""
+    import re
+    m = re.search(r"joblib\s*>=\s*([0-9]+(?:\.[0-9]+)*)", text)
+    assert m, "no 'joblib>=...' declaration found"
+    return tuple(int(p) for p in m.group(1).split("."))
+
+
+def test_declared_joblib_supports_generator_unordered():
+    # Parallel(return_as="generator_unordered") — used by the panel chunk
+    # orchestrator — needs joblib >= 1.4. Guard both dependency manifests so
+    # the declared floor can never silently drop below what the code requires.
+    root = Path(__file__).resolve().parents[1]
+    required = (1, 4)
+    for name in ("pyproject.toml", "requirements.txt"):
+        declared = _declared_joblib_min((root / name).read_text())
+        assert declared >= required, (
+            f"{name} declares joblib>={'.'.join(map(str, declared))}; "
+            f"generator_unordered requires >= {'.'.join(map(str, required))}")
+
+
+# --- 14. --no-checkpoint ignores --n-jobs: sequential, warned, no temp file ---
+
+def _no_ckpt_repo(tmp_path, monkeypatch):
+    """Minimal synthetic repo (features + feature_sets.xlsx) so the panel CLI
+    can run end-to-end under ``--no-checkpoint``. Enough timestamps that a
+    checkpointed parallel run WOULD dispatch workers, isolating the sequential
+    fallback as the reason no worker temp file appears."""
+    (tmp_path / "Data" / "Final").mkdir(parents=True)
+    (tmp_path / "Outputs" / "Signals").mkdir(parents=True)
+    rng = np.random.default_rng(0)
+    ts = pd.date_range("2022-01-01", periods=120, freq="D", tz="UTC")
+    frames = []
+    for tk in ("BTC", "ETH", "SOL"):
+        s = rng.normal(0, 1, len(ts))
+        frames.append(pd.DataFrame({
+            "timestamp": ts, "ticker": tk, "horizon": "1d",
+            "target": (2.0 * s + 0.3 * rng.normal(0, 1, len(ts)) > 0).astype(int),
+            "signal_feature": s, "noise_feature": rng.normal(0, 1, len(ts)),
+        }))
+    pd.concat(frames, ignore_index=True).to_parquet(
+        tmp_path / "Data" / "Final" / "features_1d.parquet", index=False)
+    fs = pd.DataFrame({
+        "set_id": ["ECON"], "category": ["benchmark"], "sentiment_model": ["-"],
+        "label": ["synthetic ECON"],
+        "Feature Columns (comma-separated)": ["signal_feature,noise_feature"],
+    })
+    with pd.ExcelWriter(tmp_path / "feature_sets.xlsx", engine="openpyxl") as w:
+        fs.to_excel(w, sheet_name="feature_sets", index=False)
+    monkeypatch.chdir(tmp_path)
+
+
+def _load_panel_signal(tmp_path):
+    d = tmp_path / "Outputs" / "Signals" / "1d"
+    cands = sorted(d.glob("ECON_panel_ticker_fe*.parquet"))
+    assert cands, f"no panel signal written under {d}"
+    return pd.read_parquet(cands[0])
+
+
+def test_no_checkpoint_ignores_n_jobs_and_runs_sequential(tmp_path, monkeypatch,
+                                                          capsys):
+    from thesis_pipeline.modeling import run_models as rm
+
+    common = ["--horizon", "1d", "--set-id", "ECON", "--model-type",
+              "panel_logit", "--panel-mode", "ticker_fixed_effects",
+              "--no-tune-hyperparams", "--rolling-window-days", "30",
+              "--restart"]
+
+    # (a) --no-checkpoint with --n-jobs 4: must fall back to the sequential
+    #     path, warn that --n-jobs is ignored, and never write a worker temp.
+    _no_ckpt_repo(tmp_path, monkeypatch)
+    assert rm.main(common + ["--no-checkpoint", "--n-jobs", "4"]) == 0
+    out = capsys.readouterr().out
+    assert ("--n-jobs is ignored when checkpointing is disabled" in out), out
+    # The sequential path never dumps the shared worker parquet anywhere.
+    assert not list(tmp_path.rglob("_worker_input_*.parquet"))
+    par_res = _load_panel_signal(tmp_path)
+
+    # (b) The ordinary sequential run (--no-checkpoint --n-jobs 1, no warning)
+    #     must produce an identical signal frame.
+    assert rm.main(common + ["--no-checkpoint", "--n-jobs", "1"]) == 0
+    out1 = capsys.readouterr().out
+    assert "--n-jobs is ignored when checkpointing is disabled" not in out1
+    seq_res = _load_panel_signal(tmp_path)
+
+    pd.testing.assert_frame_equal(
+        seq_res.sort_values(["timestamp", "ticker"]).reset_index(drop=True),
+        par_res.sort_values(["timestamp", "ticker"]).reset_index(drop=True),
+        check_exact=False, rtol=1e-10, atol=1e-12)

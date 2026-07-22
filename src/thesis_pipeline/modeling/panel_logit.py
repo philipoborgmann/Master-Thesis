@@ -170,11 +170,14 @@ def _resolve_n_jobs(value: int) -> int:
     """Resolve the requested worker count.
 
     ``1`` (default) → sequential; a positive integer → that many workers;
-    ``-1`` → all logical CPUs. ``0`` and values below ``-1`` raise ``ValueError``.
+    ``-1`` → all CPUs available to the process/container (via joblib's
+    quota-aware :func:`joblib.cpu_count`, not the raw host core count).
+    ``0`` and values below ``-1`` raise ``ValueError``.
     """
     v = int(value)
     if v == -1:
-        return os.cpu_count() or 1
+        from joblib import cpu_count
+        return max(int(cpu_count()), 1)
     if v >= 1:
         return v
     raise ValueError(
@@ -931,8 +934,15 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
     # ── Parallel worker count (chunk-level process parallelism) ──────
     # Resolve + validate up front so a bad --n-jobs fails clearly before any
     # heavy work, and the resolved count is visible in the stage header/logs.
+    # Parallelism operates over checkpoint chunks, so it only applies when
+    # checkpointing is enabled; with --no-checkpoint the panel walk-forward
+    # follows its non-checkpointed SEQUENTIAL path regardless of --n-jobs.
     n_jobs_resolved = _resolve_n_jobs(getattr(args, "n_jobs", 1))
-    if n_jobs_resolved > 1:
+    _checkpoint_enabled = bool(getattr(args, "checkpoint", True))
+    if n_jobs_resolved > 1 and not _checkpoint_enabled:
+        print("  [WARN] --n-jobs is ignored when checkpointing is disabled; "
+              "the non-checkpointed panel path runs sequentially.")
+    elif n_jobs_resolved > 1:
         print(f"  [INFO] panel walk-forward: {n_jobs_resolved} worker "
               f"process(es) for checkpoint chunks (1 BLAS thread each).")
 

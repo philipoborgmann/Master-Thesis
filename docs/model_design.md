@@ -135,13 +135,21 @@ a warning under `--model-type panel_logit`.
 
 ## Parallel panel-logit checkpoint chunks (`--n-jobs`)
 
-The panel-logit walk-forward groups its test timestamps into **checkpoint
-chunks** (`--checkpoint-chunk-size`, default 20). A chunk is purely a
-**storage / compute partition** — it does **not** change the training window
-or the forecasting methodology. Every test timestamp τ still selects its own
-training window (`timestamp < τ`), fits its own preprocessing on that window
-only, runs its own nested HPO when enabled, and predicts only τ. Because chunks
-are independent, they can be computed in parallel worker processes.
+`--n-jobs` parallelises the panel-logit **checkpoint chunks**. The walk-forward
+groups its test timestamps into checkpoint chunks (`--checkpoint-chunk-size`,
+default 20). A chunk is purely a **storage / compute partition** — it does
+**not** change the training window or the forecasting methodology. Every test
+timestamp τ still selects its own training window (`timestamp < τ`), fits its
+own preprocessing on that window only, runs its own nested HPO when enabled,
+and predicts only τ. Because chunks are independent, they can be computed in
+parallel worker processes.
+
+**Checkpointing must be enabled for parallel execution.** Parallelism operates
+over checkpoint chunks, so it only applies when checkpointing is on (the
+default). With `--no-checkpoint`, `--n-jobs` is **ignored**: the panel
+walk-forward follows its non-checkpointed **sequential** path regardless of the
+requested worker count, and a warning is printed to say so. To run in parallel,
+keep checkpointing enabled (do not pass `--no-checkpoint`).
 
 ### Option
 
@@ -151,7 +159,9 @@ are independent, they can be computed in parallel worker processes.
 
 * **default `1`** — sequential; behaviour is unchanged for existing users.
 * **positive integer** — that many worker processes.
-* **`-1`** — use all logical CPUs (`os.cpu_count()`).
+* **`-1`** — use all CPUs available to the current **process / container**
+  (via `joblib.cpu_count()`), which respects CPU quotas / cgroup limits and is
+  **not** necessarily every physical or host CPU.
 * **`0` or `< -1`** — a clear validation error.
 
 Each worker is capped at **one** BLAS/OpenMP thread (`threadpoolctl` +
