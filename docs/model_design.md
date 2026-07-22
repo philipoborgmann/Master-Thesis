@@ -132,3 +132,82 @@ or `..._panel_ticker_fe.parquet`, with extra columns `model_type` and
 `panel_mode`. `metrics_summary.csv` gains the same two columns. The B1
 rolling-probability benchmark is not a panel-logit model and is skipped with
 a warning under `--model-type panel_logit`.
+
+## Parallel panel-logit checkpoint chunks (`--n-jobs`)
+
+The panel-logit walk-forward groups its test timestamps into **checkpoint
+chunks** (`--checkpoint-chunk-size`, default 20). A chunk is purely a
+**storage / compute partition** — it does **not** change the training window
+or the forecasting methodology. Every test timestamp τ still selects its own
+training window (`timestamp < τ`), fits its own preprocessing on that window
+only, runs its own nested HPO when enabled, and predicts only τ. Because chunks
+are independent, they can be computed in parallel worker processes.
+
+### Option
+
+```
+--n-jobs N
+```
+
+* **default `1`** — sequential; behaviour is unchanged for existing users.
+* **positive integer** — that many worker processes.
+* **`-1`** — use all logical CPUs (`os.cpu_count()`).
+* **`0` or `< -1`** — a clear validation error.
+
+Each worker is capped at **one** BLAS/OpenMP thread (`threadpoolctl` +
+joblib/loky `inner_max_num_threads=1`) so `N` workers cannot oversubscribe the
+CPU (e.g. avoiding `4 processes × 8 BLAS threads = 32` competing threads). The
+sequential `--n-jobs 1` path keeps the library's normal threading.
+
+### Example
+
+```bash
+python -m thesis_pipeline.cli run-models \
+  --horizon 1h \
+  --model-type panel_logit \
+  --panel-mode ticker_fixed_effects \
+  --n-jobs 4 \
+  --checkpoint-chunk-size 30
+```
+
+### Recommended worker count
+
+**For an 8-core, 32 GB machine, start with `--n-jobs 4`.** More workers are not
+always faster: each worker holds its own copy of the feature frame in RAM, and
+process start-up plus result serialization add overhead. Past the point where
+memory bandwidth or RAM saturates, throughput flattens or regresses. Try
+`--n-jobs 2` and `--n-jobs 4` and keep the faster one for your hardware.
+
+* **GitHub Codespaces:** a 4-core / 8-core machine type is recommended; use
+  `--n-jobs 2` (4-core) or `--n-jobs 4` (8-core).
+* **Memory:** the shared feature frame is written once to a temporary parquet
+  and loaded once per worker (cached), so peak RAM ≈ `n_jobs × frame_size`
+  plus the main process. On 32 GB, four workers on the 1h frame is comfortable.
+
+### Determinism, safety and resume
+
+* Results are **methodologically identical** to the sequential run. The final
+  signal frame is always re-sorted by `(timestamp, ticker)`, so the order in
+  which workers finish never affects the output. Sequential vs parallel outputs
+  are equal within a strict floating-point tolerance (tests use
+  `rtol=1e-10, atol=1e-12`).
+* Only the **main process** writes chunk checkpoints (atomically) and updates
+  `manifest.json` — workers only compute and return rows, so there is no
+  cross-process write race.
+* **Resume** is fully preserved: already-cached chunks are reused, only pending
+  chunks are submitted, a corrupt checkpoint is recomputed, and sequential and
+  parallel runs can resume each other's checkpoints (chunk IDs and paths are
+  deterministic).
+* A **failed worker** re-raises its original exception in the main process, does
+  not mark its chunk complete, leaves completed chunks reusable, and makes the
+  command exit unsuccessfully rather than returning partial results.
+
+### Benchmark output
+
+Parallel runs print a one-line summary per feature set:
+`n_jobs`, total chunks, cached chunks, submitted chunks, elapsed wall-clock and
+average completed-chunk time. Small-dataset speedups are modest (start-up and
+serialization dominate); full-run scaling depends on CPU, RAM, chunk balance and
+serialization overhead, and is expected to approach near-linear up to the core
+count when per-chunk compute (HPO, larger windows) dwarfs the overhead. Do not
+assume a fixed wall-clock target — measure on the target hardware.

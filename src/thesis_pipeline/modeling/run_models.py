@@ -427,6 +427,23 @@ def compute_metrics(signals: pd.DataFrame, ticker_label: str = "pooled") -> dict
 # CLI / ARGPARSE
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _n_jobs_arg(value: str) -> int:
+    """argparse validator for ``--n-jobs``.
+
+    Accepts a positive integer (worker count) or ``-1`` (all logical CPUs).
+    ``0`` and values below ``-1`` raise a clear ``ArgumentTypeError``.
+    """
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"--n-jobs must be an integer; got {value!r}")
+    if v == 0 or v < -1:
+        raise argparse.ArgumentTypeError(
+            f"--n-jobs must be a positive integer or -1 (all CPUs); got {v}")
+    return v
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Argparse parser accepting both old (``--set_id``, ``--ticker``) and
     new (``--set-id``, ``--coins``) argument names."""
@@ -507,6 +524,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-chunk-size", "--checkpoint_chunk_size",
                         dest="checkpoint_chunk_size", type=int, default=20,
                         help="Panel test timestamps per checkpoint chunk.")
+    parser.add_argument("--n-jobs", "--n_jobs", dest="n_jobs",
+                        type=_n_jobs_arg, default=1,
+                        help="Worker processes for panel-logit checkpoint "
+                             "chunks. Default 1 (sequential, unchanged "
+                             "behaviour). A positive integer sets the worker "
+                             "count; -1 uses all logical CPUs. Each worker is "
+                             "capped at one BLAS/OpenMP thread. Recommended: 4 "
+                             "on an 8-core / 32 GB machine.")
     parser.add_argument("--clear-checkpoints", "--clear_checkpoints",
                         dest="clear_checkpoints", action="store_true",
                         help="Delete this run's checkpoint directory before start.")
@@ -1252,6 +1277,7 @@ def run(*, horizon: str | None = None, set_id: str | None = None,
         checkpoint_dir: str | None = None,
         checkpoint_chunk_size: int | None = None,
         clear_checkpoints: bool = False,
+        n_jobs: int = 1,
         generate_naive_reference: bool = True) -> int:
     """Programmatic entry point. Translates keyword arguments to argv for
     :func:`main`. Prefer calling :func:`main` directly with an argv list.
@@ -1307,6 +1333,8 @@ def run(*, horizon: str | None = None, set_id: str | None = None,
         argv += ["--checkpoint-dir", checkpoint_dir]
     if checkpoint_chunk_size is not None:
         argv += ["--checkpoint-chunk-size", str(checkpoint_chunk_size)]
+    if n_jobs != 1:
+        argv += ["--n-jobs", str(n_jobs)]
     if clear_checkpoints:
         argv.append("--clear-checkpoints")
     if smoke:

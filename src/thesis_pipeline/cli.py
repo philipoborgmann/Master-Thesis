@@ -126,6 +126,13 @@ def _add_run_models_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--checkpoint-chunk-size", "--checkpoint_chunk_size",
                         dest="checkpoint_chunk_size", type=int, default=20,
                         help="Number of panel test timestamps per checkpoint chunk.")
+    parser.add_argument("--n-jobs", "--n_jobs", dest="n_jobs",
+                        type=int, default=1,
+                        help="Worker processes for panel-logit checkpoint "
+                             "chunks. Default 1 (sequential). Positive int = "
+                             "worker count; -1 = all logical CPUs; each worker "
+                             "is capped at one BLAS thread. Recommended: 4 on "
+                             "an 8-core / 32 GB machine.")
     parser.add_argument("--clear-checkpoints", "--clear_checkpoints",
                         dest="clear_checkpoints", action="store_true",
                         help="Delete this run's checkpoint directory before "
@@ -397,6 +404,8 @@ def cmd_run_models(args: argparse.Namespace) -> int:
         argv += ["--checkpoint-dir", args.checkpoint_dir]
     if getattr(args, "checkpoint_chunk_size", None) is not None:
         argv += ["--checkpoint-chunk-size", str(args.checkpoint_chunk_size)]
+    if getattr(args, "n_jobs", None) is not None:
+        argv += ["--n-jobs", str(args.n_jobs)]
     if getattr(args, "clear_checkpoints", False):
         argv.append("--clear-checkpoints")
     if getattr(args, "train_window", None):
