@@ -129,6 +129,239 @@ def build_panel_design_matrix(train_df: pd.DataFrame,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PARALLELISATION — top-level, picklable worker helpers
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Chunk-level process parallelism for the panel walk-forward. A "chunk" is a
+# STORAGE/COMPUTE partition of consecutive test timestamps — it does NOT change
+# the training window or the forecasting methodology: every test timestamp τ
+# still selects its own training window (timestamp < τ), fits its own
+# preprocessing on that window only, runs its own HPO when enabled, and predicts
+# only τ. Parallelising chunks is therefore methodologically identical to the
+# sequential path; the only observable difference is wall-clock time and the
+# order in which chunk checkpoints are produced (the final frame is always
+# re-sorted by (timestamp, ticker), so output is deterministic).
+#
+# The worker functions are module-level and take only picklable arguments so the
+# implementation works under both fork (Linux) and spawn (Windows / some
+# Codespaces) multiprocessing. The large feature frame is written ONCE to a
+# temporary parquet by the main process and loaded ONCE per worker process
+# (cached in ``_WORKER_DF_CACHE``), avoiding a per-task DataFrame pickle/copy.
+
+from dataclasses import dataclass
+
+
+@dataclass
+class _PanelParams:
+    """Picklable bundle of the per-run panel parameters shared by every
+    timestamp/chunk (never the DataFrame itself)."""
+    feature_cols: list
+    C: float
+    panel_mode: str
+    min_train_obs: int
+    tune_hyperparams: bool
+    hpo_config: dict
+    train_window_mode: str
+    rolling_window_timestamps: int | None
+    rolling_window_days: float | None
+
+
+def _resolve_n_jobs(value: int) -> int:
+    """Resolve the requested worker count.
+
+    ``1`` (default) → sequential; a positive integer → that many workers;
+    ``-1`` → all CPUs available to the process/container (via joblib's
+    quota-aware :func:`joblib.cpu_count`, not the raw host core count).
+    ``0`` and values below ``-1`` raise ``ValueError``.
+    """
+    v = int(value)
+    if v == -1:
+        from joblib import cpu_count
+        return max(int(cpu_count()), 1)
+    if v >= 1:
+        return v
+    raise ValueError(
+        f"n_jobs must be a positive integer or -1 (all CPUs); got {value!r}")
+
+
+def _predict_panel_timestamp(df: pd.DataFrame, unique_ts: np.ndarray, i: int,
+                             p: _PanelParams) -> list[dict]:
+    """Predictions for the single test timestamp ``unique_ts[i]``.
+
+    Top-level (picklable) equivalent of the historical nested helper — the SOLE
+    source of truth for a single-timestamp panel prediction, used by both the
+    sequential loop and the parallel workers so the two paths are identical.
+    """
+    from .windowing import select_panel_train_window
+    tau = unique_ts[i]
+    train_df, test_df, window_meta = select_panel_train_window(
+        df, tau,
+        train_window_mode=p.train_window_mode,
+        rolling_window_timestamps=p.rolling_window_timestamps,
+        rolling_window_days=p.rolling_window_days,
+    )
+    train_df = train_df.dropna(subset=p.feature_cols + ["target"])
+    test_df = test_df.dropna(subset=p.feature_cols + ["target"])
+    if (len(train_df) < p.min_train_obs
+            or train_df["target"].nunique() < 2
+            or test_df.empty):
+        return []
+    test_df = test_df.reset_index(drop=True)
+
+    window_cols = {
+        "train_window_mode":       window_meta["train_window_mode"],
+        "train_window_timestamps": window_meta["train_window_timestamps"],
+        "train_start_timestamp":   window_meta["train_start_timestamp"],
+        "train_end_timestamp":     window_meta["train_end_timestamp"],
+    }
+
+    if p.tune_hyperparams:
+        from .hyperparameter_tuning import (
+            PANEL, hpo_row_columns, predict_proba, tune_logistic_hyperparams,
+        )
+        hpo_config = p.hpo_config or {}
+        objective = hpo_config.get("objective", "brier_score")
+        search_space = hpo_config.get("search_space", {})
+        res = tune_logistic_hyperparams(
+            train_df, p.feature_cols,
+            family=PANEL, objective=objective,
+            search_space=search_space, hpo_cfg=hpo_config,
+            panel_mode=p.panel_mode,
+        )
+        proba = predict_proba(res["artifacts"], test_df, p.feature_cols,
+                              family=PANEL, panel_mode=p.panel_mode)
+        preds = (proba >= 0.5).astype(int)
+        hpo_cols = hpo_row_columns(objective, res)
+        rows = []
+        for j in range(len(test_df)):
+            row = {
+                "timestamp":   test_df.loc[j, "timestamp"],
+                "ticker":      test_df.loc[j, "ticker"],
+                "target":      int(test_df.loc[j, "target"]),
+                "prediction":  int(preds[j]),
+                "probability": float(proba[j]),
+            }
+            row.update(hpo_cols)
+            row.update(window_cols)
+            rows.append(row)
+        return rows
+
+    X_tr, y_tr, X_te = build_panel_design_matrix(
+        train_df, test_df, p.feature_cols, p.panel_mode,
+    )
+    model = LogisticRegression(
+        penalty="l2", C=p.C, solver="lbfgs", max_iter=1000, random_state=42,
+    )
+    model.fit(X_tr, y_tr)
+    preds = model.predict(X_te).astype(int)
+    proba = model.predict_proba(X_te)[:, 1]
+    return [{
+        "timestamp":   test_df.loc[j, "timestamp"],
+        "ticker":      test_df.loc[j, "ticker"],
+        "target":      int(test_df.loc[j, "target"]),
+        "prediction":  int(preds[j]),
+        "probability": float(proba[j]),
+        **window_cols,
+    } for j in range(len(test_df))]
+
+
+#: Per-worker cache of the input frame, keyed by (path, mtime). loky reuses a
+#: worker process across many chunks, so the (potentially large) feature frame
+#: is read from the shared temp parquet only ONCE per worker, not per task.
+_WORKER_DF_CACHE: dict = {}
+
+
+def _load_worker_df(path: str, mtime: float) -> pd.DataFrame:
+    key = (str(path), float(mtime))
+    df = _WORKER_DF_CACHE.get(key)
+    if df is None:
+        df = (pd.read_parquet(path)
+              .sort_values(["timestamp", "ticker"]).reset_index(drop=True))
+        _WORKER_DF_CACHE.clear()      # only ever keep the current run's frame
+        _WORKER_DF_CACHE[key] = df
+    return df
+
+
+def _compute_panel_chunk_from_path(chunk_id: int, idx_group: list[int],
+                                   input_path: str, input_mtime: float,
+                                   params: _PanelParams
+                                   ) -> tuple[int, list[dict]]:
+    """Worker entry point: compute one whole chunk of test timestamps.
+
+    Loads the shared feature frame (cached per worker process) and returns
+    ``(chunk_id, rows)``. It does NOT touch the checkpoint files or the
+    manifest — only the main process persists results, so there is no
+    cross-process write race.
+
+    Every worker caps its BLAS/OpenMP threadpools to ONE thread for the
+    duration of the numerical work (``threadpoolctl.threadpool_limits``) — the
+    explicit, tested anti-oversubscription mechanism, complementing joblib's
+    ``inner_max_num_threads``. This is scoped to the worker call only and never
+    mutates the parent process's environment.
+    """
+    from threadpoolctl import threadpool_limits
+    with threadpool_limits(limits=1):
+        df = _load_worker_df(input_path, input_mtime)
+        unique_ts = np.sort(df["timestamp"].unique())
+        rows: list[dict] = []
+        for i in idx_group:
+            rows.extend(_predict_panel_timestamp(df, unique_ts, i, params))
+    return chunk_id, rows
+
+
+def _run_panel_chunks_parallel(*, df: pd.DataFrame,
+                               pending: list[tuple[int, list[int]]],
+                               params: _PanelParams,
+                               root,
+                               resolved_n_jobs: int,
+                               persist) -> None:
+    """Compute ``pending`` chunks in a loky process pool and persist each
+    result from the MAIN process as it completes.
+
+    * The feature frame is written ONCE to a temp parquet under ``root`` and
+      loaded once per worker (cached), so it is not re-pickled per task.
+    * ``inner_max_num_threads=1`` caps each worker's BLAS/OpenMP threads at one
+      to avoid ``n_jobs × BLAS`` oversubscription — without permanently
+      mutating the parent process environment.
+    * Results stream back UNORDERED; only the main process writes checkpoints
+      and the manifest (no cross-process write race). A worker exception is
+      re-raised here (aborting the run) so the command fails loudly instead of
+      returning partial results; checkpoints already written stay reusable.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from joblib import Parallel, delayed
+
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(suffix=".parquet", prefix="_worker_input_",
+                               dir=str(root))
+    os.close(fd)
+    try:
+        df.to_parquet(tmp, index=False)
+        mtime = os.path.getmtime(tmp)
+        tasks = (delayed(_compute_panel_chunk_from_path)(
+                    chunk_id, idx_group, tmp, mtime, params)
+                 for chunk_id, idx_group in pending)
+        # ``generator_unordered`` yields each chunk as soon as a worker finishes
+        # so the main process can persist it immediately (bounded memory, live
+        # progress). Worker exceptions surface when the generator is consumed.
+        results = Parallel(
+            n_jobs=resolved_n_jobs, backend="loky",
+            inner_max_num_threads=1, return_as="generator_unordered",
+        )(tasks)
+        for chunk_id, rows in results:
+            persist(chunk_id, rows)
+            print(f"     chunk_{chunk_id:04d} → computed + checkpointed (worker)")
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PANEL WALK-FORWARD
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -144,7 +377,8 @@ def run_panel_walk_forward(df: pd.DataFrame,
                            checkpoint_context: dict | None = None,
                            train_window_mode: str = "expanding",
                            rolling_window_timestamps: int | None = None,
-                           rolling_window_days: float | None = None) -> pd.DataFrame:
+                           rolling_window_days: float | None = None,
+                           n_jobs: int = 1) -> pd.DataFrame:
     """Expanding-window pooled panel logit over all coins.
 
     Returns a signal frame with columns:
@@ -180,93 +414,25 @@ def run_panel_walk_forward(df: pd.DataFrame,
     if n_ts == 0:
         return pd.DataFrame()
 
-    if tune_hyperparams:
-        from .hyperparameter_tuning import (
-            PANEL, hpo_row_columns, predict_proba, tune_logistic_hyperparams,
-        )
-        hpo_config = hpo_config or {}
-        objective = hpo_config.get("objective", "brier_score")
-        search_space = hpo_config.get("search_space", {})
-
     init_idx = max(int(n_ts * init_train_frac), min_init_timestamps)
 
-    from .windowing import select_panel_train_window
+    # Single source of truth for the per-timestamp/per-chunk parameters —
+    # shared verbatim by the sequential loop and the parallel workers.
+    params = _PanelParams(
+        feature_cols=list(feature_cols),
+        C=C,
+        panel_mode=panel_mode,
+        min_train_obs=min_train_obs,
+        tune_hyperparams=bool(tune_hyperparams),
+        hpo_config=dict(hpo_config or {}),
+        train_window_mode=train_window_mode,
+        rolling_window_timestamps=rolling_window_timestamps,
+        rolling_window_days=rolling_window_days,
+    )
 
     def _predict_one_timestamp(i: int) -> list[dict]:
-        """Predictions for the single test timestamp ``unique_ts[i]``.
-
-        The training slice is chosen by :func:`select_panel_train_window` —
-        ``expanding`` (all rows with ``timestamp < τ``, the historical
-        behaviour) or ``rolling_fixed`` with a manually specified window
-        length. The test slice always equals rows with ``timestamp == τ``.
-        Independent of any chunking — identical whether or not checkpointing is
-        on.
-        """
-        tau = unique_ts[i]
-        train_df, test_df, window_meta = select_panel_train_window(
-            df, tau,
-            train_window_mode=train_window_mode,
-            rolling_window_timestamps=rolling_window_timestamps,
-            rolling_window_days=rolling_window_days,
-        )
-        train_df = train_df.dropna(subset=feature_cols + ["target"])
-        test_df  = test_df.dropna(subset=feature_cols + ["target"])
-        if (len(train_df) < min_train_obs
-                or train_df["target"].nunique() < 2
-                or test_df.empty):
-            return []
-        test_df = test_df.reset_index(drop=True)
-
-        # Window-provenance columns attached to every output row.
-        window_cols = {
-            "train_window_mode":     window_meta["train_window_mode"],
-            "train_window_timestamps": window_meta["train_window_timestamps"],
-            "train_start_timestamp": window_meta["train_start_timestamp"],
-            "train_end_timestamp":   window_meta["train_end_timestamp"],
-        }
-
-        if tune_hyperparams:
-            res = tune_logistic_hyperparams(
-                train_df, feature_cols,
-                family=PANEL, objective=objective,
-                search_space=search_space, hpo_cfg=hpo_config,
-                panel_mode=panel_mode,
-            )
-            proba = predict_proba(res["artifacts"], test_df, feature_cols,
-                                  family=PANEL, panel_mode=panel_mode)
-            preds = (proba >= 0.5).astype(int)
-            hpo_cols = hpo_row_columns(objective, res)
-            rows = []
-            for j in range(len(test_df)):
-                row = {
-                    "timestamp":   test_df.loc[j, "timestamp"],
-                    "ticker":      test_df.loc[j, "ticker"],
-                    "target":      int(test_df.loc[j, "target"]),
-                    "prediction":  int(preds[j]),
-                    "probability": float(proba[j]),
-                }
-                row.update(hpo_cols)
-                row.update(window_cols)
-                rows.append(row)
-            return rows
-
-        X_tr, y_tr, X_te = build_panel_design_matrix(
-            train_df, test_df, feature_cols, panel_mode,
-        )
-        model = LogisticRegression(
-            penalty="l2", C=C, solver="lbfgs", max_iter=1000, random_state=42,
-        )
-        model.fit(X_tr, y_tr)
-        preds = model.predict(X_te).astype(int)
-        proba = model.predict_proba(X_te)[:, 1]
-        return [{
-            "timestamp":   test_df.loc[j, "timestamp"],
-            "ticker":      test_df.loc[j, "ticker"],
-            "target":      int(test_df.loc[j, "target"]),
-            "prediction":  int(preds[j]),
-            "probability": float(proba[j]),
-            **window_cols,
-        } for j in range(len(test_df))]
+        """Sequential-path wrapper around the top-level per-timestamp helper."""
+        return _predict_panel_timestamp(df, unique_ts, i, params)
 
     test_indices = list(range(init_idx, n_ts))
     ckpt_on = bool(checkpoint_context and checkpoint_context.get("enabled"))
@@ -283,14 +449,21 @@ def run_panel_walk_forward(df: pd.DataFrame,
     root      = checkpoint_context["root"]
     resume    = bool(checkpoint_context.get("resume", True))
     chunk_size = int(checkpoint_context.get("chunk_size", ckpt.DEFAULT_CHUNK_SIZE))
+    resolved_n_jobs = _resolve_n_jobs(
+        checkpoint_context.get("n_jobs", n_jobs))
     chunks = ckpt.chunk_indices(test_indices, chunk_size)
 
     manifest = ckpt.load_manifest(root)
     manifest["total_chunks"] = len(chunks)
     manifest["status"] = "running"
+    manifest["n_jobs"] = resolved_n_jobs
     ckpt.write_manifest(root, manifest)
 
+    # Partition into already-cached vs pending BEFORE dispatch (main process
+    # only). Cached chunks are reused; only pending chunks are (re)computed.
     frames: list[pd.DataFrame] = []
+    pending: list[tuple[int, list[int]]] = []
+    n_cached = 0
     for chunk_id, idx_group in enumerate(chunks):
         cp_path = ckpt.chunk_checkpoint_path(root, chunk_id)
         if resume and cp_path.exists():
@@ -298,19 +471,43 @@ def run_panel_walk_forward(df: pd.DataFrame,
             if cached is not None:
                 if not cached.empty:
                     frames.append(cached)
+                n_cached += 1
                 print(f"     chunk_{chunk_id:04d} → CACHED CHECKPOINT")
                 continue
-        chunk_rows: list[dict] = []
-        for i in idx_group:
-            chunk_rows.extend(_predict_one_timestamp(i))
-        chunk_df = (pd.DataFrame(chunk_rows) if chunk_rows
+        pending.append((chunk_id, idx_group))
+
+    def _persist_chunk(chunk_id: int, rows: list[dict]) -> None:
+        """MAIN-process-only checkpoint write + manifest update (no race)."""
+        chunk_df = (pd.DataFrame(rows) if rows
                     else pd.DataFrame(columns=list(ckpt.CORE_COLUMNS)))
-        ckpt.save_checkpoint_atomic(chunk_df, cp_path)
+        ckpt.save_checkpoint_atomic(
+            chunk_df, ckpt.chunk_checkpoint_path(root, chunk_id))
         if not chunk_df.empty:
             frames.append(chunk_df)
         manifest["completed_chunks"] = ckpt.list_completed_chunks(root)
         ckpt.write_manifest(root, manifest)
-        print(f"     chunk_{chunk_id:04d} → computed + checkpointed")
+
+    t0 = time.time()
+    if resolved_n_jobs == 1 or not pending:
+        # ── Sequential (unchanged behaviour) ───────────────────────
+        for chunk_id, idx_group in pending:
+            rows: list[dict] = []
+            for i in idx_group:
+                rows.extend(_predict_one_timestamp(i))
+            _persist_chunk(chunk_id, rows)
+            print(f"     chunk_{chunk_id:04d} → computed + checkpointed")
+    else:
+        # ── Parallel: process pool over PENDING chunks (loky) ──────
+        _run_panel_chunks_parallel(
+            df=df, pending=pending, params=params, root=root,
+            resolved_n_jobs=resolved_n_jobs, persist=_persist_chunk)
+
+    elapsed = time.time() - t0
+    if resolved_n_jobs > 1 and pending:
+        print(f"     [parallel] n_jobs={resolved_n_jobs} "
+              f"total_chunks={len(chunks)} cached={n_cached} "
+              f"submitted={len(pending)} elapsed={elapsed:.1f}s "
+              f"avg_chunk={elapsed / max(len(pending), 1):.2f}s")
 
     if not frames:
         return pd.DataFrame()
@@ -400,7 +597,8 @@ def run_panel_model_for_feature_set(df_all: pd.DataFrame,
                                     checkpoint_context: dict | None = None,
                                     train_window_mode: str = "expanding",
                                     rolling_window_timestamps: int | None = None,
-                                    rolling_window_days: float | None = None
+                                    rolling_window_days: float | None = None,
+                                    n_jobs: int = 1
                                     ) -> pd.DataFrame:
     """Filter to ``tickers`` (if given) and run the panel walk-forward."""
     df = df_all
@@ -414,7 +612,8 @@ def run_panel_model_for_feature_set(df_all: pd.DataFrame,
                                   checkpoint_context=checkpoint_context,
                                   train_window_mode=train_window_mode,
                                   rolling_window_timestamps=rolling_window_timestamps,
-                                  rolling_window_days=rolling_window_days)
+                                  rolling_window_days=rolling_window_days,
+                                  n_jobs=n_jobs)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -732,6 +931,21 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
     tune_on = bool(hpo_cfg["enabled"])
     hpo_variant = hpo_variant_label(tune_on, hpo_cfg["objective"])
 
+    # ── Parallel worker count (chunk-level process parallelism) ──────
+    # Resolve + validate up front so a bad --n-jobs fails clearly before any
+    # heavy work, and the resolved count is visible in the stage header/logs.
+    # Parallelism operates over checkpoint chunks, so it only applies when
+    # checkpointing is enabled; with --no-checkpoint the panel walk-forward
+    # follows its non-checkpointed SEQUENTIAL path regardless of --n-jobs.
+    n_jobs_resolved = _resolve_n_jobs(getattr(args, "n_jobs", 1))
+    _checkpoint_enabled = bool(getattr(args, "checkpoint", True))
+    if n_jobs_resolved > 1 and not _checkpoint_enabled:
+        print("  [WARN] --n-jobs is ignored when checkpointing is disabled; "
+              "the non-checkpointed panel path runs sequentially.")
+    elif n_jobs_resolved > 1:
+        print(f"  [INFO] panel walk-forward: {n_jobs_resolved} worker "
+              f"process(es) for checkpoint chunks (1 BLAS thread each).")
+
     # ── Preprocessing signature (Section 4 — cache/checkpoint invalidation) ──
     # Covers winsorisation on/off + quantile bounds + grouping rule + feature
     # allowlist (from modeling.preprocessing config) plus the model training
@@ -781,6 +995,7 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                     "set_id":     args.set_id or "(all)",
                     "coins":      list(args.coins) if args.coins else "(all)",
                     "C":          args.C,
+                    "n_jobs":     n_jobs_resolved,
                     "hpo_variant": hpo_variant,
                     "output_name": out_name_example,
                     "tune_hyperparams": tune_on,
@@ -967,7 +1182,8 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                     ckpt.clear_run_checkpoints(root)
                 ckpt.init_manifest(root, base=manifest_base)
                 checkpoint_context = {"enabled": True, "resume": resume,
-                                      "root": root, "chunk_size": chunk_size}
+                                      "root": root, "chunk_size": chunk_size,
+                                      "n_jobs": n_jobs_resolved}
 
             t0 = time.time()
             if is_benchmark:
@@ -986,6 +1202,7 @@ def _run_panel(args: argparse.Namespace, hpo_cfg: dict | None = None) -> int:
                     train_window_mode=train_window_mode,
                     rolling_window_timestamps=rolling_window_timestamps,
                     rolling_window_days=rolling_window_days,
+                    n_jobs=n_jobs_resolved,
                 )
             elapsed = time.time() - t0
             if ckpt_on:
