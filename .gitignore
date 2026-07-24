@@ -96,3 +96,9 @@ __pycache__/
 !feature_sets.xlsx
 !subreddit_ticker_mapping.xlsx
 !tests/fixtures/**
+
+# Compact final result tables + run manifest for examiners (small, curated).
+# *.csv / *.json are globally ignored above; re-include ONLY this directory.
+!results/final/
+!results/final/*.csv
+!results/final/*.json

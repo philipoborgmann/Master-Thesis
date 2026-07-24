@@ -54,7 +54,7 @@ themselves live in the thesis document, not in this repository.
 > FinBERT was evaluated during development but **removed** from the pipeline
 > (it is trained on financial-analyst language and produced no meaningful
 > variation on Reddit/crypto text). The scorer source is retained under
-> `src/thesis_pipeline/sentiment/score_finbert.py` for historical traceability,
+> `legacy/score_finbert.py` for historical traceability (see `legacy/README.md`),
 > and the CLI rejects `--model finbert` with an explanatory error.
 
 ---
@@ -162,6 +162,9 @@ tracked `subreddit_ticker_mapping.xlsx` (sheet `Subreddit_Ticker_Mapping`).
 - **OHLCV** was retrieved via CCXT on **2026-05-04** (see `legacy/crypto_data.py`).
   The exact installed CCXT version is only recoverable from the original
   environment and is **not** pinned here.
+- **Reddit** submissions come from the public Reddit-crypto collection
+  (leukipp, 2023, on Kaggle) cited in the thesis; they are not re-downloaded by
+  this repository.
 - **CoinMarketCap** market-cap / price / volume data were **supplied by the
   thesis supervisor**; the exact original retrieval date is **unavailable**.
 - **CryptoBERT** uses the Hugging Face model `ElKulako/cryptobert` (retrieved

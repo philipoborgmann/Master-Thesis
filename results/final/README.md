@@ -1,30 +1,51 @@
 # `results/final/` — compact final outputs for examiners
 
-This directory is the intended home for a **small, tracked** set of final
-result tables and a run manifest, so examiners can inspect the headline numbers
-without rerunning the pipeline or downloading large data.
+This directory holds a **small, tracked** set of final result tables plus a run
+manifest, so examiners can inspect the headline numbers without rerunning the
+pipeline or downloading large data.
 
-**It is currently empty of results by design.** No result files are committed
-yet: they must come from a single, complete final rerun. At the time of writing,
-at least one signal group was incomplete (`SENT_VAD_LD` at `1h` shipped 81,500
-rows instead of the ~103,200 its matched `ECON` benchmark produced), so
-committing current outputs would publish a partial comparison. Do **not** add
-fabricated or partial outputs here.
+## Status
 
-## What to place here after a clean final rerun
+The final run is **complete**: all 54 signal groups (18 model identities × 3
+horizons) are present and full — 103,200 rows at 1h, 17,200 at 6h, 4,300 at 1d.
+The earlier `SENT_VAD_LD` 1h shortfall (81,500 rows) was **resolved** in the
+final rerun; the completeness guard (`evaluate-signals`) confirms every
+registered production group is complete.
 
-Only compact CSV/JSON summaries — never large signal parquets or checkpoints:
+The full evaluation artefacts (21 CSVs + `signal_evaluation.xlsx`) are delivered
+in the **separately-submitted Outputs package**, since they are too large / not
+appropriate to commit. The compact subset below may be copied here for
+convenience — `.gitignore` re-includes `results/final/*.csv` and `*.json`
+despite the global data-file ignore.
+
+## Compact subset to place here
+
+Produced by `evaluate-signals --strict-feature-set-ids` (run once, across all
+horizons) under `Outputs/Evaluation/`; copy these small files here:
 
 - `pooled_metrics.csv`
 - `incremental_sentiment_value.csv`
 - `diff_in_improvement.csv`
 - `horizon_comparison.csv`
 - `multiple_testing_manifest.csv`
-- `signal_completeness.csv`  (must show every registered production group `complete`)
+- `signal_completeness.csv`  (every registered production group = `complete`)
 - `run_manifest.json`
 
-These are produced by `evaluate-signals --strict-feature-set-ids` (run once,
-across all horizons) under `Outputs/Evaluation/`; copy the compact ones here.
+## Regenerating the compact outputs
+
+From the final signal set (reproduction path 2 in the top-level README), run
+the strict evaluation once and copy the compact CSVs here:
+
+```bash
+python -m thesis_pipeline.cli evaluate-signals --strict-feature-set-ids
+# then copy the small tables named above from Outputs/Evaluation/ into results/final/
+```
+
+`--strict-feature-set-ids` restricts to the registered 17-set grid (+ the NAIVE
+reference) and drops any stale IDs; on the final signal set it keeps every row
+and discards none, so the tables are identical to a non-strict run — it simply
+makes the strict, audited path the one on record and writes
+`signal_completeness.csv`.
 
 ## `run_manifest.json` — intended fields
 
@@ -47,9 +68,3 @@ one). Fields:
 - `feature_set_registry_hash`
 - `forecast_sample` (start / end_exclusive from `configs/model_specs.yaml`)
 - `generation_timestamp`
-
-## Precondition
-
-`Outputs/Evaluation/signal_completeness.csv` must report **every** registered
-production group as `complete` before anything is copied here — the
-`evaluate-signals` completeness guard enforces this (it aborts otherwise).
