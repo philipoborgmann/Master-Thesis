@@ -24,6 +24,11 @@ dependencies = [
     "threadpoolctl>=3.1",
     "scipy>=1.10",
     "statsmodels>=0.14",
+    # Unit-root tests (DFGLS / Phillips-Perron) and structural-break
+    # detection are imported directly by the stationarity +
+    # structural-breaks stages.
+    "arch>=5.3",
+    "ruptures>=1.1",
     "matplotlib>=3.7",
     "seaborn>=0.12",
     "tqdm>=4.65",

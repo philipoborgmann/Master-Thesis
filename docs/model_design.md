@@ -1,7 +1,13 @@
 # Model design
 
-All values below are extracted from `Run_Models.py` and pinned in
-`configs/model_specs.yaml`.
+All values below are pinned in `configs/model_specs.yaml` and implemented in
+`src/thesis_pipeline/modeling/`.
+
+> **v4 default model.** The production specification is the **panel logistic
+> regression** with ticker fixed effects on a rolling 180-day window with
+> nested HPO (see *Alternative model family: `panel_logit`* below and the
+> README). The per-asset walk-forward described first is the historical
+> baseline, still available via `--model-type per_asset`.
 
 ## Task
 
@@ -10,20 +16,19 @@ ticker per horizon. Positive class (1) = next-period log return ≥ 0.
 
 ## Feature sets
 
-Set IDs follow the convention used in `feature_sets.xlsx` (loaded by
-`Run_Models.load_feature_sets`):
+The v4 registry has **17 sets** (canonical in `feature_sets.xlsx`, mirrored in
+`configs/feature_sets.yaml`):
 
 | family | IDs | what it tests |
 |--------|-----|----------------|
-| Benchmark | `B1`, `B2` | naive rolling-probability and minimal logistic |
-| Economic  | `E1`, `E2`, `E3`, `E4` | price-only feature subsets |
-| Sentiment | `S1` … `S7` | sentiment features only, per scorer |
-| Combined  | `C1` … `C5` | economic + sentiment, per scorer |
+| Economics benchmark | `ECON` | economics core only |
+| Sentiment-only | `SENT_{VAD,CBT}_{L,LD,DA,F}` (8) | sentiment block only, per scorer |
+| Combined | `ECON_{VAD,CBT}_{L,LD,DA,F}` (8) | economics core + sentiment block |
 
-The exact feature membership of each set is canonical in `feature_sets.xlsx`
-and mirrored in `configs/feature_sets.yaml` (verification in progress — see
-`docs/refactor_log.md`). The loader resolves sentiment features as
-`{model}_…` for each of `vader`, `finbert`, `cryptobert`.
+Sentiment features resolve per scorer for `vader` and `cryptobert` (FinBERT was
+removed). `NAIVE` is a rolling-probability reference generated automatically per
+`(horizon, family, window)`; the legacy `B*/E*/S*/C*` IDs were retired. See
+`docs/refactor_log.md` for the full old→new mapping.
 
 ## Model
 
@@ -37,7 +42,7 @@ sklearn.linear_model.LogisticRegression(
 )
 ```
 
-Benchmark `B1` uses the rolling-probability rule
+The `NAIVE` rolling-probability reference uses the rule
 
 ```
 p̂_t = mean(y[:t])
@@ -64,8 +69,8 @@ for t in range(init_train_n, n):
 
 A fresh `StandardScaler` and a fresh `LogisticRegression` are fit at every
 step from the train-window alone — there is **no leakage** from t into the
-training set by construction. `Run_Models.run_walk_forward` is the
-authoritative implementation and is what the new package delegates to.
+training set by construction. `thesis_pipeline.modeling.walk_forward` is the
+authoritative implementation.
 
 Numerical guards: `probability` is clipped to `[1e-15, 1 − 1e-15]` for log
 loss; predictions are not affected by this clip.
@@ -129,9 +134,9 @@ python -m thesis_pipeline.cli run-models --horizon 1d --set-id C2 \
 Outputs are written alongside (never overwriting) the per-asset signals:
 `Outputs/Signals/<horizon>/<set_id>[_<sentiment_model>]_panel_pooled.parquet`
 or `..._panel_ticker_fe.parquet`, with extra columns `model_type` and
-`panel_mode`. `metrics_summary.csv` gains the same two columns. The B1
-rolling-probability benchmark is not a panel-logit model and is skipped with
-a warning under `--model-type panel_logit`.
+`panel_mode`. `metrics_summary.csv` gains the same two columns. The `NAIVE`
+rolling-probability reference is not a panel-logit model; it is generated
+separately (not as a feature set) under `--model-type panel_logit`.
 
 ## Parallel panel-logit checkpoint chunks (`--n-jobs`)
 

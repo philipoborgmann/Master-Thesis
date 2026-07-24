@@ -41,9 +41,8 @@ python -m thesis_pipeline.cli create-price-features --horizon 1h
 # 3. Load + clean Reddit submissions
 python -m thesis_pipeline.cli load-sentiment
 
-# 4. Score posts with each scorer
+# 4. Score posts with each scorer (FinBERT was removed; VADER + CryptoBERT only)
 python -m thesis_pipeline.cli score-sentiment --model vader
-python -m thesis_pipeline.cli score-sentiment --model finbert        # heavy
 python -m thesis_pipeline.cli score-sentiment --model cryptobert     # heavy
 
 # 5. Aggregate to per-horizon sentiment features
@@ -55,12 +54,12 @@ python -m thesis_pipeline.cli stationarity --horizon 1d
 # 7. Merge price + sentiment
 python -m thesis_pipeline.cli merge-features --horizon 1d
 
-# 8. Walk-forward modelling
-python -m thesis_pipeline.cli run-models --horizon 1d --set-id B1
-python -m thesis_pipeline.cli run-models --horizon 1d --set-id E4
-python -m thesis_pipeline.cli run-models --horizon 1d --set-id S1 --sentiment-model vader
-python -m thesis_pipeline.cli run-models --horizon 1d --set-id C1 --sentiment-model vader
-# ... etc.
+# 8. Walk-forward modelling (v4 defaults = panel_logit / ticker FE / rolling
+#    180d / nested HPO / log_loss). Omit --set-id to run the full 17-set grid.
+python -m thesis_pipeline.cli run-models --horizon 1d                       # full grid
+python -m thesis_pipeline.cli run-models --horizon 1d --set-id ECON         # single set
+python -m thesis_pipeline.cli run-models --horizon 1d --set-id ECON_CBT_F   # single set
+# See README section F.2 for the fully-specified final commands.
 
 # 9. Diagnostics report
 python -m thesis_pipeline.cli diagnostics --horizon 1d
@@ -78,12 +77,11 @@ production outputs. Defaults:
 | create-price-features      | horizon = 1d, coins = BTC, ETH |
 | load-sentiment             | max_rows = 10 000 |
 | score-sentiment vader      | max_rows = 5 000 |
-| score-sentiment finbert    | max_rows = 200 |
 | score-sentiment cryptobert | max_rows = 200 |
 | create-sentiment-features  | horizon = 1d, no_plots |
 | stationarity               | horizon = 1d, coins = BTC, ETH |
 | merge-features             | horizon = 1d |
-| run-models                 | horizon = 1d, set_id = B1, coins = BTC, ETH |
+| run-models                 | horizon = 1d, set_id = ECON, coins = BTC, ETH |
 | diagnostics                | horizon = 1d |
 
 To overwrite a production output from smoke mode, pass `--force` explicitly.

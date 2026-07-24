@@ -26,7 +26,6 @@ that runs accidentally as part of `run-pipeline`.
 
 ## Why this folder exists
 
-The repository's active pipeline lives in `src/thesis_pipeline/`. The
-`scripts/` directory holds thin entry points, and the repository root holds
-backward-compatibility redirects. Any file that does not fit one of those
-three roles — but is still useful enough to keep around — belongs here.
+The repository's active pipeline lives in `src/thesis_pipeline/`, with thin
+entry points in `scripts/`. Any file that does not fit those roles — but is
+still useful enough to keep for reproducibility — belongs here.

@@ -40,12 +40,12 @@ each prints a clear header at start time.
   │   (wraps Sentiment_Data_Load.py)│
   └──────────────┬──────────────────┘
                  │
-       ┌─────────┴────────────┬─────────────────────┐
-       ▼                      ▼                     ▼
-  score_vader            score_finbert          score_cryptobert
-  (vaderSentiment)       (ProsusAI/finbert)     (ElKulako/cryptobert)
-       │                      │                     │
-       └──────────────────────┴─────────────────────┘
+       ┌─────────┴────────────────────────┐
+       ▼                                   ▼
+  score_vader                        score_cryptobert
+  (vaderSentiment)                   (ElKulako/cryptobert)
+       │                                   │
+       └───────────────────┬───────────────┘
                                 │
                                 ▼
               ┌──────────────────────────────────────────┐
@@ -108,10 +108,9 @@ end-to-end pipeline currently does not use that horizon.
 | create_price_features       |       | ✓              | horizon=1d, BTC,ETH |
 | load_sentiment              | ✓     | ✓              | max_rows=10 000     |
 | score_vader                 |       | ✓              | max_rows=5 000      |
-| score_finbert               | ✓     | ✓              | max_rows=200        |
 | score_cryptobert            | ✓     | ✓              | max_rows=200        |
 | create_sentiment_features   |       | ✓              | horizon=1d, no_plots |
 | stationarity                | ✓     | ✓              | horizon=1d, BTC,ETH |
 | merge_features              |       | ✓              | horizon=1d          |
-| run_models                  | ✓     | ✓              | horizon=1d, set_id=B1, BTC,ETH |
+| run_models                  | ✓     | ✓              | horizon=1d, set_id=ECON, BTC,ETH |
 | diagnostics                 |       | ✓              | horizon=1d          |
