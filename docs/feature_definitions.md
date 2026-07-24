@@ -39,8 +39,11 @@ Three scorers run on the same `sentiment_combined.csv` input and write to
 | scorer    | model                | per-text output |
 |-----------|----------------------|-----------------|
 | VADER     | `vaderSentiment` (lexicon-based) | `compound ∈ [-1, 1]`; thresholds ±0.05 for label |
-| FinBERT   | `ProsusAI/finbert`   | `softmax(logits)` → `P(positive) − P(negative)`; label by argmax |
 | CryptoBERT| `ElKulako/cryptobert`| `softmax(logits)` → `P(bullish) − P(bearish)`; labels re-mapped to positive/neutral/negative |
+
+> FinBERT (`ProsusAI/finbert`) was evaluated during development but **removed**
+> from the pipeline (see `docs/refactor_log.md`); the CLI rejects
+> `--model finbert` with an explanatory error.
 
 For each post the scorers compute `title_score` and `selftext_score`
 independently. Posts with empty selftext receive `NaN` for `selftext_score`.

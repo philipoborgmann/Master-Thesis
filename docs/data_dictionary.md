@@ -83,9 +83,9 @@ Same identifier columns as `sentiment_combined.csv`, plus:
 | `title_label`    | all       | `positive`/`neutral`/`negative` | |
 | `selftext_label` | all       | `positive`/`neutral`/`negative` | |
 
-VADER uses `compound` ∈ [-1, 1] with thresholds ±0.05; FinBERT uses
-P(pos) − P(neg); CryptoBERT uses P(bullish) − P(bearish). See
-`docs/feature_definitions.md`.
+VADER uses `compound` ∈ [-1, 1] with thresholds ±0.05; CryptoBERT uses
+P(bullish) − P(bearish). (FinBERT was evaluated but removed — see
+`docs/refactor_log.md`.) See `docs/feature_definitions.md`.
 
 ---
 
@@ -111,9 +111,8 @@ P(pos) − P(neg); CryptoBERT uses P(bullish) − P(bearish). See
 
 ## `Data/Features/sentiment_features_<horizon>.parquet`
 
-(observed in `Sentiment_feature_engineering.py`; columns are produced for
-each of three models — `vader`, `finbert`, `cryptobert` — and for three
-text scopes — `title`, `selftext`, `combined`)
+(produced by `create-sentiment-features` for each scorer — `vader`,
+`cryptobert` — and for three text scopes — `title`, `selftext`, `combined`)
 
 Key columns (per `{model}` and `{scope}`):
 

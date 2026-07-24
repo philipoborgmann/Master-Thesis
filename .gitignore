@@ -12,6 +12,7 @@ Outputs/Signals/
 Outputs/Checkpoints/
 Outputs/deskriptiv/
 Outputs/diagnostics/
+Outputs/Evaluation/
 
 # Transformer checkpoints (large, intermediate)
 Data/Transformed/.finbert_checkpoints/
@@ -29,9 +30,39 @@ Data/Transformed/.vader_checkpoints/
 *.pt
 *.pth
 *.zip
+*.joblib
 
 # *.xlsx — DO NOT add. feature_sets.xlsx and subreddit_ticker_mapping.xlsx
 # are intentionally tracked.
+
+# ---------------------------------------------------------------------------
+# Personal / thesis-writing documents (never part of repository execution).
+# Manuscript drafts, appendices, cover sheets, admission forms, exported PDFs,
+# slide decks and screenshots are kept locally but must not be tracked.
+# ---------------------------------------------------------------------------
+*.docx
+*.doc
+*.pdf
+*.pptx
+*.png
+*.jpg
+*.jpeg
+
+# Developer-only repo snapshot (regenerated locally, never tracked).
+repo_context.md
+create_repo_context.py
+
+# ---------------------------------------------------------------------------
+# Build artifacts, logs, temporaries, secrets
+# ---------------------------------------------------------------------------
+*.egg-info/
+build/
+dist/
+*.log
+*.tmp
+*.bak
+.env
+.env.*
 
 # ---------------------------------------------------------------------------
 # Python / IDE

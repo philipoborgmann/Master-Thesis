@@ -1,2 +1,0 @@
-[console_scripts]
-thesis-pipeline = thesis_pipeline.cli:main

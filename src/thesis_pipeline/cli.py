@@ -130,9 +130,10 @@ def _add_run_models_args(parser: argparse.ArgumentParser) -> None:
                         type=int, default=1,
                         help="Worker processes for panel-logit checkpoint "
                              "chunks. Default 1 (sequential). Positive int = "
-                             "worker count; -1 = all logical CPUs; each worker "
-                             "is capped at one BLAS thread. Recommended: 4 on "
-                             "an 8-core / 32 GB machine.")
+                             "worker count; -1 = all CPUs available to the "
+                             "process/container; each worker is capped at one "
+                             "BLAS thread. Recommended: 4 on an 8-core / 32 GB "
+                             "machine.")
     parser.add_argument("--clear-checkpoints", "--clear_checkpoints",
                         dest="clear_checkpoints", action="store_true",
                         help="Delete this run's checkpoint directory before "
