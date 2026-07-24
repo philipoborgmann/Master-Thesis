@@ -31,8 +31,12 @@ python -m thesis_pipeline.cli <command> [options]
 | Target | Binary direction of the next-period return (`1` = next log return ≥ 0) |
 | Evaluation | Directional (accuracy / McNemar) **and** probabilistic (log loss) |
 
-**Hypotheses.** The evaluation is pre-registered (`configs/*`,
-`src/thesis_pipeline/evaluation/preregistration.py`):
+**Hypotheses.** The evaluation follows a **pre-specified** testing plan — the
+hypothesis families, test statistics and multiple-testing correction are fixed
+in code and config (`configs/*`,
+`src/thesis_pipeline/evaluation/preregistration.py`; the module name is
+internal). "Pre-specified" is the accurate description: the plan is fixed in the
+repository, not externally time-stamped or registered.
 
 - **H1 — does sentiment help at all?** Combined `ECON_*` sets (economics +
   sentiment) versus the `ECON` economics-only benchmark, tested two ways:
@@ -186,19 +190,26 @@ python -m pip install -e ".[tests,transformers]"
 **Windows PowerShell**
 
 ```powershell
-python -m venv .venv
+py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -e ".[tests,transformers]"
+python -m pip install -e ".[tests,transformers,acquisition]"
 ```
 
-The editable install pulls in core modelling, raw-data acquisition (`ccxt`),
-VADER, the stationarity / structural-break diagnostics (`arch`, `ruptures`),
-and the test suite. The optional `transformers` extra adds `torch` +
-`transformers` for CryptoBERT — **omit it** (`pip install -e ".[tests]"`) if you
-only reproduce the model/evaluation stages from `Data/Final/` and do not need
-CryptoBERT scoring. `pip install -r requirements.txt` installs the same runtime
-set without the editable package.
+Pick the extras for what you actually run:
+
+| Goal | Command |
+|------|---------|
+| Model + evaluation from `Data/Final/` (no CryptoBERT, no download) | `pip install -e ".[tests]"` |
+| + CryptoBERT scoring | `pip install -e ".[tests,transformers]"` |
+| Full reproduction incl. raw OHLCV acquisition | `pip install -e ".[tests,transformers,acquisition]"` |
+
+Core dependencies always include modelling, VADER, and the stationarity /
+structural-break diagnostics (`arch`, `ruptures`). The `transformers` extra adds
+`torch` + `transformers` for CryptoBERT; the `acquisition` extra adds `ccxt` for
+the legacy OHLCV downloader. `pip install -r requirements.txt` installs the broad
+runtime environment (including `ccxt`) without the editable package; the
+editable route selects `ccxt` via the `acquisition` extra instead.
 
 ---
 
@@ -227,6 +238,12 @@ python -m thesis_pipeline.cli score-sentiment --model vader
 python -m thesis_pipeline.cli score-sentiment --model cryptobert    # heavy; GPU recommended
 
 python -m thesis_pipeline.cli create-sentiment-features
+
+# Stationarity diagnostics (reported in the thesis appendix). This is a
+# DIAGNOSTIC stage — run-models does NOT depend on it, and modelling is not
+# gated on stationarity-test acceptance. The stage reads the per-horizon
+# sentiment features; a bare call runs the horizons it finds.
+python -m thesis_pipeline.cli stationarity
 
 python -m thesis_pipeline.cli merge-features --horizon 1d
 python -m thesis_pipeline.cli merge-features --horizon 6h
@@ -289,35 +306,85 @@ Signals are written to `Outputs/Signals/{horizon}/{set_id}[…].parquet` (plus
 
 ### F.3 Evaluation, hypothesis tests and tables
 
+Run evaluation **exactly once, with no `--horizon`**, after all three model
+horizons have finished:
+
 ```bash
-python -m thesis_pipeline.cli evaluate-signals --horizon 1d
-python -m thesis_pipeline.cli evaluate-signals --horizon 6h
-python -m thesis_pipeline.cli evaluate-signals --horizon 1h
+python -m thesis_pipeline.cli evaluate-signals --strict-feature-set-ids
 ```
 
+Why once across all horizons — this matters for correctness:
+
+- All signal files for 1d, 6h and 1h must exist **before** evaluation starts.
+- A per-horizon call (`--horizon 1d`, …) writes into the same
+  `Outputs/Evaluation/` directory and would **overwrite** the previous
+  horizon's tables.
+- The family-aware Benjamini–Hochberg correction **pools p-values across
+  horizons** within each hypothesis family, so it must see all horizons at once.
+- Horizon-specific `evaluate-signals --horizon <h>` is a **diagnostic** only and
+  must not be used to generate the final thesis tables.
+
+`--strict-feature-set-ids` restricts evaluation to the registered 17-set grid
+(plus the `NAIVE` reference), dropping any stale/legacy signal files. Before any
+metric is computed, a **signal-completeness audit** writes
+`Outputs/Evaluation/signal_completeness.csv` and **aborts** (non-zero exit) if a
+registered production group is incomplete — fewer test timestamps than its
+matched `ECON` benchmark, or duplicate rows — so a partial run can never enter
+the final tables. Pass `--allow-incomplete-signals` only to inspect a
+known-partial run.
+
 `evaluate-signals` produces the metrics, McNemar / log-loss significance tests,
-volatility- and market-cap-regime tests (H2/H3), the pre-registered
+volatility- and market-cap-regime tests (H2/H3), the pre-specified
 Benjamini–Hochberg families, and the economic backtest, all under
-`Outputs/Evaluation/`. Descriptive tables used in the thesis:
+`Outputs/Evaluation/`. Descriptive tables (all three horizons combined when
+`--horizon` is omitted) and the sample report:
 
 ```bash
-python -m thesis_pipeline.cli descriptive-final-features --horizon 1d   # → Outputs/deskriptiv/final_feature_sets/
-python -m thesis_pipeline.cli diagnostics --horizon 1d                  # → Outputs/diagnostics/
+python -m thesis_pipeline.cli descriptive-final-features   # → Outputs/deskriptiv/final_feature_sets/ (1h, 6h, 1d)
+python -m thesis_pipeline.cli diagnostics --horizon 1d     # → Outputs/diagnostics/
 ```
 
 ---
 
 ## G. Two reproduction paths
 
-1. **Full reproduction from raw data** — run F.1 → F.2 → F.3. Requires the raw
-   Reddit/OHLCV/CoinMarketCap inputs of section D and re-runs CryptoBERT.
-2. **From final feature matrices** — place `Data/Final/features_{1h,6h,1d}.parquet`
-   and the CoinMarketCap reference (used by the market-cap regime step), then run
-   **F.2 → F.3 only**. This reproduces all model and evaluation results **without**
-   re-running CryptoBERT, and installs fine with `pip install -e ".[tests]"`.
+**Path 1 — full reproduction from raw inputs**
 
-Convenience wrappers that run exactly path 2's CLI commands (worker count as a
-parameter; no destructive deletes):
+1. `pip install -e ".[tests,transformers,acquisition]"`
+2. place the non-public Reddit and CoinMarketCap inputs (section D);
+3. acquire or place OHLCV data (`legacy/crypto_data.py`, or supplied parquets);
+4. `validate-price`;
+5. `create-price-features` for 1d, 6h, 1h;
+6. `load-sentiment`;
+7. `score-sentiment --model vader`;
+8. `score-sentiment --model cryptobert`;
+9. `create-sentiment-features`;
+10. `stationarity` (diagnostic; modelling does not depend on it);
+11. `merge-features` for 1d, 6h, 1h;
+12. `run-models` **separately** for 1d, 6h, 1h (F.2);
+13. `evaluate-signals --strict-feature-set-ids` **once** (no `--horizon`);
+14. `descriptive-final-features` (all horizons; omit `--horizon`);
+15. other diagnostics as required (`diagnostics`, `structural-breaks`).
+
+**Path 2 — from the final feature matrices** (no CryptoBERT, no download)
+
+1. `pip install -e ".[tests]"`
+2. place `Data/Final/features_{1h,6h,1d}.parquet`;
+3. place the CoinMarketCap and daily raw-price references required by the H2/H3
+   regime tests and the economic backtest (see below);
+4. run all three model horizons (F.2);
+5. run `evaluate-signals --strict-feature-set-ids` once across all horizons;
+6. run `descriptive-final-features` once (all horizons).
+
+This reproduces every model and evaluation result without re-running CryptoBERT.
+
+**Non-public inputs required for parts of the evaluation.** H2 (volatility
+regime) needs the daily raw-price parquets; H3 (market-cap regime) and the
+economic backtest need the CoinMarketCap reference (supplied by the supervisor).
+The core H1 metrics and significance tests run from the signal files alone.
+
+Convenience wrappers run exactly path 2's CLI commands (worker count as a
+parameter; strict filtering + completeness guard on; no destructive deletes):
 
 ```bash
 scripts/reproduce_from_final_features.sh 4        # Linux/macOS; arg = --n-jobs

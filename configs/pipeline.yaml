@@ -1,10 +1,12 @@
 # Pipeline stage configuration.
-# Each stage references inputs/outputs by path-key (see configs/paths.yaml).
+# Each stage references inputs/outputs by path-key (see configs/paths.yaml)
+# and is implemented by the package module named in `module:` — the single
+# source of truth. (The historical root-level scripts were retired; there is
+# no longer a `script:` field.)
 
 stages:
 
   validate_price:
-    script: "Price_Data_Validation.py"
     module: "thesis_pipeline.price.validate"
     inputs:
       - raw_price_root
@@ -18,7 +20,6 @@ stages:
       coins: [BTC, ETH]
 
   create_price_features:
-    script: "Create_Price_Features.py"
     module: "thesis_pipeline.price.features"
     inputs:
       - raw_price_root
@@ -26,7 +27,6 @@ stages:
     outputs:
       - price_features_pattern
       - feature_generation_report
-      - winsorization_thresholds
       - cmc_marketcap_column_matches
     heavy: false
     supports_smoke: true
@@ -35,7 +35,6 @@ stages:
       coins: [BTC, ETH]
 
   load_sentiment:
-    script: "Sentiment_Data_Load.py"
     module: "thesis_pipeline.sentiment.load"
     inputs:
       - raw_sentiment_root
@@ -49,7 +48,6 @@ stages:
       max_rows: 10000
 
   score_vader:
-    script: "Sentiment_score_vader.py"
     module: "thesis_pipeline.sentiment.score_vader"
     inputs:
       - sentiment_combined
@@ -65,7 +63,6 @@ stages:
   # variation on Reddit/crypto sentiment data — see docs/refactor_log.md).
 
   score_cryptobert:
-    script: "Sentiment_score_cryptobert.py"
     module: "thesis_pipeline.sentiment.score_cryptobert"
     inputs:
       - sentiment_combined
@@ -78,7 +75,6 @@ stages:
       max_rows: 200
 
   create_sentiment_features:
-    script: "Sentiment_feature_engineering.py"
     module: "thesis_pipeline.sentiment.aggregate"
     inputs:
       - sentiment_scored_vader
@@ -94,7 +90,6 @@ stages:
       no_plots: true
 
   stationarity:
-    script: "Sentiment_Stationarity_Test.py"
     module: "thesis_pipeline.sentiment.stationarity"
     inputs:
       - sentiment_features_pattern
@@ -109,7 +104,6 @@ stages:
       coins: [BTC, ETH]
 
   merge_features:
-    script: "Merge_Features.py"
     module: "thesis_pipeline.features.merge"
     inputs:
       - price_features_pattern
@@ -124,7 +118,6 @@ stages:
       horizon: "1d"
 
   run_models:
-    script: "Run_Models.py"
     module: "thesis_pipeline.modeling.run_models"
     inputs:
       - final_features_pattern
@@ -147,6 +140,7 @@ stages:
       - raw_price_1d
     outputs:
       - evaluation_xlsx
+      - evaluation_completeness_csv
       - evaluation_pooled_csv
       - evaluation_per_ticker_csv
       - evaluation_thresholds_csv
@@ -168,15 +162,6 @@ stages:
     smoke:
       horizon: "1d"
 
-  reports:
-    module: "thesis_pipeline.diagnostics.sample_report"
-    inputs:
-      - signals_pattern
-    outputs:
-      - descriptive_root
-    heavy: false
-    supports_smoke: true
-
 # Order in which stages run for `run-pipeline` when no --stages list is given.
 default_order:
   - validate_price
@@ -190,4 +175,3 @@ default_order:
   - run_models
   - evaluate_signals
   - diagnostics
-  - reports

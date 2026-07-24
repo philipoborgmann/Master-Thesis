@@ -37,16 +37,25 @@ Data/Transformed/.vader_checkpoints/
 
 # ---------------------------------------------------------------------------
 # Personal / thesis-writing documents (never part of repository execution).
-# Manuscript drafts, appendices, cover sheets, admission forms, exported PDFs,
-# slide decks and screenshots are kept locally but must not be tracked.
+# Policy: this is a code repository — Word / PowerPoint documents are not
+# tracked at all. PDFs and images are NOT globally ignored so legitimate
+# figures, diagrams or a thesis PDF can be committed deliberately; only known
+# personal root documents and local-doc scratch folders are excluded.
 # ---------------------------------------------------------------------------
 *.docx
 *.doc
-*.pdf
 *.pptx
-*.png
-*.jpg
-*.jpeg
+
+# Known personal root documents (manuscript appendices, admission form).
+/Anhang_*.docx
+/Antrag_*.pdf
+
+# Local-only scratch / rendered / private document folders.
+/private/
+/local_docs/
+/rendered/
+/artifacts/
+/tmp/
 
 # Developer-only repo snapshot (regenerated locally, never tracked).
 repo_context.md

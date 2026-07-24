@@ -36,10 +36,17 @@ foreach ($H in @("1d", "6h", "1h")) {
     if ($LASTEXITCODE -ne 0) { throw "run-models --horizon $H failed ($LASTEXITCODE)" }
 }
 
-foreach ($H in @("1d", "6h", "1h")) {
-    Write-Host ">>> evaluate-signals --horizon $H"
-    python -m thesis_pipeline.cli evaluate-signals --horizon $H
-    if ($LASTEXITCODE -ne 0) { throw "evaluate-signals --horizon $H failed ($LASTEXITCODE)" }
-}
+# Evaluation runs EXACTLY ONCE across all horizons (no --horizon): every horizon
+# writes into the same Outputs/Evaluation/ directory and the family-aware BH
+# correction pools p-values across horizons. --strict-feature-set-ids keeps only
+# the registered 17-set grid (+ NAIVE); the completeness guard aborts on a
+# partial run.
+Write-Host ">>> evaluate-signals (once, across all horizons, strict + completeness guard)"
+python -m thesis_pipeline.cli evaluate-signals --strict-feature-set-ids
+if ($LASTEXITCODE -ne 0) { throw "evaluate-signals failed ($LASTEXITCODE)" }
+
+Write-Host ">>> descriptive-final-features (all horizons)"
+python -m thesis_pipeline.cli descriptive-final-features
+if ($LASTEXITCODE -ne 0) { throw "descriptive-final-features failed ($LASTEXITCODE)" }
 
 Write-Host ">>> done. Signals in Outputs/Signals/, evaluation in Outputs/Evaluation/."

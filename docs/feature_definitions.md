@@ -1,8 +1,9 @@
 # Feature definitions
 
-All formulas below match the implementations in `Create_Price_Features.py`
-and `Sentiment_feature_engineering.py`. The refactor does not change any of
-them; this document only re-states them in one place.
+All formulas below match the implementations in
+`thesis_pipeline.price.features` and `thesis_pipeline.sentiment.aggregate`
+(the package modules are the single source of truth). This document only
+re-states them in one place.
 
 ## Price features
 
@@ -19,9 +20,9 @@ pipeline computes:
 | `market_cap_t`        | CoinMarketCap market cap on `date(timestamp_t)` |
 | `target`              | `1` if `log_return_{t+1} ≥ 0` else `0` (binary direction of next return) |
 
-Winsorisation thresholds are saved to
-`Data/Features/winsorization_thresholds.csv` (one row per ticker × horizon ×
-variable).
+Full-sample winsorisation was removed (it leaked test-window information). The
+model now applies a leakage-safe `TrainingWindowWinsorizer` fit on each training
+window only, and **no** `winsorization_thresholds.csv` is produced.
 
 ## Target construction
 

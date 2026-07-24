@@ -48,20 +48,30 @@ python -m thesis_pipeline.cli score-sentiment --model cryptobert     # heavy
 # 5. Aggregate to per-horizon sentiment features
 python -m thesis_pipeline.cli create-sentiment-features
 
-# 6. (optional) Stationarity tests
-python -m thesis_pipeline.cli stationarity --horizon 1d
+# 6. Stationarity diagnostics (reported in the appendix; run-models does NOT
+#    depend on this and modelling is not gated on stationarity acceptance).
+python -m thesis_pipeline.cli stationarity
 
 # 7. Merge price + sentiment
 python -m thesis_pipeline.cli merge-features --horizon 1d
+python -m thesis_pipeline.cli merge-features --horizon 6h
+python -m thesis_pipeline.cli merge-features --horizon 1h
 
 # 8. Walk-forward modelling (v4 defaults = panel_logit / ticker FE / rolling
 #    180d / nested HPO / log_loss). Omit --set-id to run the full 17-set grid.
-python -m thesis_pipeline.cli run-models --horizon 1d                       # full grid
-python -m thesis_pipeline.cli run-models --horizon 1d --set-id ECON         # single set
-python -m thesis_pipeline.cli run-models --horizon 1d --set-id ECON_CBT_F   # single set
-# See README section F.2 for the fully-specified final commands.
+#    Run SEPARATELY per horizon. See README section F.2 for the full commands.
+python -m thesis_pipeline.cli run-models --horizon 1d
+python -m thesis_pipeline.cli run-models --horizon 6h
+python -m thesis_pipeline.cli run-models --horizon 1h
 
-# 9. Diagnostics report
+# 9. Evaluation — ONCE, across all horizons (no --horizon). A per-horizon call
+#    would overwrite the previous horizon and split the cross-horizon BH
+#    correction. --strict-feature-set-ids keeps only the registered grid + NAIVE;
+#    the completeness guard aborts on a partial run.
+python -m thesis_pipeline.cli evaluate-signals --strict-feature-set-ids
+
+# 10. Descriptive tables (all horizons) + sample report
+python -m thesis_pipeline.cli descriptive-final-features
 python -m thesis_pipeline.cli diagnostics --horizon 1d
 ```
 

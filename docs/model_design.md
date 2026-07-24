@@ -1,160 +1,171 @@
 # Model design
 
-All values below are pinned in `configs/model_specs.yaml` and implemented in
-`src/thesis_pipeline/modeling/`.
-
-> **v4 default model.** The production specification is the **panel logistic
-> regression** with ticker fixed effects on a rolling 180-day window with
-> nested HPO (see *Alternative model family: `panel_logit`* below and the
-> README). The per-asset walk-forward described first is the historical
-> baseline, still available via `--model-type per_asset`.
+Every value below is pinned in `configs/model_specs.yaml` and
+`configs/feature_sets.yaml` (mirror of `feature_sets.xlsx`) and implemented in
+`src/thesis_pipeline/modeling/`. Nothing here is copied from memory.
 
 ## Task
 
-Binary classification of the **direction of next-period log return** per
-ticker per horizon. Positive class (1) = next-period log return ≥ 0.
+Binary classification of the **direction of the next-period log return**, per
+coin, per horizon (1h / 6h / 1d). Positive class (`1`) = next-period log
+return ≥ 0. Threshold on the predicted probability = **0.5**.
 
-## Feature sets
+## Feature sets (17)
 
-The v4 registry has **17 sets** (canonical in `feature_sets.xlsx`, mirrored in
-`configs/feature_sets.yaml`):
+Canonical in `feature_sets.xlsx`, mirrored in `configs/feature_sets.yaml`.
+Economics core = `log_return_t, cum_log_return_{7d,14d,21d}, realized_vol_14d,
+volume_diff, log_market_cap_lag1`. Sentiment blocks are title-based (no
+engagement weighting): `L` = title-score mean, `LD` = mean + std, `DA` =
+bullishness ratio + `log1p_post_count`, `F` = all four.
 
-| family | IDs | what it tests |
-|--------|-----|----------------|
+| family | IDs | content |
+|--------|-----|---------|
 | Economics benchmark | `ECON` | economics core only |
 | Sentiment-only | `SENT_{VAD,CBT}_{L,LD,DA,F}` (8) | sentiment block only, per scorer |
 | Combined | `ECON_{VAD,CBT}_{L,LD,DA,F}` (8) | economics core + sentiment block |
 
-Sentiment features resolve per scorer for `vader` and `cryptobert` (FinBERT was
-removed). `NAIVE` is a rolling-probability reference generated automatically per
-`(horizon, family, window)`; the legacy `B*/E*/S*/C*` IDs were retired. See
-`docs/refactor_log.md` for the full old→new mapping.
+Sentiment features resolve per scorer for **vader** and **cryptobert** (FinBERT
+was removed). `NAIVE` is a rolling-probability reference generated automatically
+per `(horizon, family, window)` — it is **not** one of the 17 feature sets. The
+legacy `B*/E*/S*/C*` IDs were retired (see `docs/refactor_log.md`).
 
-## Model
+---
+
+## Production specification — panel logistic regression
+
+This is the **default** model (a bare `run-models` runs exactly this):
+`--model-type panel_logit --panel-mode ticker_fixed_effects
+--train-window rolling_fixed --rolling-window-days 180 --tune-hyperparams
+--hpo-objective log_loss`. Implementation:
+`src/thesis_pipeline/modeling/panel_logit.py`.
+
+### Estimator
 
 ```
 sklearn.linear_model.LogisticRegression(
-    penalty="l2",       # ridge
-    C=1.0,              # fixed; no hyperparameter search
+    penalty="l2",            # ridge (L2)
+    C=<selected by nested HPO; 1.0 when --no-tune-hyperparams>,
     solver="lbfgs",
     max_iter=1000,
     random_state=42,
 )
 ```
 
-The `NAIVE` rolling-probability reference uses the rule
+A **pooled panel** logit in a forecasting setting (not a classical inference
+panel). For each unique test timestamp `τ`:
 
-```
-p̂_t = mean(y[:t])
-ŷ_t = 1 if p̂_t ≥ 0.5 else 0
-```
+- **train** = every coin observation with `timestamp < τ`, restricted to the
+  rolling window (see below);
+- **test**  = every coin observation with `timestamp == τ`;
 
-## Walk-forward / expanding window
+so one logit is fit over the whole panel and predicts all coins at `τ`.
 
-Scheme: **expanding** window, step size = 1 row.
+- **Panel mode = `ticker_fixed_effects`**: `y_it ~ X_it + ticker dummies` —
+  shared feature **slopes** with coin-specific intercepts. Dummies are fit on
+  training tickers only (one reference dropped); unseen test tickers collapse to
+  the reference. **No time fixed effects** — a test-timestamp dummy is
+  unidentified out-of-sample. (`--panel-mode pooled` — a single shared intercept
+  — is available as a robustness variant.)
 
-```
-n            = len(rows for one ticker)
-init_train_n = max(int(n * 0.50), 30)            # configs/model_specs.yaml → walk_forward
-for t in range(init_train_n, n):
-    train_X = X.iloc[:t].dropna()
-    train_y = y.iloc[:t].loc[train_X.index]
-    if len(train_X) < 20 or train_y.nunique() < 2:
-        continue
-    scaler  = StandardScaler().fit(train_X)
-    model   = LogisticRegression(...).fit(scaler.transform(train_X), train_y)
-    proba_t = model.predict_proba(scaler.transform(X.iloc[[t]]))[:, 1]
-    pred_t  = int(proba_t >= 0.5)
-```
+### Training window — rolling, fixed 180 calendar days
 
-A fresh `StandardScaler` and a fresh `LogisticRegression` are fit at every
-step from the train-window alone — there is **no leakage** from t into the
-training set by construction. `thesis_pipeline.modeling.walk_forward` is the
-authoritative implementation.
+`--train-window rolling_fixed --rolling-window-days 180` (config
+`walk_forward.scheme = rolling_fixed`, `rolling_window_days = 180`). The window
+is measured in **calendar days**, so the wall-clock training span is identical
+across 1h / 6h / 1d. The initial position is the first 50 % of unique timestamps
+(`init_train_frac = 0.50`), never fewer than `min_init_train_obs = 30`; a step is
+skipped if the window has `< 20` valid rows or fewer than 2 classes.
 
-Numerical guards: `probability` is clipped to `[1e-15, 1 − 1e-15]` for log
-loss; predictions are not affected by this clip.
+### Preprocessing — training-window only (leakage-safe)
 
-## Output
+Fit on the training rows of each window **only**, then applied to `τ`:
 
-Per ticker, per (`horizon`, `set_id`, `sentiment_model`):
+- **Winsorisation**: a leakage-safe `TrainingWindowWinsorizer` computes its
+  quantile bounds from the training window alone (full-sample winsorisation was
+  removed — no `winsorization_thresholds.csv` is produced).
+- **Scaling**: a fresh `StandardScaler` (`fit_scope = train_window_only`).
 
-`Outputs/Signals/<horizon>/<set_id>.parquet` (for benchmark / economic sets)
+There is no leakage from `τ` into training by construction.
 
-`Outputs/Signals/<horizon>/<set_id>_<sentiment_model>.parquet` (for sentiment
-or combined sets when the script writes the model into the filename).
+### Nested hyperparameter search (HPO)
 
-Pooled and per-ticker metrics are written to
+`--tune-hyperparams` (default ON) runs a nested grid search **inside every
+training window** and selects by `--hpo-objective log_loss` (config
+`hyperparameter_tuning`):
+
+- **C grid**: `[0.01, 0.1, 1.0, 10.0]`
+- **class_weight grid**: `[null]` only (the production grid; `balanced` degrades
+  probability calibration under a log-loss/Brier objective and is a documented
+  robustness-only variant).
+- validation = most-recent 20 % of the training window
+  (`validation_fraction = 0.2`); falls back to fixed `C = 1.0` below
+  `min_train_obs = 60` / `min_validation_obs = 20`; the best params are refit on
+  the full window before predicting (`refit_on_full_train = true`).
+
+log loss is the objective because it rewards calibrated probabilities, matching
+how predictions are reused downstream (threshold analysis, economic backtest).
+
+### Forecast-origin sample (2022)
+
+Signal rows are restricted **at write time** to the canonical production sample
+(config `forecast_sample`, the single source of truth — never hard-coded
+elsewhere): inclusion is decided on the **forecast origin** (`timestamp + h`),
+retaining rows with `2022-01-01T00:00:00Z ≤ forecast_origin < 2023-01-01T00:00:00Z`.
+The raw interval-start `timestamp` is kept and a tz-aware `forecast_origin`
+column is added.
+
+### Numerical guards
+
+`probability` is clipped to `[1e-15, 1 − 1e-15]` for log loss; predictions
+(threshold 0.5) are unaffected by the clip.
+
+### Complete 17-set grid + benchmarks
+
+`run-models` runs the **full 17-set grid** when `--set-id` is omitted (the
+config is filtered only when `--set-id` is given). `ECON` is the matched
+economics-only benchmark every combined `ECON_*` set is compared against;
+`NAIVE` (rolling probability `p̂_t = mean(y[:t])`, `ŷ_t = 1 if p̂_t ≥ 0.5`) is a
+separate absolute-skill reference, generated once per `(horizon, family,
+window)`, not as a feature set.
+
+### Output
+
+`Outputs/Signals/<horizon>/<set_id>[_<sentiment_model>]_panel_ticker_fe.parquet`
+(or `_panel_pooled` for the pooled variant), plus the HPO-variant / rolling-window
+suffixes. Columns include `timestamp, ticker, target, prediction, probability,
+set_id, sentiment_model, model_type, panel_mode, hpo_enabled, hpo_objective,
+hpo_variant, best_C, best_class_weight, hpo_score, hpo_status` (see
+`configs/model_specs.yaml → output_columns`). Pooled + per-ticker metrics go to
 `Outputs/Signals/metrics_summary.csv`.
 
-## What this design intentionally does **not** include
+### Checkpointing and resume
 
-- No random train/test split (walk-forward only).
-- No hyperparameter tuning (`C = 1.0` is fixed).
-- No feature selection beyond the set definitions.
-- No nonlinear models or ensembles.
+`--checkpoint --resume` (both default ON). The walk-forward groups its test
+timestamps into checkpoint chunks (`--checkpoint-chunk-size`, default 20; the
+final runs use 30). Each chunk is computed, persisted atomically
+(`chunks/chunk_NNNN.parquet`) and, on resume, reloaded instead of recomputed. A
+chunk is purely a storage/compute partition — every `τ` still trains on its own
+window, so chunking changes nothing about the predictions. Deliberate restart:
+`--restart` (ignore cached signal parquets) and/or `--clear-checkpoints` (delete
+this run's checkpoint directory first). The preprocessing signature is embedded
+in the checkpoint manifest so a methodology change invalidates stale checkpoints.
 
-These choices are part of the thesis and are not changed by the refactor.
-
-## Alternative model family: `panel_logit`
-
-In addition to the canonical **per-asset** walk-forward above, a second model
-family is available for comparison:
-`src/thesis_pipeline/modeling/panel_logit.py`.
-
-It estimates a **pooled panel logistic regression** in a forecasting setting
-(not a classical inference panel model). For each unique test timestamp `τ`:
-
-- **train** = every coin observation with `timestamp < τ`
-- **test**  = every coin observation with `timestamp == τ`
-
-so a single logit is fit over the whole panel and predicts all coins at `τ`.
-The initial training window is the first 50 % of the *unique timestamps*
-(not 50 % of observations); the `StandardScaler` is fit on the training rows
-only; the estimator is the identical
-`LogisticRegression(penalty="l2", C=1.0, solver="lbfgs", random_state=42)`.
-
-Two modes:
-
-- `pooled` — `y_it ~ X_it` (shared coefficients).
-- `ticker_fixed_effects` — `y_it ~ X_it + ticker dummies`, approximating
-  coin-specific intercepts. Dummies are fit on training tickers only (one
-  reference dropped); unseen test tickers collapse to the reference. **No time
-  fixed effects** — a test-timestamp dummy is unidentified out-of-sample.
-
-Usage (per-asset remains the default):
-
-```bash
-python -m thesis_pipeline.cli run-models --horizon 1d --set-id C2 \
-    --model-type panel_logit --panel-mode pooled --restart
-python -m thesis_pipeline.cli run-models --horizon 1d --set-id C2 \
-    --model-type panel_logit --panel-mode ticker_fixed_effects --restart
-```
-
-Outputs are written alongside (never overwriting) the per-asset signals:
-`Outputs/Signals/<horizon>/<set_id>[_<sentiment_model>]_panel_pooled.parquet`
-or `..._panel_ticker_fe.parquet`, with extra columns `model_type` and
-`panel_mode`. `metrics_summary.csv` gains the same two columns. The `NAIVE`
-rolling-probability reference is not a panel-logit model; it is generated
-separately (not as a feature set) under `--model-type panel_logit`.
+---
 
 ## Parallel panel-logit checkpoint chunks (`--n-jobs`)
 
-`--n-jobs` parallelises the panel-logit **checkpoint chunks**. The walk-forward
-groups its test timestamps into checkpoint chunks (`--checkpoint-chunk-size`,
-default 20). A chunk is purely a **storage / compute partition** — it does
-**not** change the training window or the forecasting methodology. Every test
-timestamp τ still selects its own training window (`timestamp < τ`), fits its
-own preprocessing on that window only, runs its own nested HPO when enabled,
-and predicts only τ. Because chunks are independent, they can be computed in
-parallel worker processes.
+`--n-jobs` parallelises the panel-logit **checkpoint chunks**. A chunk is purely
+a storage / compute partition — it does **not** change the training window or the
+forecasting methodology. Every test timestamp τ still selects its own training
+window (`timestamp < τ`), fits its own preprocessing on that window only, runs
+its own nested HPO when enabled, and predicts only τ. Because chunks are
+independent, they can be computed in parallel worker processes.
 
 **Checkpointing must be enabled for parallel execution.** Parallelism operates
 over checkpoint chunks, so it only applies when checkpointing is on (the
 default). With `--no-checkpoint`, `--n-jobs` is **ignored**: the panel
 walk-forward follows its non-checkpointed **sequential** path regardless of the
-requested worker count, and a warning is printed to say so. To run in parallel,
-keep checkpointing enabled (do not pass `--no-checkpoint`).
+requested worker count, and a warning is printed to say so.
 
 ### Option
 
@@ -164,65 +175,52 @@ keep checkpointing enabled (do not pass `--no-checkpoint`).
 
 * **default `1`** — sequential; behaviour is unchanged for existing users.
 * **positive integer** — that many worker processes.
-* **`-1`** — use all CPUs available to the current **process / container**
-  (via `joblib.cpu_count()`), which respects CPU quotas / cgroup limits and is
-  **not** necessarily every physical or host CPU.
+* **`-1`** — use all CPUs available to the current **process / container** (via
+  `joblib.cpu_count()`), which respects CPU quotas / cgroup limits and is **not**
+  necessarily every physical or host CPU.
 * **`0` or `< -1`** — a clear validation error.
 
 Each worker is capped at **one** BLAS/OpenMP thread (`threadpoolctl` +
 joblib/loky `inner_max_num_threads=1`) so `N` workers cannot oversubscribe the
-CPU (e.g. avoiding `4 processes × 8 BLAS threads = 32` competing threads). The
-sequential `--n-jobs 1` path keeps the library's normal threading.
+CPU. The sequential `--n-jobs 1` path keeps the library's normal threading.
 
-### Example
+`--n-jobs` affects execution speed only, **not** the empirical result: the final
+signal frame is always re-sorted by `(timestamp, ticker)`, so worker completion
+order never affects output (sequential vs parallel are equal within
+`rtol=1e-10, atol=1e-12`). Only the **main process** writes checkpoints /
+`manifest.json` (no cross-process race). Resume is fully preserved; a failed
+worker re-raises in the main process and the command exits unsuccessfully rather
+than returning partial results.
 
-```bash
-python -m thesis_pipeline.cli run-models \
-  --horizon 1h \
-  --model-type panel_logit \
-  --panel-mode ticker_fixed_effects \
-  --n-jobs 4 \
-  --checkpoint-chunk-size 30
+**Recommended:** start with `--n-jobs 4` on an 8-core / 32 GB machine; try
+`--n-jobs 2` vs `4` and keep the faster one. Peak RAM ≈ `n_jobs × frame_size`
+plus the main process.
+
+---
+
+## Legacy / robustness model — per-asset expanding walk-forward
+
+**Not the production specification and not the default.** Available only through
+explicit CLI flags (`--model-type per_asset`, optionally `--train-window
+expanding`, `--no-tune-hyperparams`). Implementation:
+`thesis_pipeline.modeling.walk_forward`. It fits an independent per-ticker logit
+in an expanding window with step size 1:
+
+```
+n            = len(rows for one ticker)
+init_train_n = max(int(n * 0.50), 30)
+for t in range(init_train_n, n):
+    train_X = X.iloc[:t].dropna()
+    train_y = y.iloc[:t].loc[train_X.index]
+    if len(train_X) < 20 or train_y.nunique() < 2:
+        continue
+    scaler  = StandardScaler().fit(train_X)                    # train window only
+    model   = LogisticRegression(penalty="l2", C=1.0, solver="lbfgs",
+                                 max_iter=1000, random_state=42).fit(...)
+    proba_t = model.predict_proba(scaler.transform(X.iloc[[t]]))[:, 1]
+    pred_t  = int(proba_t >= 0.5)
 ```
 
-### Recommended worker count
-
-**For an 8-core, 32 GB machine, start with `--n-jobs 4`.** More workers are not
-always faster: each worker holds its own copy of the feature frame in RAM, and
-process start-up plus result serialization add overhead. Past the point where
-memory bandwidth or RAM saturates, throughput flattens or regresses. Try
-`--n-jobs 2` and `--n-jobs 4` and keep the faster one for your hardware.
-
-* **GitHub Codespaces:** a 4-core / 8-core machine type is recommended; use
-  `--n-jobs 2` (4-core) or `--n-jobs 4` (8-core).
-* **Memory:** the shared feature frame is written once to a temporary parquet
-  and loaded once per worker (cached), so peak RAM ≈ `n_jobs × frame_size`
-  plus the main process. On 32 GB, four workers on the 1h frame is comfortable.
-
-### Determinism, safety and resume
-
-* Results are **methodologically identical** to the sequential run. The final
-  signal frame is always re-sorted by `(timestamp, ticker)`, so the order in
-  which workers finish never affects the output. Sequential vs parallel outputs
-  are equal within a strict floating-point tolerance (tests use
-  `rtol=1e-10, atol=1e-12`).
-* Only the **main process** writes chunk checkpoints (atomically) and updates
-  `manifest.json` — workers only compute and return rows, so there is no
-  cross-process write race.
-* **Resume** is fully preserved: already-cached chunks are reused, only pending
-  chunks are submitted, a corrupt checkpoint is recomputed, and sequential and
-  parallel runs can resume each other's checkpoints (chunk IDs and paths are
-  deterministic).
-* A **failed worker** re-raises its original exception in the main process, does
-  not mark its chunk complete, leaves completed chunks reusable, and makes the
-  command exit unsuccessfully rather than returning partial results.
-
-### Benchmark output
-
-Parallel runs print a one-line summary per feature set:
-`n_jobs`, total chunks, cached chunks, submitted chunks, elapsed wall-clock and
-average completed-chunk time. Small-dataset speedups are modest (start-up and
-serialization dominate); full-run scaling depends on CPU, RAM, chunk balance and
-serialization overhead, and is expected to approach near-linear up to the core
-count when per-chunk compute (HPO, larger windows) dwarfs the overhead. Do not
-assume a fixed wall-clock target — measure on the target hardware.
+A fresh scaler and estimator are fit at every step from the train window alone —
+no leakage by construction. This historical baseline uses a fixed `C = 1.0` and
+an expanding window; it is retained for robustness comparison only.

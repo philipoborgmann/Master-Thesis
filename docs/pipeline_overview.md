@@ -1,90 +1,73 @@
 # Pipeline overview
 
 The pipeline is organised as a directed acyclic graph of independent stages.
-Each stage has documented inputs and outputs (see
-`configs/pipeline.yaml`); each can be smoke-tested or dry-run in isolation;
-each prints a clear header at start time.
+Each stage has documented inputs and outputs (see `configs/pipeline.yaml`); each
+can be smoke-tested or dry-run in isolation; each prints a clear header at start
+time. The package modules under `src/thesis_pipeline/` **are** the
+implementation and the single source of truth — the historical root-level
+scripts were retired, not wrapped.
 
 ```
-                       ┌─────────────────────────────┐
-                       │   Crypto _data.py (ccxt)    │   (one-off raw download)
-                       └──────────────┬──────────────┘
-                                      │ writes Data/Raw/Price/<horizon>/
-                                      ▼
-              ┌──────────────────────────────────────────┐
-              │           validate_price                 │
-              │   src/.../price/validate.py              │
-              │   (wraps Price_Data_Validation.py)       │
-              └──────────────┬───────────────────────────┘
-                             │ Data/Raw/Price/validation/*.csv
-                             ▼
-              ┌──────────────────────────────────────────┐
-              │        create_price_features             │
-              │   src/.../price/features.py              │
-              │   (wraps Create_Price_Features.py)       │
-              └──────────────┬───────────────────────────┘
-                             │ Data/Features/price_features_<horizon>.parquet
-                             │ Data/Features/winsorization_thresholds.csv
-                             │ Data/Features/feature_generation_report.csv
-                             ▼
-                              ─────────
-                                  merge_features
-                              ─────────
-
-  Data/Raw/Sentiment/<subreddit>/submission.csv
-              │
-              ▼
-  ┌─────────────────────────────────┐
-  │       load_sentiment            │   → Data/Processed/Sentiment/sentiment_combined.csv
-  │   src/.../sentiment/load.py     │   → Outputs/deskriptiv/descriptive_statistics.xlsx
-  │   (wraps Sentiment_Data_Load.py)│
-  └──────────────┬──────────────────┘
-                 │
-       ┌─────────┴────────────────────────┐
-       ▼                                   ▼
-  score_vader                        score_cryptobert
-  (vaderSentiment)                   (ElKulako/cryptobert)
-       │                                   │
-       └───────────────────┬───────────────┘
-                                │
-                                ▼
-              ┌──────────────────────────────────────────┐
-              │     create_sentiment_features            │
-              │   src/.../sentiment/aggregate.py         │
-              │   (wraps Sentiment_feature_engineering.py)│
-              └──────────────┬───────────────────────────┘
-                             │ Data/Features/sentiment_features_<horizon>.parquet
-                             │ Data/Features/sentiment_coverage.csv
-                             ▼
-              ┌──────────────────────────────────────────┐
-              │           stationarity                   │
-              │   src/.../sentiment/stationarity.py      │
-              │   (wraps Sentiment_Stationarity_Test.py) │
-              └──────────────┬───────────────────────────┘
-                             │ Data/Features/stationarity_*.parquet|xlsx
-                             ▼
-              ┌──────────────────────────────────────────┐
-              │           merge_features                 │
-              │   src/.../features/merge.py              │
-              │   (wraps Merge_Features.py)              │
-              └──────────────┬───────────────────────────┘
-                             │ Data/Final/features_<horizon>.parquet
-                             │ Data/Final/merge_report.csv
-                             ▼
-              ┌──────────────────────────────────────────┐
-              │            run_models                    │
-              │   src/.../modeling/run_models.py         │
-              │   (wraps Run_Models.py)                  │
-              └──────────────┬───────────────────────────┘
-                             │ Outputs/Signals/<horizon>/<set_id>.parquet
-                             │ Outputs/Signals/metrics_summary.csv
-                             ▼
-              ┌──────────────────────────────────────────┐
-              │           diagnostics                    │
-              │   src/.../diagnostics/sample_report.py   │
-              └──────────────────────────────────────────┘
-                Outputs/diagnostics/sample_report_<horizon>.md
+  raw OHLCV (Data/Raw/Price/<h>/)                raw Reddit (Data/Raw/Sentiment/<subreddit>/submission.csv)
+        │                                                    │
+        ▼                                                    ▼
+  validate_price                                       load_sentiment
+  price/validate.py                                    sentiment/load.py
+        │  Data/Raw/Price/validation/*.csv                  │  Data/Processed/Sentiment/sentiment_combined.csv
+        ▼                                                    ▼
+  create_price_features                          ┌───────────┴───────────┐
+  price/features.py                              ▼                       ▼
+        │  Data/Features/                    score_vader           score_cryptobert
+        │  price_features_<h>.parquet        sentiment/            sentiment/
+        │  feature_generation_report.csv     score_vader.py        score_cryptobert.py
+        │                                        │  Data/Transformed/Sentiment_Scored_*.csv
+        │                                        ▼
+        │                                   create_sentiment_features
+        │                                   sentiment/aggregate.py
+        │                                        │  Data/Features/sentiment_features_<h>.parquet
+        │                                        │  Data/Features/sentiment_coverage.csv
+        │                                        ▼
+        │                                   stationarity (diagnostic)
+        │                                   sentiment/stationarity.py
+        │                                        │  Data/Features/stationarity_*.parquet|xlsx
+        └───────────────────┬────────────────────┘
+                            ▼
+                     merge_features                       features/merge.py
+                            │  Data/Final/features_<h>.parquet, merge_report.csv
+                            ▼
+                     run_models  (SEPARATELY for 1d, 6h, 1h)      modeling/run_models.py
+                            │  Outputs/Signals/<h>/<set_id>...parquet, metrics_summary.csv
+                            ▼
+                     evaluate_signals  (ONCE, across ALL horizons)  evaluation/evaluate_signals.py
+                            │  Outputs/Evaluation/*.csv + signal_evaluation.xlsx
+                            │  (incl. signal_completeness.csv, multiple_testing_manifest.csv)
+                            ▼
+                     final evaluation tables
 ```
+
+Raw OHLCV is (re)acquired out-of-pipeline by `legacy/crypto_data.py` (ccxt); it
+is a deliberate manual step, not a pipeline stage.
+
+**Why evaluation runs once.** `run_models` is run separately per horizon, but
+`evaluate_signals` is run **once with no `--horizon`** so it sees all three
+horizons together: every horizon writes into the same `Outputs/Evaluation/`
+directory (a per-horizon call would overwrite the previous horizon's tables),
+and the family-aware Benjamini–Hochberg correction pools p-values **across
+horizons** within each hypothesis family. Horizon-specific `evaluate_signals
+--horizon <h>` calls are for diagnostics only and must not generate the final
+thesis tables.
+
+### Separate diagnostic / reporting stages
+
+Run on demand, outside the modelling DAG:
+
+- **`diagnostics`** (`diagnostics/sample_report.py`) → `Outputs/diagnostics/` —
+  per-horizon sample report.
+- **`descriptive-final-features`** (`diagnostics/descriptive_final_features.py`)
+  → `Outputs/deskriptiv/final_feature_sets/` — descriptive statistics over the
+  final feature sets (omit `--horizon` for all three horizons combined).
+- **`structural-breaks`** (`diagnostics/structural_breaks.py`) — advisory
+  Bai–Perron-style break diagnostics; **never** sets rolling-window sizes.
 
 ## Horizon coverage
 

@@ -4,7 +4,7 @@ ALL confirmatory Benjamini-Hochberg correction flows through this one
 module. Every confirmatory test emits a record
 ``(test_id, family, horizon, model, metric, p_value_raw)``; the module
 groups by ``family`` and applies BH WITHIN each family at that family's
-pre-registered ``alpha`` (default 0.05), pooling p-values ACROSS horizons
+pre-specified ``alpha`` (default 0.05), pooling p-values ACROSS horizons
 within the family (never per-horizon).
 
 Design guarantees (guardrails)
@@ -112,7 +112,7 @@ def build_manifest(corrected: pd.DataFrame,
 
     ``family_role`` tags every row emitted here (``"confirmatory"`` by
     default). Exploratory families are appended by the caller with
-    ``family_role="exploratory"`` so a reviewer can tell the pre-registered
+    ``family_role="exploratory"`` so a reviewer can tell the pre-specified
     confirmatory set apart from post-hoc exploratory families at a glance.
     Descriptive surfaces (regime_mcnemar, absolute_vs_naive) never receive a
     family and so never appear here.

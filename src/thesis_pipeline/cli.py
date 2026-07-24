@@ -500,6 +500,10 @@ def cmd_evaluate_signals(args: argparse.Namespace) -> int:
         argv.append("--no-economic")
     if getattr(args, "no_regime_mcnemar", False):
         argv.append("--no-regime-mcnemar")
+    if getattr(args, "strict_feature_set_ids", False):
+        argv.append("--strict-feature-set-ids")
+    if getattr(args, "allow_incomplete_signals", False):
+        argv.append("--allow-incomplete-signals")
     return _es.main(argv)
 
 
@@ -540,27 +544,31 @@ def cmd_run_pipeline(args: argparse.Namespace) -> int:
     return rc
 
 
+# Stage-name → command-function dispatch table. Module-level so tests can
+# assert every configs/pipeline.yaml default_order stage maps to exactly one
+# dispatcher (and no two stages share the same underlying command).
+STAGE_DISPATCH = {
+    "validate_price":            cmd_validate_price,
+    "create_price_features":     cmd_create_price_features,
+    "load_sentiment":            cmd_load_sentiment,
+    "score_vader":               lambda a: cmd_score_sentiment(_with_attr(a, model="vader")),
+    "score_cryptobert":          lambda a: cmd_score_sentiment(_with_attr(a, model="cryptobert")),
+    "create_sentiment_features": cmd_create_sentiment_features,
+    "stationarity":              cmd_stationarity,
+    "merge_features":            cmd_merge_features,
+    "run_models":                cmd_run_models,
+    "evaluate_signals":          cmd_evaluate_signals,
+    "diagnostics":               cmd_diagnostics,
+    "descriptive_final_features": cmd_descriptive_final_features,
+    "structural_breaks":          cmd_structural_breaks,
+}
+
+
 def _dispatch_stage(stage: str, args: argparse.Namespace) -> int:
     """Map a stage name to the matching command function."""
-    table = {
-        "validate_price":            cmd_validate_price,
-        "create_price_features":     cmd_create_price_features,
-        "load_sentiment":            cmd_load_sentiment,
-        "score_vader":               lambda a: cmd_score_sentiment(_with_attr(a, model="vader")),
-        "score_cryptobert":          lambda a: cmd_score_sentiment(_with_attr(a, model="cryptobert")),
-        "create_sentiment_features": cmd_create_sentiment_features,
-        "stationarity":              cmd_stationarity,
-        "merge_features":            cmd_merge_features,
-        "run_models":                cmd_run_models,
-        "evaluate_signals":          cmd_evaluate_signals,
-        "diagnostics":               cmd_diagnostics,
-        "reports":                   cmd_diagnostics,
-        "descriptive_final_features": cmd_descriptive_final_features,
-        "structural_breaks":          cmd_structural_breaks,
-    }
-    if stage not in table:
+    if stage not in STAGE_DISPATCH:
         raise SystemExit(f"Unknown stage: {stage}")
-    return table[stage](args)
+    return STAGE_DISPATCH[stage](args)
 
 
 def _with_attr(ns: argparse.Namespace, **kwargs) -> argparse.Namespace:
@@ -756,6 +764,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-regime-mcnemar", dest="no_regime_mcnemar",
                     action="store_true",
                     help="Skip the regime-specific McNemar tests.")
+    sp.add_argument("--strict-feature-set-ids", "--strict_feature_set_ids",
+                    dest="strict_feature_set_ids", action="store_true",
+                    help="Only evaluate signal groups whose set_id is a registered "
+                         "feature set (NAIVE reference kept); drops stale/legacy IDs.")
+    sp.add_argument("--allow-incomplete-signals", "--allow_incomplete_signals",
+                    dest="allow_incomplete_signals", action="store_true",
+                    help="Downgrade the signal-completeness guard to a warning "
+                         "instead of aborting on an incomplete production run.")
     _add_common(sp)
     sp.set_defaults(func=cmd_evaluate_signals)
 
@@ -778,6 +794,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-market-cap",  dest="no_market_cap",  action="store_true")
     sp.add_argument("--no-economic",    dest="no_economic",    action="store_true")
     sp.add_argument("--no-regime-mcnemar", dest="no_regime_mcnemar", action="store_true")
+    sp.add_argument("--strict-feature-set-ids", dest="strict_feature_set_ids",
+                    action="store_true")
+    sp.add_argument("--allow-incomplete-signals", dest="allow_incomplete_signals",
+                    action="store_true")
     sp.add_argument("--backtest-config", dest="backtest_config", default=None)
     sp.add_argument("--transaction-cost-bps", dest="transaction_cost_bps",
                     type=float, nargs="*", default=None)
@@ -806,6 +826,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-market-cap",  dest="no_market_cap",  action="store_true")
     sp.add_argument("--no-economic",    dest="no_economic",    action="store_true")
     sp.add_argument("--no-regime-mcnemar", dest="no_regime_mcnemar", action="store_true")
+    sp.add_argument("--strict-feature-set-ids", dest="strict_feature_set_ids",
+                    action="store_true")
+    sp.add_argument("--allow-incomplete-signals", dest="allow_incomplete_signals",
+                    action="store_true")
     sp.add_argument("--backtest-config", dest="backtest_config", default=None)
     sp.add_argument("--transaction-cost-bps", dest="transaction_cost_bps",
                     type=float, nargs="*", default=None)

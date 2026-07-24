@@ -79,3 +79,37 @@ def test_pipeline_stages_cover_known_stages():
     }
     assert expected.issubset(set(cfg["stages"]))
     assert "default_order" in cfg
+
+
+def test_pipeline_has_no_stale_script_fields():
+    """The retired root-level scripts are gone; only `module:` is authoritative."""
+    cfg = load_config("pipeline")
+    for name, stage in cfg["stages"].items():
+        assert "script" not in stage, (
+            f"stage {name!r} still carries a stale `script:` field")
+        assert "module" in stage, f"stage {name!r} is missing `module:`"
+
+
+def test_default_order_maps_one_to_one_to_dispatchers():
+    """Every default_order stage dispatches to exactly one command, and no two
+    default stages share the same underlying command function."""
+    import sys
+    from pathlib import Path
+    src = Path(__file__).resolve().parents[1] / "src"
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    from thesis_pipeline import cli
+
+    order = load_config("pipeline")["default_order"]
+    assert len(order) == len(set(order)), f"duplicate stages in default_order: {order}"
+
+    seen: dict = {}
+    for stage in order:
+        assert stage in cli.STAGE_DISPATCH, f"no dispatcher for default stage {stage!r}"
+        fn = cli.STAGE_DISPATCH[stage]
+        assert fn not in seen, (
+            f"stages {seen.get(fn)!r} and {stage!r} dispatch to the same "
+            f"command function — remove the duplicate")
+        seen[fn] = stage
+    # 'reports' was a duplicate of 'diagnostics' and must be gone.
+    assert "reports" not in order and "reports" not in cli.STAGE_DISPATCH

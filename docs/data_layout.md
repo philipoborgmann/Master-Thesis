@@ -70,7 +70,6 @@ Data/
 │   ├── sentiment_features_6h.parquet
 │   ├── feature_generation_report.csv
 │   ├── sentiment_coverage.csv
-│   ├── winsorization_thresholds.csv
 │   ├── cmc_marketcap_column_matches.csv
 │   ├── stationarity_records_v2.parquet
 │   ├── stationarity_results.xlsx

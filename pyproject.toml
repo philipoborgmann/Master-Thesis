@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Pipeline for the cryptocurrency-sentiment master thesis."
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "Philip Oborgmann" }]
+authors = [{ name = "Philip Borgmann" }]
 dependencies = [
     "pandas>=2.0",
     "numpy>=1.24",
@@ -40,6 +40,13 @@ transformers = [
     "torch>=2.0",
     "transformers>=4.30",
     "accelerate>=0.20",
+]
+# Raw OHLCV acquisition via the legacy downloader (legacy/crypto_data.py).
+# Not needed for the model/evaluation reproduction path (from Data/Final/).
+# The exact CCXT version used for the original 2026-05-04 retrieval is
+# unknown and deliberately not pinned.
+acquisition = [
+    "ccxt>=4.0",
 ]
 tests = [
     "pytest>=7.0",

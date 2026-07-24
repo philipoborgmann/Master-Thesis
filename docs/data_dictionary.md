@@ -19,8 +19,7 @@ but have not been hand-verified.
 
 ## Raw OHLCV — `Data/Raw/Price/<horizon>/<TICKER>USDT_<suffix>.parquet`
 
-(observed; loader: `load_ohlcv` in `Price_Data_Validation.py` /
-`Create_Price_Features.py`)
+(loader: `thesis_pipeline.price.validate` / `thesis_pipeline.price.features`)
 
 | column     | dtype           | notes |
 |------------|-----------------|-------|
@@ -48,14 +47,14 @@ Sidecar files in the same folder:
 |------|---------|
 | `price.parquet`      | `date` (index or column), one column per CMC ID (e.g. `1`, `1027`, …) |
 | `volume.parquet`     | same shape as `price.parquet` |
-| `market_cap.parquet` | same shape — used by `Create_Price_Features.py` for `market_cap_t` |
+| `market_cap.parquet` | same shape — used by `thesis_pipeline.price.features` for `market_cap_t` |
 | `MetaData.csv` / `MetaData.xlsx` | per-coin metadata (symbol, name, CMC id, listing date) |
 
 ---
 
 ## `Data/Processed/Sentiment/sentiment_combined.csv`
 
-(observed in `Sentiment_Data_Load.py`)
+(produced by `thesis_pipeline.sentiment.load`)
 
 | column | notes |
 |--------|-------|
@@ -91,7 +90,7 @@ P(bullish) − P(bearish). (FinBERT was evaluated but removed — see
 
 ## `Data/Features/price_features_<horizon>.parquet`
 
-(observed in `Create_Price_Features.py::create_features_for_coin_horizon`)
+(produced by `thesis_pipeline.price.features`, `create_features_for_coin_horizon`)
 
 | column                | dtype    | notes |
 |-----------------------|----------|-------|

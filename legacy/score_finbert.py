@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Sentiment_Score_Finbert.py
-==========================
+score_finbert.py  (RETIRED — legacy/)
+=====================================
+NOT part of the supported pipeline. FinBERT was evaluated during development
+and then dropped (it is trained on financial-analyst language and produced no
+meaningful variation on Reddit/crypto text). The CLI rejects
+``score-sentiment --model finbert``. This module is kept only as a retired
+development experiment; the production scorers are VADER and CryptoBERT.
+
 Scores Reddit post titles and selftexts using ProsusAI/finbert.
 
 Reads the cleaned, combined sentiment CSV and adds FinBERT scores

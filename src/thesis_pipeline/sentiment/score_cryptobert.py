@@ -84,6 +84,13 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 # ══════════════════════════════════════════════════════════════════════════════
 
 MODEL_NAME         = "ElKulako/cryptobert"
+# Hugging Face revision (commit hash / tag) to pin for exact reproducibility.
+# The thesis scores were produced from the model retrieved on 2026-04-15 from
+# the then-current default branch. The exact snapshot revision could NOT be
+# reconstructed from the local Hugging Face cache, logs, or run metadata, so it
+# is left as None (= resolve the default branch at load time). If the exact
+# commit hash is ever recovered, set it here to pin both tokenizer and model.
+MODEL_REVISION     = None
 MAX_SEQ_LENGTH     = 128          # CryptoBERT trained with 128; up to 514 possible but not recommended
 EMPTY_SELFTEXT     = {"[removed]", "[deleted]", "", "nan", "None"}
 CHECKPOINT_DIRNAME = ".cryptobert_checkpoints"
@@ -105,10 +112,12 @@ def load_cryptobert():
     Returns:
         tokenizer, model, device, label_map
     """
-    print(f"[INFO] Loading CryptoBERT model ({MODEL_NAME})...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+    print(f"[INFO] Loading CryptoBERT model ({MODEL_NAME}, "
+          f"revision={MODEL_REVISION or 'default-branch'})...")
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_NAME, use_fast=True, revision=MODEL_REVISION)
     model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_NAME, num_labels=3
+        MODEL_NAME, num_labels=3, revision=MODEL_REVISION
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

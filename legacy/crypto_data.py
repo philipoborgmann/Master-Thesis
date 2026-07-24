@@ -16,14 +16,15 @@ Install:
     pip install ccxt pandas pyarrow
 
 Usage:
-    # Default run (all coins, all four timeframes, 2022 Reddit data window)
-    python crypto_data_downloader.py --output /path/to/thesis/data/raw/crypto
+    # Default run (all coins, the full thesis timeframe grid, 2022 window).
+    # Output defaults to the repository-standard Data/Raw/Price.
+    python legacy/crypto_data.py --output Data/Raw/Price
 
     # Subset of timeframes
-    python crypto_data_downloader.py --timeframes 15m 1h
+    python legacy/crypto_data.py --timeframes 15m 1h
 
     # Specific coins only
-    python crypto_data_downloader.py --coins BTC ETH SOL ADA
+    python legacy/crypto_data.py --coins BTC ETH SOL ADA
 
     # Custom date range
     python crypto_data_downloader.py --since 2021-12-01 --until 2023-02-01
@@ -122,7 +123,8 @@ QUOTE_PRIORITY = ["USDT", "USD", "USDC", "BUSD", "FDUSD"]
 # Note: 1m data depth varies strongly across exchanges. Binance has the deepest
 # 1m history (back to 2017+); Bybit/KuCoin keep ~2 years; Kraken is limited.
 # If 1m coverage looks sparse for some coins, consider --exchange binance.
-DEFAULT_TIMEFRAMES = [ "6h"]
+# The thesis raw-price grid (see configs/horizons.yaml raw_price_horizons).
+DEFAULT_TIMEFRAMES = ["15m", "1h", "4h", "6h", "1d"]
 
 EXCHANGE_LIMITS = {
     "binance": 1000, "bybit": 1000, "okx": 300, "kucoin": 1500,
@@ -177,12 +179,29 @@ def save_checkpoint(output_dir, coin, timeframe, status, n_bars=0):
 # PRICE SOURCES METADATA (for thesis appendix / reproducibility)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ``exchange`` is the ACTUAL source; ``preferred_exchange`` is the CLI hint.
+# ``fetched_at`` is the retrieval timestamp; ``ccxt_version`` pins the runtime.
+# NOTE: these last two columns were added for newly generated provenance logs —
+# historic price_sources.csv files created before this change do not contain them.
 PRICE_SOURCES_HEADER = [
-    "coin", "timeframe", "exchange", "symbol", "quote",
+    "coin", "timeframe", "preferred_exchange", "exchange", "symbol", "quote",
     "start", "end", "n_bars", "expected_bars", "coverage_pct",
     "missing_bars", "max_gap_minutes",
-    "status", "filename", "fetched_at",
+    "status", "filename", "fetched_at", "ccxt_version",
 ]
+
+
+def _ccxt_version() -> str:
+    try:
+        import ccxt
+        return getattr(ccxt, "__version__", "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+#: Set once in ``main()`` from ``--exchange`` so the provenance row can record
+#: the requested lead exchange alongside the actual source.
+_PREFERRED_EXCHANGE = ""
 
 def upsert_price_source(output_dir, row):
     """Write/replace one row in price_sources.csv keyed by (coin, timeframe).
@@ -526,6 +545,7 @@ def _log_price_source(output_dir, coin, timeframe, ex_id, symbol, quote,
 
     upsert_price_source(output_dir, {
         "coin": coin, "timeframe": timeframe,
+        "preferred_exchange": _PREFERRED_EXCHANGE,
         "exchange": ex_id, "symbol": symbol, "quote": quote,
         "start": start, "end": end,
         "n_bars": n_bars, "expected_bars": expected_bars,
@@ -534,6 +554,7 @@ def _log_price_source(output_dir, coin, timeframe, ex_id, symbol, quote,
         "max_gap_minutes": max_gap_minutes,
         "status": status, "filename": filename,
         "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "ccxt_version": _ccxt_version(),
     })
 
 
@@ -563,21 +584,30 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("--exchange", default=None,
-                        help="Preferred lead exchange (still falls through if pair missing)")
+                        help="Preferred LEAD exchange. This is only a hint: the "
+                             "downloader still falls through the per-coin "
+                             "COIN_EXCHANGE_PREFERENCE and then FALLBACK_EXCHANGES "
+                             "list whenever the pair is missing or returns no data, "
+                             "so the actual source may differ (recorded per row in "
+                             "price_sources.csv).")
     parser.add_argument("--coins", nargs="+", default=None,
                         help=f"Coins to download (default: all {len(COIN_UNIVERSE)})")
     parser.add_argument("--timeframes", nargs="+", default=None,
-                        help="Timeframes to download (default: 15m)")
+                        help="Timeframes to download "
+                             f"(default: {' '.join(DEFAULT_TIMEFRAMES)} — the thesis raw grid)")
     parser.add_argument("--since", default="2021-12-01",
                         help="Start date (default: 2021-12-01, 1 month before Reddit data)")
     parser.add_argument("--until", default="2023-02-01",
                         help="End date (default: 2023-02-01, 1 month after Reddit data)")
-    parser.add_argument("--output", default="data/raw/price"
-                        )
+    parser.add_argument("--output", default="Data/Raw/Price",
+                        help="Output root (default: Data/Raw/Price — the "
+                             "repository-standard path; note the capitalisation).")
     parser.add_argument("--resume", action="store_true",
                         help="Skip already-complete coins, resume partials")
 
     args = parser.parse_args()
+    global _PREFERRED_EXCHANGE
+    _PREFERRED_EXCHANGE = args.exchange or "(auto-fallback)"
     coins = args.coins or COIN_UNIVERSE
     timeframes = args.timeframes or DEFAULT_TIMEFRAMES
     since_ms = parse_date_ms(args.since)

@@ -29,9 +29,15 @@ for H in 1d 6h 1h; do
         --n-jobs "${N_JOBS}"
 done
 
-for H in 1d 6h 1h; do
-    echo ">>> evaluate-signals --horizon ${H}"
-    "${CLI[@]}" evaluate-signals --horizon "${H}"
-done
+# Evaluation runs EXACTLY ONCE across all horizons (no --horizon): every horizon
+# writes into the same Outputs/Evaluation/ directory and the family-aware BH
+# correction pools p-values across horizons. --strict-feature-set-ids keeps only
+# the registered 17-set grid (+ NAIVE); the completeness guard aborts on a
+# partial run.
+echo ">>> evaluate-signals (once, across all horizons, strict + completeness guard)"
+"${CLI[@]}" evaluate-signals --strict-feature-set-ids
+
+echo ">>> descriptive-final-features (all horizons)"
+"${CLI[@]}" descriptive-final-features
 
 echo ">>> done. Signals in Outputs/Signals/, evaluation in Outputs/Evaluation/."

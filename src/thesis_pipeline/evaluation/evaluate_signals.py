@@ -131,6 +131,14 @@ def build_parser() -> argparse.ArgumentParser:
                              "the active feature_sets.xlsx. Default: evaluate every "
                              "loaded signal file (legacy / stale IDs are still "
                              "scored, just flagged in economic_diagnostics.csv).")
+    parser.add_argument("--allow-incomplete-signals", "--allow_incomplete_signals",
+                        dest="allow_incomplete_signals", action="store_true",
+                        help="Downgrade the signal-completeness guard to a warning. "
+                             "By default a registered production feature-set group "
+                             "that is incomplete (fewer timestamps than its matched "
+                             "ECON benchmark, or duplicate rows) aborts evaluation so "
+                             "partial runs never enter the final thesis tables. Use "
+                             "only for diagnostic inspection of a known-partial run.")
     return parser
 
 
@@ -158,6 +166,7 @@ def run(*, horizon: str | None = None,
         no_regime_mcnemar: bool = False,
         no_diff_in_improvement: bool = False,
         strict_feature_set_ids: bool = False,
+        allow_incomplete_signals: bool = False,
         feature_config: str | None = None,
         backtest_config: str | None = None,
         transaction_cost_bps: list[float] | None = None) -> int:
@@ -191,6 +200,8 @@ def run(*, horizon: str | None = None,
         argv.append("--no-diff-in-improvement")
     if strict_feature_set_ids:
         argv.append("--strict-feature-set-ids")
+    if allow_incomplete_signals:
+        argv.append("--allow-incomplete-signals")
     return main(argv)
 
 
@@ -217,6 +228,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         except KeyError:
             pass
     outputs = [xlsx_path,
+               out_root / "signal_completeness.csv",
                out_root / "pooled_metrics.csv",
                out_root / "per_ticker_metrics.csv",
                out_root / "threshold_analysis.csv",
@@ -341,6 +353,44 @@ def main(argv: Sequence[str] | None = None) -> int:
                 logger.warning("evaluate-signals: no signal rows survive strict "
                                "feature-set-id filter — nothing to evaluate")
                 return 0
+
+    # ── 2c. Signal-completeness audit (final-production guard) ───
+    # A partial model run (e.g. a sentiment set whose walk-forward ended a few
+    # timestamps early) must never enter the final thesis comparisons silently.
+    # The audit writes signal_completeness.csv and — outside smoke mode and
+    # unless --allow-incomplete-signals is set — aborts BEFORE any metric is
+    # computed when a registered production feature-set group is incomplete.
+    from .completeness import (
+        audit_signal_completeness, incomplete_production_groups,
+    )
+    from ..features.feature_registry import SET_ID_PATTERN as _REGISTERED_SET_IDS
+    completeness_df = audit_signal_completeness(signals)
+    out_root.mkdir(parents=True, exist_ok=True)
+    _completeness_path = out_root / "signal_completeness.csv"
+    completeness_df.to_csv(_completeness_path, index=False)
+    logger.info("evaluate-signals: wrote signal-completeness audit → %s",
+                _completeness_path)
+    incomplete = incomplete_production_groups(completeness_df, set(_REGISTERED_SET_IDS))
+    if not incomplete.empty:
+        detail = "; ".join(
+            f"{r.get('horizon')}/{r.get('set_id')}/{r.get('sentiment_model')}: "
+            f"{r.get('reason')}"
+            for _, r in incomplete.iterrows())
+        if args.smoke or getattr(args, "allow_incomplete_signals", False):
+            logger.warning(
+                "evaluate-signals: %d incomplete production signal group(s) "
+                "detected but allowed (%s): %s",
+                len(incomplete),
+                "smoke mode" if args.smoke else "--allow-incomplete-signals",
+                detail)
+        else:
+            logger.error(
+                "evaluate-signals: ABORTING — %d registered production signal "
+                "group(s) are incomplete and would corrupt the final thesis "
+                "comparisons: %s. See %s. Re-run the affected model horizon(s), "
+                "or pass --allow-incomplete-signals for diagnostic inspection.",
+                len(incomplete), detail, _completeness_path)
+            return 3
 
     # ── 3. Pooled + per-ticker metrics ──────────────────────────
     pooled     = pooled_metrics_table(signals)

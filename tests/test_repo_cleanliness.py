@@ -77,6 +77,17 @@ def test_crypto_data_moved_to_legacy():
     )
 
 
+def test_finbert_scorer_moved_to_legacy():
+    """FinBERT was removed from the pipeline; its scorer must not live in the
+    active package. It is retained under ``legacy/`` as a retired experiment."""
+    assert not (SRC_ROOT / "thesis_pipeline" / "sentiment" / "score_finbert.py").exists(), (
+        "score_finbert.py must not live in the active package — move it to legacy/"
+    )
+    assert (REPO_ROOT / "legacy" / "score_finbert.py").exists(), (
+        "legacy/score_finbert.py is missing"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Section 2: scripts/ entries are thin and re-import the package module
 # ---------------------------------------------------------------------------
@@ -145,9 +156,9 @@ def test_cli_dry_run_returns_zero(argv):
     "thesis_pipeline.price.validate",
     "thesis_pipeline.sentiment.load",
     "thesis_pipeline.sentiment.score_vader",
-    # score_finbert was retired (FinBERT removed from the pipeline); the file
-    # remains on disk for historical traceability but is no longer part of
-    # the import contract.
+    # score_finbert was retired (FinBERT removed from the pipeline) and moved
+    # out of the active package to legacy/score_finbert.py — it is no longer
+    # part of the import contract.
     "thesis_pipeline.sentiment.score_cryptobert",
     "thesis_pipeline.sentiment.aggregate",
     "thesis_pipeline.sentiment.stationarity",
